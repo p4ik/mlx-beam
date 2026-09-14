@@ -216,7 +216,7 @@ def _get_classes(config: dict):
     else:
         model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
-        arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+        arch = importlib.import_module(f"{__package__}.models.{model_type}")
     except ImportError as e:
         msg = f"Model type {model_type} not supported."
         raise ValueError(msg) from e
