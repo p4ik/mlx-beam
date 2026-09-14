@@ -1,0 +1,39 @@
+---
+import "../styles/global.css";
+const title = "mlx-beam";
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} - Batched Engine for Apple Metal</title>
+    <meta name="description" content="B.E.A.M.: an MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon." />
+  </head>
+  <body>
+    <main>
+      <span class="wip">work in progress</span>
+      <h1>mlx-beam</h1>
+      <p class="lead">B.E.A.M. — Batched Engine for Apple Metal. An MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon.</p>
+
+      <h2>Install</h2>
+      <pre><code>uv add "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
+beam doctor</code></pre>
+
+      <h2>What it is built for</h2>
+      <ul>
+        <li>A prefix cache with recurrent-state checkpoints — long conversations resume from disk instead of re-prefilling.</li>
+        <li>Multi-token prediction inside continuous batching.</li>
+        <li>Expert streaming from SSD with a resident pool, for models larger than RAM.</li>
+      </ul>
+
+      <h2>Today</h2>
+      <p>The skeleton: packaging, CI on Apple silicon, <code>beam doctor</code>. Nothing serves a model yet. Measured numbers will appear here when there are some.</p>
+
+      <footer>
+        <a href="https://github.com/p4ik/mlx-beam">GitHub</a> ·
+        <a href="https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md">Changelog</a> ·
+        Apache-2.0
+      </footer>
+    </main>
+  </body>
+</html>

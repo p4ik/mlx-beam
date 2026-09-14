@@ -1,0 +1,17 @@
+repos:
+-   repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 25.1.0
+    hooks:
+    -   id: black
+        exclude: ^mlx_beam/_vendor/
+-   repo: https://github.com/pycqa/isort
+    rev: 6.0.0
+    hooks:
+    -   id: isort
+        args:
+            - --profile=black
+        exclude: ^mlx_beam/_vendor/
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+    -   id: ruff-check
