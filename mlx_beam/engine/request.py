@@ -5,8 +5,8 @@ from __future__ import annotations
 import queue
 import threading
 import uuid
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Sequence
 
 
 @dataclass
@@ -15,18 +15,18 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     min_p: float = 0.0
-    repetition_penalty: Optional[float] = None
+    repetition_penalty: float | None = None
     repetition_context_size: int = 20
-    presence_penalty: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    logit_bias: Optional[Dict[int, float]] = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    logit_bias: dict[int, float] | None = None
 
 
 @dataclass
 class GenerationRequest:
     """Token ids in, tokens out. Text belongs to the API layer."""
 
-    tokens: List[int]
+    tokens: list[int]
     max_tokens: int = 256
     sampling: SamplingParams = field(default_factory=SamplingParams)
     # Token-id sequences that end the generation; the model's eos ids belong here.
@@ -45,7 +45,7 @@ class TokenEvent:
     token: int
     logprob: float
     # "stop", "length", or None while the sequence keeps going.
-    finish_reason: Optional[str] = None
+    finish_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ class ResultStream:
         self._queue: queue.Queue = queue.Queue()
         self._on_cancel = on_cancel
         self._cancelled = threading.Event()
-        self.progress: Optional[PromptProgress] = None
+        self.progress: PromptProgress | None = None
         self.prompt_cached = 0
 
     def put(self, item) -> None:

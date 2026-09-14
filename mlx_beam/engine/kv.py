@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_beam._vendor.optiq.kv_batch import MergeableQuantizedKVCache
@@ -23,9 +23,9 @@ class KVPolicy:
     form for them.
     """
 
-    bits: Optional[int] = None
+    bits: int | None = None
     group_size: int = 64
-    layers: Dict[int, int] = field(default_factory=dict)
+    layers: dict[int, int] = field(default_factory=dict)
 
     def __post_init__(self):
         for b in (self.bits, *self.layers.values()):
@@ -36,7 +36,7 @@ class KVPolicy:
                 f"kv group size must be one of {VALID_GROUP_SIZES}, got {self.group_size}"
             )
 
-    def bits_for(self, layer: int) -> Optional[int]:
+    def bits_for(self, layer: int) -> int | None:
         return self.layers.get(layer, self.bits)
 
     @property
@@ -51,7 +51,7 @@ class KVPolicy:
         }
 
 
-def make_request_cache(model: Any, policy: KVPolicy) -> List[Any]:
+def make_request_cache(model: Any, policy: KVPolicy) -> list[Any]:
     """A fresh per-request cache list, quantized where the policy says so.
 
     Starts from what the model asks for (hybrids bring their own layout via
@@ -67,7 +67,7 @@ def make_request_cache(model: Any, policy: KVPolicy) -> List[Any]:
     return caches
 
 
-def describe_caches(caches: List[Any]) -> List[dict]:
+def describe_caches(caches: list[Any]) -> list[dict]:
     """What a cache list actually is, layer by layer - the evidence for /health."""
     out = []
     for c in caches:

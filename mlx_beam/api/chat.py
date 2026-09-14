@@ -1,0 +1,292 @@
+"""POST /v1/chat/completions: request → prompt tokens, token events → JSON."""
+
+from __future__ import annotations
+
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+from collections.abc import Iterator
+
+from mlx_beam.api.errors import ApiError, missing_extra, unsupported
+from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
+from mlx_beam.engine.request import GenerationRequest, SamplingParams
+
+DEFAULT_MAX_TOKENS = 512
+
+
+@dataclass
+class ChatRequest:
+    messages: list[dict]
+    model: str
+    max_tokens: int
+    sampling: SamplingParams
+    stream: bool = False
+    stop: list[str] = field(default_factory=list)
+    tools: list[dict] | None = None
+    logprobs: bool = False
+    stream_usage: bool = False
+    reasoning_effort: str | None = None
+    template_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+def _number(body, key, default, lo=None, hi=None, kind=float):
+    value = body.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ApiError(f"{key} must be a number", param=key)
+    value = kind(value)
+    if (lo is not None and value < lo) or (hi is not None and value > hi):
+        raise ApiError(f"{key} must be between {lo} and {hi}", param=key)
+    return value
+
+
+def parse_sampling(body: dict) -> SamplingParams:
+    logit_bias = body.get("logit_bias")
+    if logit_bias:
+        try:
+            logit_bias = {int(k): float(v) for k, v in logit_bias.items()}
+        except (TypeError, ValueError, AttributeError):
+            raise ApiError(
+                "logit_bias must map token ids to numbers", param="logit_bias"
+            ) from None
+    penalty = _number(body, "repetition_penalty", None, 0.0)
+    presence = _number(body, "presence_penalty", 0.0, -2.0, 2.0)
+    frequency = _number(body, "frequency_penalty", 0.0, -2.0, 2.0)
+    return SamplingParams(
+        temperature=_number(body, "temperature", 1.0, 0.0, 2.0),
+        top_p=_number(body, "top_p", 1.0, 0.0, 1.0),
+        # -1 and 0 both mean "off" (the vLLM and HF convention).
+        top_k=max(0, _number(body, "top_k", 0, -1, None, int)),
+        min_p=_number(body, "min_p", 0.0, 0.0, 1.0),
+        repetition_penalty=penalty if penalty not in (None, 1.0) else None,
+        repetition_context_size=_number(
+            body, "repetition_context_size", 20, 1, None, int
+        ),
+        presence_penalty=presence or None,
+        frequency_penalty=frequency or None,
+        logit_bias=logit_bias or None,
+    )
+
+
+def parse_stop(body: dict) -> list[str]:
+    stop = body.get("stop")
+    if stop is None or stop == []:
+        return []
+    if isinstance(stop, str):
+        return [stop]
+    if isinstance(stop, list) and all(isinstance(s, str) for s in stop):
+        return stop
+    raise ApiError("stop must be a string or a list of strings", param="stop")
+
+
+def _reject_unsupported(body: dict) -> None:
+    n = body.get("n", 1)
+    if n not in (None, 1):
+        raise unsupported("n > 1", "n")
+    if body.get("seed") is not None:
+        # Sequences share a batch; a per-request seed cannot be honoured.
+        raise unsupported("seed", "seed")
+    rf = body.get("response_format")
+    if rf and rf.get("type") not in (None, "text"):
+        raise missing_extra("response_format", "structured")
+    if body.get("tool_choice") not in (None, "auto", "none"):
+        raise unsupported("tool_choice other than auto or none", "tool_choice")
+
+
+def _normalise_messages(messages: Any) -> list[dict]:
+    if not isinstance(messages, list) or not messages:
+        raise ApiError("messages must be a non-empty list", param="messages")
+    out = []
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict) or "role" not in m:
+            raise ApiError(f"messages[{i}] needs a role", param="messages")
+        m = dict(m)
+        content = m.get("content")
+        if isinstance(content, list):
+            texts = []
+            for part in content:
+                kind = part.get("type") if isinstance(part, dict) else None
+                if kind == "text":
+                    texts.append(part.get("text", ""))
+                elif kind in ("image_url", "input_image"):
+                    raise missing_extra("image input", "vision")
+                elif kind in ("input_audio", "audio", "video_url"):
+                    raise missing_extra("audio and video input", "audio")
+                else:
+                    raise ApiError(
+                        f"messages[{i}].content has an unknown part type {kind!r}",
+                        param="messages",
+                    )
+            m["content"] = "".join(texts)
+        elif content is not None and not isinstance(content, str):
+            raise ApiError(f"messages[{i}].content must be text", param="messages")
+        out.append(m)
+    return out
+
+
+def parse_chat_request(body: dict, default_model: str) -> ChatRequest:
+    if not isinstance(body, dict):
+        raise ApiError("the request body must be a JSON object")
+    _reject_unsupported(body)
+    max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
+    max_tokens = (
+        DEFAULT_MAX_TOKENS
+        if max_tokens is None
+        else _number(body, "max_completion_tokens", max_tokens, 1, None, int)
+    )
+    tools = body.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list) or any(
+            not isinstance(t, dict) or t.get("type") != "function" for t in tools
+        ):
+            raise ApiError("tools must be a list of function tools", param="tools")
+        if body.get("tool_choice") == "none":
+            tools = None
+    template_kwargs = dict(body.get("chat_template_kwargs") or {})
+    effort = body.get("reasoning_effort")
+    if effort == "none":
+        template_kwargs.setdefault("enable_thinking", False)
+    stream_opts = body.get("stream_options") or {}
+    return ChatRequest(
+        messages=_normalise_messages(body.get("messages")),
+        model=body.get("model") or default_model,
+        max_tokens=max_tokens,
+        sampling=parse_sampling(body),
+        stream=bool(body.get("stream", False)),
+        stop=parse_stop(body),
+        tools=tools,
+        logprobs=bool(body.get("logprobs", False)),
+        stream_usage=bool(stream_opts.get("include_usage", False)),
+        reasoning_effort=effort,
+        template_kwargs=template_kwargs,
+    )
+
+
+def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
+    if not getattr(tokenizer, "has_chat_template", True):
+        raise ApiError("this model has no chat template; use /v1/completions")
+    kwargs = dict(req.template_kwargs)
+    if req.tools:
+        kwargs["tools"] = req.tools
+    tokens = tokenizer.apply_chat_template(
+        req.messages, add_generation_prompt=True, tokenize=True, **kwargs
+    )
+    if not tokens:
+        raise ApiError("the prompt is empty", param="messages")
+    return list(tokens)
+
+
+def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
+    prompt = build_prompt(tokenizer, req)
+    return GenerationRequest(
+        tokens=prompt,
+        max_tokens=req.max_tokens,
+        sampling=req.sampling,
+        stop_sequences=stop_sequence_ids(tokenizer, req.stop),
+    )
+
+
+def _usage(prompt_tokens: int, completion_tokens: int, cached: int) -> dict:
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+
+
+class ChatResponder:
+    """Builds chat.completion objects (one, or a stream of chunks)."""
+
+    def __init__(self, tokenizer, req: ChatRequest, prompt_tokens: list[int]):
+        self.req = req
+        self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        self.created = int(time.time())
+        self.prompt_len = len(prompt_tokens)
+        self._sent_role = False
+        self.assembler = TextAssembler(
+            tokenizer,
+            prompt_tokens=prompt_tokens,
+            stop_words=req.stop,
+            tools=req.tools,
+            streaming=req.stream,
+        )
+
+    def _envelope(self, kind: str) -> dict:
+        return {
+            "id": self.id,
+            "object": kind,
+            "created": self.created,
+            "model": self.req.model,
+        }
+
+    def _message(self, d: TextDelta) -> dict:
+        msg: dict[str, Any] = {"role": "assistant", "content": d.content or None}
+        if d.reasoning:
+            msg["reasoning_content"] = d.reasoning
+        if d.tool_calls:
+            msg["tool_calls"] = d.tool_calls
+        return msg
+
+    def chunk(self, d: TextDelta, cached: int, final: bool = False) -> dict:
+        delta = {}
+        if d.content:
+            delta["content"] = d.content
+        if d.reasoning:
+            delta["reasoning_content"] = d.reasoning
+        if d.tool_calls:
+            delta["tool_calls"] = d.tool_calls
+        if not self._sent_role:
+            delta = {"role": "assistant", **delta}
+            self._sent_role = True
+        out = self._envelope("chat.completion.chunk")
+        out["choices"] = [
+            {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
+        ]
+        if final and self.req.stream_usage:
+            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+        return out
+
+    def stream(self, events, cached: int) -> Iterator[dict]:
+        """Chunks as the tokens arrive; tool-call text is held until complete."""
+        for event in events:
+            d = self.assembler.feed(event)
+            if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
+                continue
+            yield self.chunk(d, cached, final=d.finish_reason is not None)
+        if self.req.stream_usage:
+            out = self._envelope("chat.completion.chunk")
+            out["choices"] = []
+            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+            yield out
+
+    def complete(self, events, cached: int) -> dict:
+        """One chat.completion once the generation has finished."""
+        total = TextDelta()
+        for event in events:
+            d = self.assembler.feed(event)
+            total.content += d.content
+            total.reasoning += d.reasoning
+            total.tool_calls += d.tool_calls
+            if d.finish_reason:
+                total.finish_reason = d.finish_reason
+        out = self._envelope("chat.completion")
+        choice: dict[str, Any] = {
+            "index": 0,
+            "message": self._message(total),
+            "finish_reason": total.finish_reason or "stop",
+        }
+        if self.req.logprobs:
+            choice["logprobs"] = {
+                "content": [
+                    {"token": str(t), "logprob": lp}
+                    for t, lp in zip(
+                        self.assembler.token_ids, self.assembler.logprobs, strict=True
+                    )
+                ]
+            }
+        out["choices"] = [choice]
+        out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+        return out

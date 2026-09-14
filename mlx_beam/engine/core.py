@@ -11,7 +11,7 @@ import threading
 import time
 import traceback
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import mlx.core as mx
 
@@ -37,9 +37,7 @@ class EngineDead(RuntimeError):
 
 
 def _sampler(p: SamplingParams):
-    return make_sampler(
-        temp=p.temperature, top_p=p.top_p, min_p=p.min_p, top_k=p.top_k
-    )
+    return make_sampler(temp=p.temperature, top_p=p.top_p, min_p=p.min_p, top_k=p.top_k)
 
 
 def _logits_processors(p: SamplingParams):
@@ -58,14 +56,14 @@ class Engine:
         model: Any,
         *,
         model_key: str = "model",
-        kv_policy: Optional[KVPolicy] = None,
+        kv_policy: KVPolicy | None = None,
         completion_batch_size: int = 8,
         prefill_batch_size: int = 2,
         prefill_step_size: int = 2048,
         prefill_slice: int = 512,
         decode_share: float = 0.5,
         prompt_cache_size: int = 16,
-        prompt_cache_bytes: Optional[int] = None,
+        prompt_cache_bytes: int | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -83,22 +81,22 @@ class Engine:
         )
         self._inbox: queue.Queue = queue.Queue()
         self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._error: Optional[BaseException] = None
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
         self._lock = threading.Lock()
         self._cancelled: set = set()
-        self._live: Dict[int, ResultStream] = {}
-        self._admitting: Optional[ResultStream] = None
-        self._gen: Optional[BatchGenerator] = None
+        self._live: dict[int, ResultStream] = {}
+        self._admitting: ResultStream | None = None
+        self._gen: BatchGenerator | None = None
         self._last_step = 0.0
-        self._applied_caches: Optional[List[dict]] = None
+        self._applied_caches: list[dict] | None = None
         self._started_at = 0.0
         self._ready = threading.Event()
-        self.warmup_tokens: List[int] = [0]
+        self.warmup_tokens: list[int] = [0]
 
     # -- lifecycle --------------------------------------------------------
 
-    def start(self, timeout: Optional[float] = 600.0) -> "Engine":
+    def start(self, timeout: float | None = 600.0) -> Engine:
         """Start the worker and wait for its warm-up: one token through the
         model with the configured KV layout. A policy the model cannot carry
         fails here, not on the first client request."""
@@ -124,7 +122,7 @@ class Engine:
         if self._thread is not None:
             self._thread.join(timeout)
 
-    def __enter__(self) -> "Engine":
+    def __enter__(self) -> Engine:
         return self.start()
 
     def __exit__(self, *exc) -> None:
@@ -133,9 +131,7 @@ class Engine:
     @property
     def alive(self) -> bool:
         return (
-            self._thread is not None
-            and self._thread.is_alive()
-            and self._error is None
+            self._thread is not None and self._thread.is_alive() and self._error is None
         )
 
     # -- submission -------------------------------------------------------
@@ -166,14 +162,18 @@ class Engine:
         return {
             "alive": self.alive,
             "error": repr(self._error) if self._error else None,
-            "uptime_s": round(time.monotonic() - self._started_at, 1)
-            if self._started_at
-            else 0.0,
+            "uptime_s": (
+                round(time.monotonic() - self._started_at, 1)
+                if self._started_at
+                else 0.0
+            ),
             "in_flight": len(self._live),
             "queued": self._inbox.qsize(),
-            "last_step_age_s": round(time.monotonic() - self._last_step, 3)
-            if self._last_step
-            else None,
+            "last_step_age_s": (
+                round(time.monotonic() - self._last_step, 3)
+                if self._last_step
+                else None
+            ),
             "counters": counters,
             "batching": dict(self._gen_args),
             "kv": {
@@ -261,9 +261,7 @@ class Engine:
 
     def _warmup(self, gen: BatchGenerator) -> None:
         cache = make_request_cache(self.model, self.kv_policy)
-        (uid,) = gen.insert(
-            [list(self.warmup_tokens)], max_tokens=[1], caches=[cache]
-        )
+        (uid,) = gen.insert([list(self.warmup_tokens)], max_tokens=[1], caches=[cache])
         while True:
             _, generated = gen.next()
             if any(r.uid == uid and r.finish_reason for r in generated):
@@ -307,7 +305,11 @@ class Engine:
                 for r in prompt_responses:
                     s = self._live.get(r.uid)
                     if s is not None:
-                        s.put(PromptProgress(r.progress[0], r.progress[1], s.prompt_cached))
+                        s.put(
+                            PromptProgress(
+                                r.progress[0], r.progress[1], s.prompt_cached
+                            )
+                        )
 
                 for r in gen_responses:
                     s = self._live.get(r.uid)
