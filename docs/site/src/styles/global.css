@@ -1,27 +1,415 @@
 :root {
-  --bg: #fbfbfa;
-  --fg: #1a1a1a;
-  --muted: #6b6b6b;
-  --line: #e4e4e0;
-  --accent: #2456d8;
-  --mono: ui-monospace, "SF Mono", Menlo, monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
-  color-scheme: light dark;
+  --black: #000000;
+  --ember: #330000;
+  --oxide: #660000;
+  --red: #aa0000;
+  --beam: #ff3300;
+  --flare: #ff6600;
+  --text: #ffffff;
+  --text-soft: rgba(255, 255, 255, 0.72);
+  --text-dim: rgba(255, 255, 255, 0.5);
+  --sans: "Archivo Variable", "Archivo", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --measure: 60rem;
+  color-scheme: dark;
 }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #111113; --fg: #ececec; --muted: #9a9a9a; --line: #2a2a2e; --accent: #7ea2ff; }
+
+* {
+  box-sizing: border-box;
 }
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 var(--sans); }
-main { max-width: 44rem; margin: 0 auto; padding: 4rem 1.25rem 6rem; }
-h1 { font-size: 2rem; letter-spacing: -0.02em; margin: 0 0 .5rem; }
-h2 { font-size: 1.1rem; margin: 2.5rem 0 .75rem; }
-p { margin: 0 0 1rem; }
-.lead { color: var(--muted); font-size: 1.05rem; }
-.wip { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: .1rem .7rem; font-size: .85rem; color: var(--muted); }
-pre { background: color-mix(in srgb, var(--fg) 5%, var(--bg)); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font: 14px/1.5 var(--mono); }
-ul { padding-left: 1.2rem; }
-li { margin: .25rem 0; }
-a { color: var(--accent); text-decoration: none; }
-a:hover { text-decoration: underline; }
-footer { margin-top: 4rem; color: var(--muted); font-size: .9rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  scrollbar-gutter: stable;
+  scroll-behavior: smooth;
+}
+
+section[id] {
+  scroll-margin-top: 1.5rem;
+}
+
+body {
+  margin: 0;
+  background: var(--black);
+  color: var(--text);
+  font: 17px/1.55 var(--sans);
+  font-stretch: 100%;
+}
+
+::selection {
+  background: var(--oxide);
+  color: var(--text);
+}
+
+a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--oxide);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.22em;
+}
+
+a:hover {
+  text-decoration-color: var(--beam);
+}
+
+:focus-visible {
+  outline: 2px solid var(--beam);
+  outline-offset: 3px;
+}
+
+.wrap {
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* header: the wordmark and what it stands for, no rule beneath */
+.top {
+  padding: 1.6rem 0 0;
+}
+
+.top .wrap {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.brand {
+  text-decoration: none;
+  line-height: 1.25;
+}
+
+.brand .name {
+  display: block;
+  font-weight: 640;
+  font-stretch: 112%;
+  letter-spacing: -0.01em;
+  font-size: 1.1rem;
+}
+
+.brand .expands {
+  display: block;
+  color: var(--text-dim);
+  font-size: 0.9rem;
+}
+
+.top nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  padding-top: 0.15rem;
+  color: var(--text-soft);
+  font-size: 0.95rem;
+}
+
+.top nav a {
+  text-decoration: none;
+}
+
+.top nav a:hover {
+  color: var(--text);
+}
+
+/* hero: the wall the beam lights from below */
+.hero {
+  position: relative;
+  padding: 6.5rem 0 4.5rem;
+  background: radial-gradient(60% 55% at 50% 100%, rgba(102, 0, 0, 0.28), transparent 70%);
+}
+
+h1 {
+  margin: 0 0 1.4rem;
+  font-size: clamp(2.6rem, 6vw, 4.6rem);
+  line-height: 1.02;
+  font-weight: 700;
+  font-stretch: 112%;
+  letter-spacing: -0.025em;
+  max-width: 24ch;
+  text-wrap: balance;
+}
+
+.lead {
+  margin: 0;
+  font-size: 1.08rem;
+  font-weight: 600;
+  font-stretch: 106%;
+  line-height: 1.5;
+  max-width: 58ch;
+}
+
+.lead-terms {
+  margin: 0.25rem 0 0;
+  color: var(--text-soft);
+}
+
+.lead-terms .term {
+  white-space: nowrap;
+}
+
+.lead-terms .sep {
+  color: var(--beam);
+  padding: 0 0.2em 0 0.45em;
+}
+
+/* the beam: one line of light across the whole width */
+.beam {
+  position: relative;
+  height: 2px;
+  margin: 0 0 4rem;
+  animation: ignite 0.9s ease-out both;
+}
+
+.beam .line,
+.beam .glow,
+.beam .core {
+  position: absolute;
+  pointer-events: none;
+}
+
+.beam .line {
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--ember) 6%,
+    var(--oxide) 20%,
+    var(--beam) 42%,
+    var(--flare) 50%,
+    var(--beam) 58%,
+    var(--oxide) 80%,
+    var(--ember) 94%,
+    transparent 100%
+  );
+}
+
+.beam .glow {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 220px;
+  transform: translateY(-50%);
+  background: radial-gradient(50% 50% at 50% 50%, rgba(255, 51, 0, 0.38), rgba(170, 0, 0, 0.16) 45%, transparent 72%);
+  filter: blur(22px);
+}
+
+.beam .core {
+  left: 50%;
+  top: 50%;
+  width: 26%;
+  height: 10px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(50% 50% at 50% 50%, rgba(255, 102, 0, 0.9), rgba(255, 51, 0, 0.5) 45%, transparent 72%);
+  filter: blur(4px);
+}
+
+.beam.pulse .core {
+  animation: flare 0.55s ease-out;
+}
+
+@keyframes ignite {
+  from {
+    opacity: 0.2;
+    filter: saturate(0.4);
+  }
+  to {
+    opacity: 1;
+    filter: saturate(1);
+  }
+}
+
+@keyframes flare {
+  0% {
+    transform: translate(-50%, -50%) scaleX(1);
+    filter: blur(4px) brightness(1);
+  }
+  35% {
+    transform: translate(-50%, -50%) scaleX(1.35);
+    filter: blur(6px) brightness(1.8);
+  }
+  100% {
+    transform: translate(-50%, -50%) scaleX(1);
+    filter: blur(4px) brightness(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .beam,
+  .beam.pulse .core {
+    animation: none;
+  }
+}
+
+/* sections */
+section {
+  padding: 0 0 3.5rem;
+}
+
+h2 {
+  margin: 0 0 1rem;
+  font-size: 1.35rem;
+  font-weight: 600;
+  font-stretch: 108%;
+  letter-spacing: -0.01em;
+}
+
+.prose {
+  margin: 0;
+  color: var(--text-soft);
+  max-width: 58ch;
+}
+
+.note {
+  margin: 0.9rem 0 0;
+  color: var(--text-dim);
+  font-size: 0.95rem;
+  max-width: 60ch;
+}
+
+/* install: the one block with a surface; the button sits beside the short second line */
+.terminal {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--oxide);
+  border-radius: 6px;
+  background: #120000;
+  padding: 1rem 1.25rem;
+}
+
+.terminal pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 15px/1.75 var(--mono);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.terminal button {
+  position: absolute;
+  right: 0.7rem;
+  bottom: 0.7rem;
+  font: 500 13px var(--sans);
+  color: var(--text-soft);
+  background: transparent;
+  border: 1px solid var(--oxide);
+  border-radius: 4px;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+}
+
+.terminal button:hover {
+  color: var(--text);
+  border-color: var(--red);
+}
+
+.terminal button.done {
+  color: var(--flare);
+  border-color: var(--red);
+}
+
+.note code {
+  font: 0.92em var(--mono);
+}
+
+/* built for: a list, rows separated by lines the beam colour barely reaches */
+dl {
+  margin: 0;
+  max-width: 46rem;
+}
+
+dl > div {
+  padding: 0.85rem 0;
+  border-top: 1px solid rgba(102, 0, 0, 0.55);
+}
+
+dl > div:last-child {
+  border-bottom: 1px solid rgba(102, 0, 0, 0.55);
+}
+
+dt {
+  font-weight: 600;
+  font-stretch: 106%;
+  font-size: 1.08rem;
+  margin: 0 0 0.25rem;
+}
+
+dd {
+  margin: 0;
+  color: var(--text-soft);
+  max-width: 58ch;
+}
+
+/* status: built things carry light, planned ones only the outline */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 46rem;
+}
+
+td {
+  padding: 0.75rem 0;
+  border-top: 1px solid rgba(102, 0, 0, 0.55);
+  vertical-align: middle;
+}
+
+tr:last-child td {
+  border-bottom: 1px solid rgba(102, 0, 0, 0.55);
+}
+
+td.state {
+  width: 9rem;
+  white-space: nowrap;
+  color: var(--text-soft);
+}
+
+.mark {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-right: 0.6rem;
+  vertical-align: 0;
+}
+
+.mark.built {
+  background: var(--beam);
+  box-shadow: 0 0 9px rgba(255, 51, 0, 0.75);
+}
+
+.mark.planned {
+  border: 1.5px solid rgba(170, 0, 0, 0.85);
+}
+
+footer {
+  padding: 2.5rem 0 3.5rem;
+  color: var(--text-dim);
+  font-size: 0.95rem;
+}
+
+footer .wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 2rem;
+  justify-content: space-between;
+}
+
+footer p {
+  margin: 0;
+}
+
+footer nav {
+  display: flex;
+  gap: 1.5rem;
+}
+
+@media (max-width: 520px) {
+  .hero {
+    padding-top: 4.5rem;
+  }
+  .terminal {
+    width: 100%;
+  }
+}

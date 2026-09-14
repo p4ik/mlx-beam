@@ -1,39 +1,176 @@
 ---
+import "@fontsource-variable/archivo/standard.css";
 import "../styles/global.css";
-const title = "mlx-beam";
+
+const repo = "https://github.com/p4ik/mlx-beam";
+const install = `uv tool install "mlx-beam @ git+${repo}"\nbeam doctor`;
+
+const built = [
+  { title: "Robust prefix cache", text: "RAM and SSD tiers, checkpoints for hybrid models. Survives model swaps and restarts." },
+  { title: "Expert streaming", text: "Mixture-of-experts models larger than memory. Residency configurable, from minimal RAM to fully resident." },
+  { title: "No bloat", text: "The core is the token path. Vision, audio, conversion, structured output and tool-call repair are optional extras." },
+  { title: "Batched MTP", text: "Multi-token prediction stays on with many requests at once." },
+  { title: "Batched vision", text: "Images go through the same scheduler; no request waits behind a picture." },
+  { title: "No stalls", text: "A short request beside a long prefill answers in seconds." },
+  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion." },
+  { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request." },
+  { title: "Responses API", text: "Next to chat completions, stateless." },
+];
+
+
+const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
+
+const status = [
+  { piece: "CLI, packaging, CI", state: "skeleton", built: true },
+  { piece: "Vendored mlx-lm base", state: "planned", built: false },
+  { piece: "Prefix cache with recurrent-state checkpoints", state: "planned", built: false },
+  { piece: "Multi-token prediction in the batch", state: "planned", built: false },
+  { piece: "Expert streaming from SSD", state: "planned", built: false },
+];
 ---
+
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{title} - Batched Engine for Apple Metal</title>
-    <meta name="description" content="B.E.A.M.: an MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon." />
+    <title>mlx-beam</title>
+    <meta
+      name="description"
+      content="A light, modular inference engine for Apple silicon, built on MLX: robust prefix cache with SSD tier, expert streaming, no bloat."
+    />
+    <meta name="theme-color" content="#000000" />
   </head>
   <body>
+    <header class="top">
+      <div class="wrap">
+        <a class="brand" href="./">
+          <span class="name">mlx-beam</span>
+          <span class="expands">Batched Engine for Apple Metal</span>
+        </a>
+        <nav>
+          <a href="#how">How</a>
+          <a href="#what">What</a>
+          <a href="#why">Why</a>
+          <a href="#where">Where</a>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
+        </nav>
+      </div>
+    </header>
+
     <main>
-      <span class="wip">work in progress</span>
-      <h1>mlx-beam</h1>
-      <p class="lead">B.E.A.M. — Batched Engine for Apple Metal. An MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon.</p>
+      <section class="hero">
+        <div class="wrap">
+          <h1>B.E.A.M.</h1>
+          <p class="lead">Light and modular inference engine, built on MLX.</p>
+          <p class="lead-terms">
+            {features.map((f, i) => (
+              <>
+                {i > 0 && " "}
+                <span class="term">
+                  {f}
+                  {i < features.length - 1 && <span class="sep" aria-hidden="true">&#8226;</span>}
+                </span>
+              </>
+            ))}
+          </p>
+        </div>
+      </section>
 
-      <h2>Install</h2>
-      <pre><code>uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
-beam doctor</code></pre>
+      <div class="beam" aria-hidden="true">
+        <span class="glow"></span>
+        <span class="line"></span>
+        <span class="core"></span>
+      </div>
 
-      <h2>What it is built for</h2>
-      <ul>
-        <li>A prefix cache with recurrent-state checkpoints — long conversations resume from disk instead of re-prefilling.</li>
-        <li>Multi-token prediction inside continuous batching.</li>
-        <li>Expert streaming from SSD with a resident pool, for models larger than RAM.</li>
-      </ul>
+      <section id="how">
+        <div class="wrap">
+          <h2>How to install</h2>
+          <div class="terminal">
+            <pre><code>{install}</code></pre>
+            <button type="button" data-copy>Copy</button>
+          </div>
+          <p class="note"><code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
+        </div>
+      </section>
 
-      <h2>Today</h2>
-      <p>The skeleton: packaging, CI on Apple silicon, <code>beam doctor</code>. Nothing serves a model yet. Measured numbers will appear here when there are some.</p>
+      <section id="what">
+        <div class="wrap">
+          <h2>What sets it apart</h2>
+          <dl>
+            {built.map((b) => (
+              <div>
+                <dt>{b.title}</dt>
+                <dd>{b.text}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      </section>
 
-      <footer>
-        <a href="https://github.com/p4ik/mlx-beam">GitHub</a> ·
-        <a href="https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md">Changelog</a> ·
-        Apache-2.0
-      </footer>
+      <section id="why">
+        <div class="wrap">
+          <h2>Why it exists</h2>
+          <p class="prose">
+            Existing MLX servers either stop at the basics or grow things that have no place in an
+            inference engine: a built-in game, a cloud path that arrives with an update. The ones we ran
+            daily also had bugs where it matters most: prefix cache, batching under load, vision.
+            B.E.A.M. keeps the core to the token path and fixes those paths at the source. Everything
+            else is an extra you choose to install; nothing ever ships in the core that you did not ask
+            for.
+          </p>
+        </div>
+      </section>
+
+      <section id="where">
+        <div class="wrap">
+          <h2>Where it stands</h2>
+          <table>
+            <tbody>
+              {status.map((s) => (
+                <tr>
+                  <td>{s.piece}</td>
+                  <td class="state"><span class={`mark ${s.built ? "built" : "planned"}`}></span>{s.state}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
+        </div>
+      </section>
     </main>
+
+    <footer>
+      <div class="wrap">
+        <p>Apache-2.0. Vendored components keep their own licenses.</p>
+        <nav>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+        </nav>
+      </div>
+    </footer>
+
+    <script>
+      const beam = document.querySelector(".beam");
+      document.querySelectorAll("[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const text = button.closest(".terminal")?.querySelector("code")?.textContent ?? "";
+          try {
+            await navigator.clipboard.writeText(text);
+            button.textContent = "Copied";
+            button.classList.add("done");
+            beam?.classList.remove("pulse");
+            void beam?.offsetWidth;
+            beam?.classList.add("pulse");
+            setTimeout(() => {
+              button.textContent = "Copy";
+              button.classList.remove("done");
+            }, 1600);
+          } catch {
+            button.textContent = "Select and copy";
+          }
+        });
+      });
+    </script>
   </body>
 </html>
