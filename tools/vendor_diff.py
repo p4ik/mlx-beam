@@ -78,8 +78,10 @@ def diff_part(name, part, clock):
             errors.append(f"listed as modified but identical to upstream: {rel}")
         for rel in sorted(present - expected - ours):
             errors.append(f"not upstream's and not listed as local: {rel}")
-        print(f"{name} @ {part['commit'][:12]}: {len(expected)} upstream files, "
-              f"{len(changed)} modified, {len(ours)} local")
+        print(
+            f"{name} @ {part['commit'][:12]}: {len(expected)} upstream files, "
+            f"{len(changed)} modified, {len(ours)} local"
+        )
         for rel in changed:
             a = (src / rel).read_text().splitlines(keepends=True)
             b = (dest / rel).read_text().splitlines(keepends=True)
@@ -90,8 +92,10 @@ def diff_part(name, part, clock):
             head = git("ls-remote", part["repo"], "HEAD").split()[0]
             git("fetch", "-q", "--depth", "200", "origin", head, cwd=tmp)
             behind = git("rev-list", "--count", f"{part['commit']}..{head}", cwd=tmp)
-            print(f"{name}: upstream HEAD {head[:12]}, {behind.strip()} commits "
-                  "after the pin (capped at 200)")
+            print(
+                f"{name}: upstream HEAD {head[:12]}, {behind.strip()} commits "
+                "after the pin (capped at 200)"
+            )
         for e in errors:
             print(f"ERROR {name}: {e}")
         return not errors
