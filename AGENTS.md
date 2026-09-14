@@ -13,10 +13,25 @@
 - English only: code, comments, docstrings, commits, docs, issues.
 - Format with `uvx pre-commit run --all` (black, isort, ruff).
 
+### Do not
+
+AI-written code tends to over-comment. None of these belong in this repo:
+
+- Narrative comments that tell the story of the code, the alternatives that
+  were considered, or what the previous version did. The commit message and
+  the PR hold that; the code holds the reason in one line.
+- Comments that restate the line below them.
+- "What I did here" notes, `NOTE:` / `IMPORTANT:` banners, and TODO essays.
+  A TODO is one line with an issue number or it is not written.
+- Docstrings that repeat the signature ("Returns the result of ...").
+  One line that says what the caller gets; more only when the contract
+  needs it (units, invariants, failure modes).
+- Section-header comments (`# --- helpers ---`) in files under 300 lines.
+
 ### Examples
 
 ```python
-# Good (explains reason)
+# Good (explains reason, one line)
 
 # The schema requires "content" to be present, even when empty.
 choice["message"]["content"] = text if text else None
@@ -24,6 +39,15 @@ choice["message"]["content"] = text if text else None
 # Bad (restates the code)
 
 # Set content to text or None.
+choice["message"]["content"] = text if text else None
+
+# Bad (narrative - this is a PR description, not a comment)
+
+# `content` stays present and nullable, the way the schema has it. A model
+# that stops while still inside a reasoning block leaves `text` empty, and
+# dropping the key makes a client raise KeyError instead of reading an empty
+# answer. Streaming deltas are left alone: omitting fields between chunks is
+# normal there, so we only touch the final message here.
 choice["message"]["content"] = text if text else None
 ```
 
