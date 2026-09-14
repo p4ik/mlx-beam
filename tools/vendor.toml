@@ -23,8 +23,25 @@ local = ["__init__.py", "LICENSE"]
 # Upstream files we changed on purpose; a diff anywhere else is an error.
 modified = [
   "generate.py",
+  "models/base.py",
   "models/cache.py",
   "utils.py",
   "tokenizer_utils.py",
   "models/plamo2.py",
 ]
+
+[parts.optiq]
+# No public source repository; the PyPI wheel is the upstream.
+wheel = "https://files.pythonhosted.org/packages/b6/c4/4845ba173600125316e8b63a818e910ea4678acf1e1a016d48aa9938a646/mlx_optiq-0.5.6-py3-none-any.whl"
+sha256 = "3b94d235a1cf52136f6ef8ace025643d032edd0b4658ba62f0d29fd05592c7c1"
+version = "0.5.6"
+upstream_subdir = "optiq"
+dest = "mlx_beam/_vendor/optiq"
+local = ["__init__.py", "LICENSE"]
+# Both files are ports (new cache API, installers removed), so both are modified.
+modified = ["kv_batch.py", "fused_quant_sdpa.py"]
+
+# dest file = upstream file
+[parts.optiq.files]
+"kv_batch.py" = "runtime/kv/batch.py"
+"fused_quant_sdpa.py" = "runtime/fused_quant_sdpa.py"

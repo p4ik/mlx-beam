@@ -64,5 +64,51 @@ upstream's chunking at slice width; greedy output is byte-identical
 worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,
 `test_scheduler_alternates_under_sharing`.
 
+`tiled SDPA` - `models/base.py`, `scaled_dot_product_attention`: with a
+quantized cache, the tiled attention from the optiq part below runs whenever
+it supports the shape (4/8 bit, group 32/64/128, fp16/bf16 queries, causal or
+no mask); the stock path stays for everything else.
+
+`rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
+trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
+is the whole buffer, so the assignment into a zero-width destination raised a
+broadcast error and took the generation thread down. Reached by any
+sliding-window model reusing a cached prefix across turns. Guarded with
+`or l == 0`. Test: `test_rotating_merge_survives_a_zero_length_cache`.
+
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
+
+## optiq
+
+| | |
+|---|---|
+| Upstream | `mlx-optiq` on PyPI (https://mlx-optiq.com); no public source repository, the wheel is the upstream |
+| Version | 0.5.6 (wheel sha256 in `tools/vendor.toml`); 0.5.7 checked 2026-09-15, both files unchanged |
+| License | MIT, `mlx_beam/_vendor/optiq/LICENSE` |
+| Taken | `runtime/kv/batch.py` as `kv_batch.py`, `runtime/fused_quant_sdpa.py` as `fused_quant_sdpa.py` |
+| Left out | everything else: the package is a server with its own glue, and the only parts the engine needs are the two below |
+
+Both files are ports, not copies: they were written against mlx-lm 0.31.3
+and installed themselves by monkeypatching at run time. Here they target the
+vendored mlx-lm commit and are wired in explicitly - `models/base.py` calls
+the tiled attention, and the engine builds the quantized per-request caches
+itself and hands them to `BatchGenerator.insert`.
+
+### Local changes
+
+`kv_batch.py` - `BatchQuantizedKVCache`, `MergeableQuantizedKVCache`: imports
+from the vendored package; `state` carries `_idx`, `group_size` and `bits`
+(the old `meta_state` no longer exists upstream); `keys_and_values()` instead
+of returning slices from `update_and_fetch`; `merge` takes bits and group size
+from any cache that carries them - fresh prompts hold no keys, and taking the
+defaults from the first populated cache silently turned a 4-bit configuration
+into 8-bit batches (measured: greedy output under 4, 8 and mixed bits
+byte-identical); `MergeableQuantizedKVCache.keys_and_values` tolerates an
+empty cache. Dropped: `quantize_batch_cache_layer`, `install_batch_kv_quant`
+(the monkeypatch installer). Tests: `test_vendor_optiq_kv.py`.
+
+`fused_quant_sdpa.py`: the tiled attention as a plain function with the
+support check next to it; `install`/`uninstall` and the module-level
+original dropped. The chunk width is an argument (`n_chunk`, default 512).
+Test: `test_tiled_sdpa_matches_stock`.

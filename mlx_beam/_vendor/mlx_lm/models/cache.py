@@ -1435,7 +1435,9 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, l, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+            # A cache trimmed back to length 0 keeps its buffer, and [-0:]
+            # is the whole buffer, not nothing (VENDORED.md, rotating merge).
+            if c.keys is None or l == 0:
                 continue
             keys[i : i + 1, :, p : p + l] = c._temporal_order(c.keys)[..., -l:, :]
             values[i : i + 1, :, p : p + l] = c._temporal_order(c.values)[..., -l:, :]
