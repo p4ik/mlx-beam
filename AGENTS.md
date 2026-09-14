@@ -67,13 +67,15 @@ choice["message"]["content"] = text if text else None
   minor (created from the tag `v0.y.0` when needed; fixes arrive by PR).
 - Versions come from git tags (hatch-vcs); never edit a version string.
   On `main` the tree counts towards the next minor: after `v0.1.0` it is
-  `0.2.0.devN`, N = commits since the tag (before any tag: `0.1.devN`). A
+  `0.2.0.devN`, N = commits since the tag (before any tag: `0.1.0.devN`). A
   fix for a released minor lives on `release-0.y`, where the tree counts
-  `0.y.1.devN`. No local `+g<hash>` label: PyPI refuses local versions, and
-  `.dev` builds are published.
+  towards the next patch (`0.1.1.devN`, after `v0.1.1` then `0.1.2.devN`).
+  No local `+g<hash>` label: PyPI refuses local versions, and `.dev` builds
+  are published.
 - Pre-releases are PEP 440 (`0.2.0.dev14`, `0.2.0a1`, `0.2.0rc1`) and are
-  published when a test needs them - `.dev` only from `main`; installers skip
-  them unless asked. A burnt release number is never reused.
+  published when a test needs them - `.dev` only from `main` or a
+  `release-*` branch; installers skip them unless asked. A burnt release
+  number is never reused.
 - Vendored parts are updated in their own commit (`vendor: <part> <old> -> <new>`).
 
 ## AI usage
