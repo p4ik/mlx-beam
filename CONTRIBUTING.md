@@ -4,8 +4,9 @@
 
 AI-generated code is allowed. What is not allowed is submitting code you do not
 understand. You are responsible for every line, however it was produced, and
-you disclose how AI was used. Do not use AI to write issues, pull request
-descriptions, discussions or replies to people.
+you disclose how AI was used. An agent may draft a pull request description or
+an issue; you read, edit and approve it before it goes out, and you keep it
+short. Replies to people are written by people.
 
 ## Setup
 

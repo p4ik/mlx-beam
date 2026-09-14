@@ -81,5 +81,7 @@ choice["message"]["content"] = text if text else None
 ## AI usage
 
 - AI-generated code is allowed. You are responsible for every line and disclose
-  how AI was used. Do not let AI write issues, PR descriptions or replies to
-  people.
+  how AI was used.
+- PR descriptions and issues may be drafted by an agent; the human author reads,
+  edits and approves them before they go out, and keeps them short: what
+  changed and why, no narrative. Replies to people are written by people.
