@@ -1,0 +1,30 @@
+# Vendored parts: what tools/vendor_diff.py compares against. VENDORED.md
+# carries the prose (why, what changed); this file carries the coordinates.
+
+[parts.mlx-lm]
+repo = "https://github.com/ml-explore/mlx-lm"
+commit = "dcbcf786c0cf56f9a12fabe9468c887781431ae2"
+upstream_subdir = "mlx_lm"
+dest = "mlx_beam/_vendor/mlx_lm"
+# Files and directories taken from upstream_subdir; everything else stays out.
+include = [
+  "generate.py",
+  "generate_utils.py",
+  "sample_utils.py",
+  "tokenizer_utils.py",
+  "utils.py",
+  "py.typed",
+  "models",
+  "tool_parsers",
+  "chat_templates",
+]
+# Files under dest that are ours, not upstream's (never diffed).
+local = ["__init__.py", "LICENSE"]
+# Upstream files we changed on purpose; a diff anywhere else is an error.
+modified = [
+  "generate.py",
+  "models/cache.py",
+  "utils.py",
+  "tokenizer_utils.py",
+  "models/plamo2.py",
+]

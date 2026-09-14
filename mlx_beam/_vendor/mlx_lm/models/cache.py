@@ -685,12 +685,15 @@ class ArraysCache(_BaseCache):
             self.left_padding -= N
 
     def make_mask(self, N: int):
-        if self.left_padding is not None:
-            pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
+        # Right-padded prefill sets lengths, but merge() of fresh caches leaves
+        # left_padding = [0] * B behind; lengths must win or the recurrent
+        # layers run the padding through the delta rule (VENDORED.md, mask).
+        if self.lengths is not None:
             pos = mx.arange(N)
             return pos < self.lengths[:, None]
+        elif self.left_padding is not None:
+            pos = mx.arange(N)
+            return pos >= self.left_padding[:, None]
         else:
             return None
 

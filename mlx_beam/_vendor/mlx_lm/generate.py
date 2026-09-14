@@ -13,7 +13,7 @@ from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Un
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
+from mlx.utils import tree_flatten, tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
@@ -1265,6 +1265,24 @@ class PromptProcessingBatch:
         )
 
 
+def _cache_arrays(caches) -> List[mx.array]:
+    # Every instance attribute, read as storage (the state property slices
+    # the KV arrays and would copy them); a field this walk does not know
+    # about is exactly the one that would be left to chain.
+    out = []
+    for c in caches:
+        for leaf in getattr(c, "caches", None) or (c,):
+            if leaf is None:
+                continue
+            for v in vars(leaf).values():
+                if v is None or isinstance(v, (int, float, str, bool)):
+                    continue
+                for _, a in tree_flatten(v):
+                    if isinstance(a, mx.array):
+                        out.append(a)
+    return out
+
+
 class GenerationBatch:
     """
     A batched token generator that manages multiple sequences in parallel.
@@ -1408,6 +1426,10 @@ class GenerationBatch:
         # them to self.tokens so that it always represents the tokens contained
         # in the KV Cache.
         mx.eval(inputs, self._current_logprobs)
+        # Materialise the cache state each step: a lazy per-step assignment
+        # keeps one Metal buffer per chaining layer per token alive
+        # (mlx-lm#1332, #1845; VENDORED.md, cache eval).
+        mx.eval(*_cache_arrays(self.prompt_cache))
         inputs = inputs.tolist()
         for sti, ti in zip(self.tokens, inputs):
             sti.append(ti)
@@ -1531,6 +1553,8 @@ class BatchGenerator:
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
+        prefill_slice: int = 512,
+        decode_share: float = 0.5,
         max_kv_size: Optional[int] = None,
         stream=None,
     ):
@@ -1540,6 +1564,13 @@ class BatchGenerator:
         self.logits_processors = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
+        # A model call cannot be interrupted, so its width is the wait a
+        # newcomer sees. 512 ran at 125 tok/s against 114 for 2048 on a
+        # 27B GDN hybrid (2026-09-13, M4 Pro 64 GB); VENDORED.md, scheduler.
+        self.prefill_slice = max(1, prefill_slice)
+        # Decode wall time granted per prefill wall time while both share
+        # the worker; 0 = one decode step per prefill step, as upstream.
+        self.decode_share = max(0.0, decode_share)
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
@@ -1558,6 +1589,8 @@ class BatchGenerator:
         self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
+        self._prefill_turn = False
+        self._last_prefill_s = 0.0
 
         self._counters = BatchCounters()
 
@@ -1783,19 +1816,37 @@ class BatchGenerator:
     def _next(self):
         generation_responses = []
         prompt_responses = []
+        last_prefill_s = self._last_prefill_s
+        sharing = bool(self._currently_processing or self._unprocessed_sequences)
 
-        # Generate tokens first
-        if len(self._generation_batch) > 0:
+        # Generate tokens first. While a prefill shares the worker, decode
+        # for a share of that prefill's wall time and hand the tokens back
+        # at once; the prefill call follows in the next _next, the two
+        # alternate (VENDORED.md, scheduler).
+        if len(self._generation_batch) > 0 and not self._prefill_turn:
+            budget = self.decode_share * last_prefill_s
             tic = time.perf_counter()
-            generation_responses = self._generation_batch.next()
+            while True:
+                step = self._generation_batch.next()
+                generation_responses += step
+                self._counters.generation_tokens += len(step)
+                self._counters.generation_steps += 1
+                if self._counters.generation_steps % 512 == 0:
+                    mx.clear_cache()
+                if (
+                    len(self._generation_batch) == 0
+                    or time.perf_counter() - tic >= budget
+                ):
+                    break
             self._counters.decode_time += time.perf_counter() - tic
-            self._counters.generation_tokens += len(generation_responses)
-            self._counters.generation_steps += 1
-            if self._counters.generation_steps % 512 == 0:
-                mx.clear_cache()
+            if sharing and generation_responses:
+                self._prefill_turn = True
+                return prompt_responses, generation_responses
+        self._prefill_turn = False
 
         # Exit early because we already have our hands full with decoding
         if len(self._generation_batch) >= self.completion_batch_size:
+            self._last_prefill_s = 0.0
             return prompt_responses, generation_responses
 
         # Check if we have sequences and add them to the prompt batch
@@ -1833,21 +1884,33 @@ class BatchGenerator:
                     )
                 )
             self._generation_batch.extend(gen_batch)
+            if self._currently_processing:
+                # Hand the finished prompt over now; its first token comes
+                # at the top of the next call, not behind another prefill
+                # step of the others.
+                return prompt_responses, generation_responses
 
-        # Extract the next prompts input
+        if not self._currently_processing:
+            self._last_prefill_s = 0.0
+            return prompt_responses, generation_responses
+
+        # One model call, as wide as the shortest current segment: nobody is
+        # padded, and the width is capped by the step and the slice.
+        width = min(len(seq[0][0]) for seq in self._currently_processing)
+        width = min(width, self.prefill_step_size, self.prefill_slice)
+
         prompts = []
         for i, seq in enumerate(self._currently_processing):
             response = PromptProcessingBatch.Response(
                 self._prompt_batch.uids[i], 0, False, False
             )
             segments = seq[0]
-            n = min(len(segments[0]), self.prefill_step_size)
-            prompts.append(segments[0][:n])
-            segments[0] = segments[0][n:]
+            prompts.append(segments[0][:width])
+            segments[0] = segments[0][width:]
             if len(segments[0]) == 0:
                 segments.pop(0)
                 response.end_of_segment = True
-            seq[1] += len(prompts[-1])
+            seq[1] += width
             response.progress = (seq[1], seq[2])
             prompt_responses.append(response)
 
@@ -1855,7 +1918,9 @@ class BatchGenerator:
         self._counters.prompt_tokens += sum(len(p) for p in prompts)
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
-        self._counters.prompt_time += time.perf_counter() - tic
+        toc = time.perf_counter()
+        self._counters.prompt_time += toc - tic
+        self._last_prefill_s = toc - tic
 
         return prompt_responses, generation_responses
 

@@ -24,10 +24,23 @@ classifiers = [
 ]
 dependencies = [
   "mlx>=0.32; sys_platform == 'darwin'",
+  # Carried by the vendored mlx-lm (tokenizers, chat templates, tool parsers).
+  "transformers>=5.7",
+  "huggingface_hub",
+  "jinja2",
+  "numpy",
+  "regex",
+  "sentencepiece",
+  "protobuf",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pre-commit>=4"]
+dev = [
+  "pytest>=8",
+  "pre-commit>=4",
+  # CPU build of MLX so the tests run on Linux too (Apple silicon stays the reference).
+  "mlx[cpu]>=0.32; sys_platform == 'linux'",
+]
 
 [project.scripts]
 beam = "mlx_beam.cli:main"
