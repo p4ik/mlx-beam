@@ -64,11 +64,11 @@ choice["message"]["content"] = text if text else None
   free-form. No direct pushes to `main`.
 - Branch names: `feat/…`, `fix/…`, `docs/…`, `vendor/…`. Delete after merge.
 - Versions come from git tags (hatch-vcs); never edit a version string.
-  Between tags the tree is `<next patch after the last tag>.devN`, N = commits
-  since the tag (`0.1.0` -> `0.1.1.dev3`; before any tag `0.1.devN`). No local
-  `+g<hash>` label: PyPI refuses local versions, and `.dev` builds are
-  published. The tag decides the real number; the dev counter only sorts
-  between the last tag and the next release.
+  On `main` the tree counts towards the next minor: after `v0.1.0` it is
+  `0.2.0.devN`, N = commits since the tag (before any tag: `0.1.devN`). A
+  fix for a released minor lives on `release-0.y`, where the tree counts
+  `0.y.1.devN`. No local `+g<hash>` label: PyPI refuses local versions, and
+  `.dev` builds are published.
 - Pre-releases are PEP 440 (`0.2.0.dev14`, `0.2.0a1`, `0.2.0rc1`) and are
   published when a test needs them - `.dev` only from `main`; installers skip
   them unless asked. A burnt release number is never reused.

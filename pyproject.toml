@@ -44,6 +44,10 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # PyPI refuses local labels (+g<hash>); .dev builds from main must be uploadable.
 local_scheme = "no-local-version"
+# main counts towards the next minor (0.1.0 -> 0.2.0.devN); a release-* branch
+# counts towards the next patch (0.1.1.devN). Measured 2026-09-14 against the
+# three schemes; the default would count 0.1.1.devN on main.
+version_scheme = "release-branch-semver"
 
 [tool.hatch.build.hooks.vcs]
 version-file = "mlx_beam/_version.py"
