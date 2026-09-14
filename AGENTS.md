@@ -63,6 +63,8 @@ choice["message"]["content"] = text if text else None
   per change, `<area>: <what>` in English, imperative. Branch commits are
   free-form. No direct pushes to `main`.
 - Branch names: `feat/…`, `fix/…`, `docs/…`, `vendor/…`. Delete after merge.
+  `release-0.y` is the long-lived branch for patch releases of an older
+  minor (created from the tag `v0.y.0` when needed; fixes arrive by PR).
 - Versions come from git tags (hatch-vcs); never edit a version string.
   On `main` the tree counts towards the next minor: after `v0.1.0` it is
   `0.2.0.devN`, N = commits since the tag (before any tag: `0.1.devN`). A
