@@ -6,19 +6,19 @@ const repo = "https://github.com/p4ik/mlx-beam";
 const install = `uv tool install "mlx-beam @ git+${repo}"\nbeam doctor`;
 
 const built = [
-  {
-    title: "Prefix cache with checkpoints",
-    text: "Recurrent state is saved at segment boundaries, so a long conversation resumes from disk instead of re-prefilling.",
-  },
-  {
-    title: "Multi-token prediction in the batch",
-    text: "Speculative decoding inside continuous batching, with the rollback that makes it exact.",
-  },
-  {
-    title: "Expert streaming",
-    text: "Routed experts stay on SSD behind a resident pool, for models larger than memory.",
-  },
+  { title: "Robust prefix cache", text: "RAM and SSD tiers, checkpoints for hybrid models. Survives model swaps and restarts." },
+  { title: "Expert streaming", text: "Mixture-of-experts models larger than memory. Residency configurable, from minimal RAM to fully resident." },
+  { title: "No bloat", text: "The core is the token path. Vision, audio, conversion, structured output and tool-call repair are optional extras." },
+  { title: "Batched MTP", text: "Multi-token prediction stays on with many requests at once." },
+  { title: "Batched vision", text: "Images go through the same scheduler; no request waits behind a picture." },
+  { title: "No stalls", text: "A short request beside a long prefill answers in seconds." },
+  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion." },
+  { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request." },
+  { title: "Responses API", text: "Next to chat completions, stateless." },
 ];
+
+
+const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
 
 const status = [
   { piece: "CLI, packaging, CI", state: "skeleton", built: true },
@@ -36,7 +36,7 @@ const status = [
     <title>mlx-beam</title>
     <meta
       name="description"
-      content="An inference engine for hybrid-attention and mixture-of-experts models on Apple silicon, built on MLX."
+      content="A light, modular inference engine for Apple silicon, built on MLX: robust prefix cache with SSD tier, expert streaming, no bloat."
     />
     <meta name="theme-color" content="#000000" />
   </head>
@@ -48,6 +48,10 @@ const status = [
           <span class="expands">Batched Engine for Apple Metal</span>
         </a>
         <nav>
+          <a href="#how">How</a>
+          <a href="#what">What</a>
+          <a href="#why">Why</a>
+          <a href="#where">Where</a>
           <a href={repo}>GitHub</a>
           <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
         </nav>
@@ -57,10 +61,18 @@ const status = [
     <main>
       <section class="hero">
         <div class="wrap">
-          <h1>An inference engine for the models a plain transformer server gets wrong.</h1>
-          <p class="lead">
-            Hybrid attention and mixture-of-experts on Apple silicon, built on MLX: recurrent state that
-            cannot be trimmed, experts that do not fit in memory, speculative decoding under batching.
+          <h1>B.E.A.M.</h1>
+          <p class="lead">Light and modular inference engine, built on MLX.</p>
+          <p class="lead-terms">
+            {features.map((f, i) => (
+              <>
+                {i > 0 && " "}
+                <span class="term">
+                  {f}
+                  {i < features.length - 1 && <span class="sep" aria-hidden="true">&#8226;</span>}
+                </span>
+              </>
+            ))}
           </p>
         </div>
       </section>
@@ -71,8 +83,9 @@ const status = [
         <span class="core"></span>
       </div>
 
-      <section>
+      <section id="how">
         <div class="wrap">
+          <h2>How to install</h2>
           <div class="terminal">
             <pre><code>{install}</code></pre>
             <button type="button" data-copy>Copy</button>
@@ -81,9 +94,9 @@ const status = [
         </div>
       </section>
 
-      <section>
+      <section id="what">
         <div class="wrap">
-          <h2>Built for</h2>
+          <h2>What sets it apart</h2>
           <dl>
             {built.map((b) => (
               <div>
@@ -95,9 +108,23 @@ const status = [
         </div>
       </section>
 
-      <section>
+      <section id="why">
         <div class="wrap">
-          <h2>Status</h2>
+          <h2>Why it exists</h2>
+          <p class="prose">
+            Existing MLX servers either stop at the basics or grow things that have no place in an
+            inference engine: a built-in game, a cloud path that arrives with an update. The ones we ran
+            daily also had bugs where it matters most: prefix cache, batching under load, vision.
+            B.E.A.M. keeps the core to the token path and fixes those paths at the source. Everything
+            else is an extra you choose to install; nothing ever ships in the core that you did not ask
+            for.
+          </p>
+        </div>
+      </section>
+
+      <section id="where">
+        <div class="wrap">
+          <h2>Where it stands</h2>
           <table>
             <tbody>
               {status.map((s) => (

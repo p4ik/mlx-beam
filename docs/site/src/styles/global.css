@@ -21,6 +21,11 @@
 html {
   -webkit-text-size-adjust: 100%;
   scrollbar-gutter: stable;
+  scroll-behavior: smooth;
+}
+
+section[id] {
+  scroll-margin-top: 1.5rem;
 }
 
 body {
@@ -93,7 +98,8 @@ a:hover {
 
 .top nav {
   display: flex;
-  gap: 1.5rem;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
   padding-top: 0.15rem;
   color: var(--text-soft);
   font-size: 0.95rem;
@@ -116,7 +122,7 @@ a:hover {
 
 h1 {
   margin: 0 0 1.4rem;
-  font-size: clamp(2.35rem, 5.4vw, 4.3rem);
+  font-size: clamp(2.6rem, 6vw, 4.6rem);
   line-height: 1.02;
   font-weight: 700;
   font-stretch: 112%;
@@ -127,10 +133,25 @@ h1 {
 
 .lead {
   margin: 0;
-  font-size: 1.2rem;
+  font-size: 1.08rem;
+  font-weight: 600;
+  font-stretch: 106%;
   line-height: 1.5;
+  max-width: 58ch;
+}
+
+.lead-terms {
+  margin: 0.25rem 0 0;
   color: var(--text-soft);
-  max-width: 56ch;
+}
+
+.lead-terms .term {
+  white-space: nowrap;
+}
+
+.lead-terms .sep {
+  color: var(--beam);
+  padding: 0 0.2em 0 0.45em;
 }
 
 /* the beam: one line of light across the whole width */
@@ -234,6 +255,12 @@ h2 {
   letter-spacing: -0.01em;
 }
 
+.prose {
+  margin: 0;
+  color: var(--text-soft);
+  max-width: 58ch;
+}
+
 .note {
   margin: 0.9rem 0 0;
   color: var(--text-dim);
@@ -241,28 +268,29 @@ h2 {
   max-width: 60ch;
 }
 
-/* install: the one block with a surface, lit along its top edge */
+/* install: the one block with a surface; the button sits beside the short second line */
 .terminal {
   position: relative;
-  max-width: 46rem;
+  width: fit-content;
+  max-width: 100%;
+  border: 1px solid var(--oxide);
   border-radius: 6px;
-  border-top: 1px solid rgba(255, 51, 0, 0.35);
-  background: linear-gradient(180deg, rgba(51, 0, 0, 0.6), rgba(51, 0, 0, 0.18) 60%, rgba(0, 0, 0, 0));
-  padding: 1.1rem 1.25rem;
+  background: #120000;
+  padding: 1rem 1.25rem;
 }
 
 .terminal pre {
   margin: 0;
-  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   font: 15px/1.75 var(--mono);
   color: rgba(255, 255, 255, 0.92);
-  padding-right: 4.5rem;
 }
 
 .terminal button {
   position: absolute;
-  top: 0.8rem;
-  right: 0.8rem;
+  right: 0.7rem;
+  bottom: 0.7rem;
   font: 500 13px var(--sans);
   color: var(--text-soft);
   background: transparent;
@@ -293,7 +321,7 @@ dl {
 }
 
 dl > div {
-  padding: 1rem 0;
+  padding: 0.85rem 0;
   border-top: 1px solid rgba(102, 0, 0, 0.55);
 }
 
@@ -381,8 +409,7 @@ footer nav {
   .hero {
     padding-top: 4.5rem;
   }
-  .terminal pre {
-    padding-right: 0;
-    padding-top: 1.6rem;
+  .terminal {
+    width: 100%;
   }
 }
