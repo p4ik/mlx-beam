@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# Collapsed in diffs and left out of the language statistics.
+docs/site/package-lock.json linguist-generated=true
+mlx_beam/_vendor/** linguist-vendored=true

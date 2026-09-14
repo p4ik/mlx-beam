@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-beam"
+dynamic = ["version"]
+description = "B.E.A.M. - Batched Engine for Apple Metal: an MLX inference engine for hybrid and MoE models on Apple silicon."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "the mlx-beam contributors" }]
+keywords = ["mlx", "apple-silicon", "llm", "inference", "moe"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mlx>=0.32; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pre-commit>=4"]
+
+[project.scripts]
+beam = "mlx_beam.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/p4ik/mlx-beam"
+Repository = "https://github.com/p4ik/mlx-beam"
+Changelog = "https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md"
+Issues = "https://github.com/p4ik/mlx-beam/issues"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+# PyPI refuses local labels (+g<hash>); .dev builds from main must be uploadable.
+local_scheme = "no-local-version"
+# main counts towards the next minor (0.1.0 -> 0.2.0.devN); a release-* branch
+# counts towards the next patch (0.1.1.devN). Measured 2026-09-14 against the
+# three schemes; the default would count 0.1.1.devN on main.
+version_scheme = "release-branch-semver"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "mlx_beam/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mlx_beam"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["docs/site/node_modules", "docs/site/dist"]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+extend-exclude = ["mlx_beam/_vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["exactness: bit-exact comparisons on tiny models (Apple silicon only)"]

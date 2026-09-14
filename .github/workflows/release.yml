@@ -1,0 +1,98 @@
+name: Release
+
+# Publishes to PyPI through Trusted Publishing (no token in the repo).
+#   - a tag v* (v0.2.0, v0.2.0rc1, v0.2.0a1): the tagged commit must be on
+#     main or on a release-* branch (patch releases for an older minor); the
+#     tests run again on Apple silicon before anything is uploaded.
+#   - workflow_dispatch on main or a release-* branch: a .dev build of that
+#     branch (0.2.0.devN on main, 0.1.1.devN on release-0.1; N = commits
+#     since the last tag) for a lab test.
+# Installers skip pre-releases unless asked. The `pypi` environment can add
+# a required reviewer in the repository settings.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: The commit must be on main or on a release-* branch
+        run: |
+          git fetch origin 'refs/heads/main:refs/remotes/origin/main' 'refs/heads/release-*:refs/remotes/origin/release-*'
+          ok=0
+          for b in $(git for-each-ref --format='%(refname)' refs/remotes/origin/main 'refs/remotes/origin/release-*'); do
+            git merge-base --is-ancestor "$GITHUB_SHA" "$b" && { echo "on $b"; ok=1; }
+          done
+          test "$ok" = 1 || { echo "::error::$GITHUB_SHA is neither on main nor on a release-* branch"; exit 1; }
+      - name: A dispatch must run on main or a release-* branch itself
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          case "$GITHUB_REF_NAME" in
+            main|release-*) ;;
+            *) echo "::error::.dev builds are published from main or release-* only, not $GITHUB_REF_NAME"; exit 1;;
+          esac
+
+  test:
+    needs: verify
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - run: uvx pre-commit run --all-files
+      - run: uv run beam doctor --json
+      - run: uv run pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: ls -l dist/
+      - name: The built version must match the trigger
+        run: |
+          built=$(ls dist/*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
+          echo "built version: $built"
+          case "$GITHUB_EVENT_NAME" in
+            workflow_dispatch)
+              case "$built" in
+                *.dev*) ;;
+                *) echo "::error::dispatch builds publish .dev versions only; main is at a release tag ($built) - push the tag instead"; exit 1;;
+              esac;;
+            push)
+              test "$built" = "${GITHUB_REF_NAME#v}" \
+                || { echo "::error::tag $GITHUB_REF_NAME does not match the built version $built"; exit 1; };;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
