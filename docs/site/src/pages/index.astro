@@ -1,28 +1,52 @@
 ---
+import "@fontsource-variable/archivo/standard.css";
 import "../styles/global.css";
+
 const repo = "https://github.com/p4ik/mlx-beam";
+const install = `uv tool install "mlx-beam @ git+${repo}"\nbeam doctor`;
+
+const built = [
+  {
+    title: "Prefix cache with checkpoints",
+    text: "Recurrent state is saved at segment boundaries, so a long conversation resumes from disk instead of re-prefilling.",
+  },
+  {
+    title: "Multi-token prediction in the batch",
+    text: "Speculative decoding inside continuous batching, with the rollback that makes it exact.",
+  },
+  {
+    title: "Expert streaming",
+    text: "Routed experts stay on SSD behind a resident pool, for models larger than memory.",
+  },
+];
+
 const status = [
-  ["CLI, packaging, CI", "skeleton"],
-  ["Vendored mlx-lm base", "planned"],
-  ["Prefix cache with recurrent-state checkpoints", "planned"],
-  ["Multi-token prediction in the batch", "planned"],
-  ["Expert streaming from SSD", "planned"],
+  { piece: "CLI, packaging, CI", state: "skeleton", built: true },
+  { piece: "Vendored mlx-lm base", state: "planned", built: false },
+  { piece: "Prefix cache with recurrent-state checkpoints", state: "planned", built: false },
+  { piece: "Multi-token prediction in the batch", state: "planned", built: false },
+  { piece: "Expert streaming from SSD", state: "planned", built: false },
 ];
 ---
+
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>mlx-beam</title>
-    <meta name="description" content="B.E.A.M. - an MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon." />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <meta
+      name="description"
+      content="An inference engine for hybrid-attention and mixture-of-experts models on Apple silicon, built on MLX."
+    />
+    <meta name="theme-color" content="#000000" />
   </head>
   <body>
     <header class="top">
       <div class="wrap">
-        <a class="brand" href="./"><span class="glyph"></span>mlx-beam</a>
+        <a class="brand" href="./">
+          <span class="name">mlx-beam</span>
+          <span class="expands">Batched Engine for Apple Metal</span>
+        </a>
         <nav>
           <a href={repo}>GitHub</a>
           <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
@@ -30,64 +54,93 @@ const status = [
       </div>
     </header>
 
-    <main class="wrap">
-      <div class="hero">
-        <div class="eyebrow"><span>B.E.A.M. &mdash; Batched Engine for Apple Metal</span><span class="pill">work in progress</span></div>
-        <h1>An inference engine for the models a plain transformer server gets wrong.</h1>
-        <p class="lead">Hybrid-attention and mixture-of-experts models on Apple silicon, built on MLX: recurrent state that cannot be trimmed, experts that do not fit in memory, speculative decoding under batching.</p>
+    <main>
+      <section class="hero">
+        <div class="wrap">
+          <h1>An inference engine for the models a plain transformer server gets wrong.</h1>
+          <p class="lead">
+            Hybrid attention and mixture-of-experts on Apple silicon, built on MLX: recurrent state that
+            cannot be trimmed, experts that do not fit in memory, speculative decoding under batching.
+          </p>
+        </div>
+      </section>
+
+      <div class="beam" aria-hidden="true">
+        <span class="glow"></span>
+        <span class="line"></span>
+        <span class="core"></span>
       </div>
 
       <section>
-        <h2>Install</h2>
-        <div class="code">
-          <div class="bar"><span>terminal</span><button type="button" data-copy>Copy</button></div>
-          <pre><code>uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
-beam doctor</code></pre>
-        </div>
-        <p class="note"><code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
-      </section>
-
-      <section>
-        <h2>Built for</h2>
-        <div class="cards">
-          <div class="card"><h3>Prefix cache with checkpoints</h3><p>Recurrent state is saved at segment boundaries, so a long conversation resumes from disk instead of re-prefilling.</p></div>
-          <div class="card"><h3>Multi-token prediction in the batch</h3><p>Speculative decoding inside continuous batching, with the rollback that makes it exact.</p></div>
-          <div class="card"><h3>Expert streaming</h3><p>Routed experts stay on SSD behind a resident pool, for models larger than RAM.</p></div>
+        <div class="wrap">
+          <div class="terminal">
+            <pre><code>{install}</code></pre>
+            <button type="button" data-copy>Copy</button>
+          </div>
+          <p class="note"><code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
         </div>
       </section>
 
       <section>
-        <h2>Status</h2>
-        <table>
-          <thead><tr><th>Piece</th><th>State</th></tr></thead>
-          <tbody>
-            {status.map(([piece, state]) => (
-              <tr><td>{piece}</td><td><span class={`state ${state}`}>{state}</span></td></tr>
+        <div class="wrap">
+          <h2>Built for</h2>
+          <dl>
+            {built.map((b) => (
+              <div>
+                <dt>{b.title}</dt>
+                <dd>{b.text}</dd>
+              </div>
             ))}
-          </tbody>
-        </table>
-        <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
+          </dl>
+        </div>
+      </section>
+
+      <section>
+        <div class="wrap">
+          <h2>Status</h2>
+          <table>
+            <tbody>
+              {status.map((s) => (
+                <tr>
+                  <td>{s.piece}</td>
+                  <td class="state"><span class={`mark ${s.built ? "built" : "planned"}`}></span>{s.state}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
+        </div>
       </section>
     </main>
 
     <footer>
       <div class="wrap">
-        <span>Apache-2.0 &middot; vendored components keep their own licenses</span>
-        <span><a href={repo}>GitHub</a> &middot; <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a></span>
+        <p>Apache-2.0. Vendored components keep their own licenses.</p>
+        <nav>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+        </nav>
       </div>
     </footer>
 
     <script>
-      // Copy the install block; progressive enhancement, the page works without it.
-      document.querySelectorAll("[data-copy]").forEach((btn) => {
-        btn.addEventListener("click", async () => {
-          const code = btn.closest(".code")?.querySelector("code")?.textContent ?? "";
+      const beam = document.querySelector(".beam");
+      document.querySelectorAll("[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const text = button.closest(".terminal")?.querySelector("code")?.textContent ?? "";
           try {
-            await navigator.clipboard.writeText(code);
-            btn.textContent = "Copied";
-            setTimeout(() => (btn.textContent = "Copy"), 1500);
+            await navigator.clipboard.writeText(text);
+            button.textContent = "Copied";
+            button.classList.add("done");
+            beam?.classList.remove("pulse");
+            void beam?.offsetWidth;
+            beam?.classList.add("pulse");
+            setTimeout(() => {
+              button.textContent = "Copy";
+              button.classList.remove("done");
+            }, 1600);
           } catch {
-            btn.textContent = "Select and copy";
+            button.textContent = "Select and copy";
           }
         });
       });
