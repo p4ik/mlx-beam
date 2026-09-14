@@ -56,7 +56,7 @@ version-file = "mlx_beam/_version.py"
 packages = ["mlx_beam"]
 
 [tool.hatch.build.targets.sdist]
-exclude = ["docs/site/node_modules", "docs/site/dist"]
+only-include = ["mlx_beam", "tests", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"]
 
 [tool.black]
 line-length = 88
