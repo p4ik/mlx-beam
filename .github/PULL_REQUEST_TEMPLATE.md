@@ -1,6 +1,6 @@
 ## What
 
-<!-- One change per PR. Say what changes and why, for a reader without context. -->
+<!-- One change per PR. List what changed, in plain words. -->
 
 ## Checklist
 
