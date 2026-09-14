@@ -9,6 +9,9 @@ name: Release
 #     since the last tag) for a lab test.
 # Installers skip pre-releases unless asked. The `pypi` environment can add
 # a required reviewer in the repository settings.
+# After the upload the same files go to a GitHub release: the tag's own for
+# v*, a rolling `dev` release for dispatches (no digit in the tag name, so
+# hatch-vcs never counts it as a version).
 on:
   push:
     tags: ["v*"]
@@ -96,3 +99,32 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Release for a tag, prerelease when the version has a, b or rc
+        if: github.event_name == 'push'
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *a[0-9]*|*b[0-9]*|*rc[0-9]*) pre=--prerelease;;
+            *) pre=;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --notes "" $pre
+      - name: Rolling dev release for a dispatch
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          built=$(ls dist/*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
+          gh release delete dev --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create dev dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "dev $built" --notes "" --prerelease
