@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
       - run: uvx pre-commit run --all-files --show-diff-on-failure
 
   test-apple-silicon:
@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # hatch-vcs needs the tags
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --extra dev
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: "3.12"
       - run: uv sync --extra dev
@@ -55,6 +55,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.1.0
       - run: uv build
       - run: ls -l dist/
