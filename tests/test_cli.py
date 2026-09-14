@@ -32,6 +32,8 @@ def test_doctor_json_has_the_fields(capsys):
         "mlx",
         "device",
         "memory_gb",
+        "ok",
+        "error",
     }
 
 
@@ -50,3 +52,39 @@ def test_doctor_exit_code_follows_mlx(capsys):
     assert rc == (0 if has_mlx else 1)
     if platform.system() == "Darwin" and platform.machine() == "arm64":
         assert has_mlx, "mlx must be installed on Apple silicon"
+
+
+def test_doctor_keeps_the_load_error(monkeypatch, capsys):
+    """An mlx that is installed but fails to load is reported with its error."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def failing_import(name, *args, **kwargs):
+        if name == "mlx.core":
+            raise ImportError("dlopen: Metal not available")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", failing_import)
+    rc = doctor(as_json=True)
+    report = json.loads(capsys.readouterr().out)
+    assert rc == 1 and report["ok"] is False
+    assert (
+        "failed to load" in report["error"] and "Metal not available" in report["error"]
+    )
+
+
+def test_doctor_reports_missing_package(monkeypatch, capsys):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def missing_import(name, *args, **kwargs):
+        if name == "mlx.core":
+            raise ModuleNotFoundError("No module named 'mlx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_import)
+    rc = doctor(as_json=True)
+    report = json.loads(capsys.readouterr().out)
+    assert rc == 1 and "not installed" in report["error"]

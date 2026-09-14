@@ -41,6 +41,10 @@ Issues = "https://github.com/p4ik/mlx-beam/issues"
 [tool.hatch.version]
 source = "vcs"
 
+[tool.hatch.version.raw-options]
+# PyPI refuses local labels (+g<hash>); .dev builds from main must be uploadable.
+local_scheme = "no-local-version"
+
 [tool.hatch.build.hooks.vcs]
 version-file = "mlx_beam/_version.py"
 

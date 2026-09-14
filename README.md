@@ -17,14 +17,21 @@ The engine reads standard MLX checkpoints and the B.E.A.M. package layout (`extr
 
 ## Install
 
-Not on PyPI yet. Until the first pre-release:
+Not on PyPI yet. Until the first pre-release, install the command line tool straight from the repository:
 
 ```bash
-uv add "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
+uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
 beam doctor
 ```
 
-`beam doctor` prints the Python, MLX, device and memory it sees. It is the only command so far.
+Inside an existing uv project, add it as a dependency instead and run it through uv:
+
+```bash
+uv add "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
+uv run beam doctor
+```
+
+`beam doctor` prints the Python, MLX, device and memory it sees (`--json` for scripts) and exits non-zero when MLX is missing or fails to load. It is the only command so far.
 
 ## Status
 

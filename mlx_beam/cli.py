@@ -17,25 +17,34 @@ def doctor(as_json: bool = False) -> int:
         "mlx": None,
         "device": None,
         "memory_gb": None,
+        "ok": False,
+        "error": None,
     }
     try:
         import mlx.core as mx
-
-        report["mlx"] = mx.__version__
-        info = mx.device_info() if hasattr(mx, "device_info") else {}
-        report["device"] = info.get("device_name") or str(mx.default_device())
-        mem = info.get("memory_size")
-        if mem:
-            report["memory_gb"] = round(mem / 2**30, 1)
-    except ImportError:
-        report["mlx"] = "not installed (mlx runs on Apple silicon only)"
+    except ModuleNotFoundError:
+        report["error"] = "mlx is not installed (it runs on Apple silicon only)"
+    except ImportError as e:
+        # Installed but the extension did not load (Metal unavailable, wrong wheel).
+        report["error"] = f"mlx is installed but failed to load: {e!r}"
+    else:
+        report["mlx"] = getattr(mx, "__version__", "?")
+        try:
+            info = mx.device_info() if hasattr(mx, "device_info") else {}
+            report["device"] = info.get("device_name") or str(mx.default_device())
+            mem = info.get("memory_size")
+            if mem:
+                report["memory_gb"] = round(mem / 2**30, 1)
+            report["ok"] = True
+        except Exception as e:  # noqa: BLE001 - the error text is the finding
+            report["error"] = f"mlx loaded but the device query failed: {e!r}"
     if as_json:
         print(json.dumps(report, indent=2))
     else:
         width = max(len(k) for k in report)
         for key, value in report.items():
             print(f"{key:<{width}}  {value}")
-    return 0 if report["mlx"] and not str(report["mlx"]).startswith("not ") else 1
+    return 0 if report["ok"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
