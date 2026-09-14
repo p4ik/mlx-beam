@@ -11,6 +11,9 @@
 - Health reports what is active, with evidence - not what is configured.
 - Never fall back silently to another inference path. Fail the request.
 - English only: code, comments, docstrings, commits, docs, issues.
+- No statements with a known expiry in README or site ("not yet", "currently",
+  "soon"). Write what holds; the current state lives in the status table and
+  the changelog.
 - Format with `uvx pre-commit run --all` (black, isort, ruff).
 
 ### Do not

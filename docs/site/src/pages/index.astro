@@ -1,39 +1,96 @@
 ---
 import "../styles/global.css";
-const title = "mlx-beam";
+const repo = "https://github.com/p4ik/mlx-beam";
+const status = [
+  ["CLI, packaging, CI", "skeleton"],
+  ["Vendored mlx-lm base", "planned"],
+  ["Prefix cache with recurrent-state checkpoints", "planned"],
+  ["Multi-token prediction in the batch", "planned"],
+  ["Expert streaming from SSD", "planned"],
+];
 ---
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>{title} - Batched Engine for Apple Metal</title>
-    <meta name="description" content="B.E.A.M.: an MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon." />
+    <title>mlx-beam</title>
+    <meta name="description" content="B.E.A.M. - an MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   </head>
   <body>
-    <main>
-      <span class="wip">work in progress</span>
-      <h1>mlx-beam</h1>
-      <p class="lead">B.E.A.M. — Batched Engine for Apple Metal. An MLX inference engine for hybrid-attention and mixture-of-experts models on Apple silicon.</p>
+    <header class="top">
+      <div class="wrap">
+        <a class="brand" href="./"><span class="glyph"></span>mlx-beam</a>
+        <nav>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
+        </nav>
+      </div>
+    </header>
 
-      <h2>Install</h2>
-      <pre><code>uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
+    <main class="wrap">
+      <div class="hero">
+        <div class="eyebrow"><span>B.E.A.M. &mdash; Batched Engine for Apple Metal</span><span class="pill">work in progress</span></div>
+        <h1>An inference engine for the models a plain transformer server gets wrong.</h1>
+        <p class="lead">Hybrid-attention and mixture-of-experts models on Apple silicon, built on MLX: recurrent state that cannot be trimmed, experts that do not fit in memory, speculative decoding under batching.</p>
+      </div>
+
+      <section>
+        <h2>Install</h2>
+        <div class="code">
+          <div class="bar"><span>terminal</span><button type="button" data-copy>Copy</button></div>
+          <pre><code>uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
 beam doctor</code></pre>
+        </div>
+        <p class="note"><code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
+      </section>
 
-      <h2>What it is built for</h2>
-      <ul>
-        <li>A prefix cache with recurrent-state checkpoints — long conversations resume from disk instead of re-prefilling.</li>
-        <li>Multi-token prediction inside continuous batching.</li>
-        <li>Expert streaming from SSD with a resident pool, for models larger than RAM.</li>
-      </ul>
+      <section>
+        <h2>Built for</h2>
+        <div class="cards">
+          <div class="card"><h3>Prefix cache with checkpoints</h3><p>Recurrent state is saved at segment boundaries, so a long conversation resumes from disk instead of re-prefilling.</p></div>
+          <div class="card"><h3>Multi-token prediction in the batch</h3><p>Speculative decoding inside continuous batching, with the rollback that makes it exact.</p></div>
+          <div class="card"><h3>Expert streaming</h3><p>Routed experts stay on SSD behind a resident pool, for models larger than RAM.</p></div>
+        </div>
+      </section>
 
-      <h2>Today</h2>
-      <p>The skeleton: packaging, CI on Apple silicon, <code>beam doctor</code>. Nothing serves a model yet. Measured numbers will appear here when there are some.</p>
-
-      <footer>
-        <a href="https://github.com/p4ik/mlx-beam">GitHub</a> ·
-        <a href="https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md">Changelog</a> ·
-        Apache-2.0
-      </footer>
+      <section>
+        <h2>Status</h2>
+        <table>
+          <thead><tr><th>Piece</th><th>State</th></tr></thead>
+          <tbody>
+            {status.map(([piece, state]) => (
+              <tr><td>{piece}</td><td><span class={`state ${state}`}>{state}</span></td></tr>
+            ))}
+          </tbody>
+        </table>
+        <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
+      </section>
     </main>
+
+    <footer>
+      <div class="wrap">
+        <span>Apache-2.0 &middot; vendored components keep their own licenses</span>
+        <span><a href={repo}>GitHub</a> &middot; <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a></span>
+      </div>
+    </footer>
+
+    <script>
+      // Copy the install block; progressive enhancement, the page works without it.
+      document.querySelectorAll("[data-copy]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const code = btn.closest(".code")?.querySelector("code")?.textContent ?? "";
+          try {
+            await navigator.clipboard.writeText(code);
+            btn.textContent = "Copied";
+            setTimeout(() => (btn.textContent = "Copy"), 1500);
+          } catch {
+            btn.textContent = "Select and copy";
+          }
+        });
+      });
+    </script>
   </body>
 </html>

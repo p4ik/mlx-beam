@@ -2,7 +2,7 @@
 
 **B.E.A.M. — Batched Engine for Apple Metal.** An [MLX](https://github.com/ml-explore/mlx) inference engine for hybrid-attention and mixture-of-experts language models on Apple silicon.
 
-> **Work in progress.** This repository holds the project skeleton. Nothing here serves a model yet. Follow the [changelog](CHANGELOG.md) for what lands.
+> **Work in progress.** See the status table below and the [changelog](CHANGELOG.md).
 
 ## What it is for
 
@@ -17,19 +17,12 @@ The engine reads standard MLX checkpoints and the B.E.A.M. package layout (`extr
 
 ## Install
 
-Not on PyPI yet. Until the first pre-release, install the command line tool straight from the repository:
-
 ```bash
 uv tool install "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
 beam doctor
 ```
 
-Inside an existing uv project, add it as a dependency instead and run it through uv:
-
-```bash
-uv add "mlx-beam @ git+https://github.com/p4ik/mlx-beam"
-uv run beam doctor
-```
+Inside an existing uv project: `uv add "mlx-beam @ git+https://github.com/p4ik/mlx-beam"`, then `uv run beam doctor`.
 
 `beam doctor` prints the Python, MLX, device and memory it sees (`--json` for scripts) and exits non-zero when MLX is missing or fails to load. It is the only command so far.
 
