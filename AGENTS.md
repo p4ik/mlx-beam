@@ -64,7 +64,8 @@ choice["message"]["content"] = text if text else None
   free-form. No direct pushes to `main`.
 - Branch names: `feat/…`, `fix/…`, `docs/…`, `vendor/…`. Delete after merge.
 - Versions come from git tags (hatch-vcs); never edit a version string.
-  Between tags the tree is `0.y.0.devN+g<hash>`, N = commits since the tag.
+  Between tags the tree is `0.y.0.devN`, N = commits since the tag (no local
+  `+g<hash>` label: PyPI refuses local versions, and `.dev` builds are published).
 - Pre-releases are PEP 440 (`0.2.0.dev14`, `0.2.0a1`, `0.2.0rc1`) and are
   published when a test needs them - `.dev` only from `main`; installers skip
   them unless asked. A burnt release number is never reused.
