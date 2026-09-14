@@ -11,6 +11,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `/health` with the cache layout that was actually built.
 - OpenAI-compatible server: `/v1/chat/completions`, `/v1/completions`,
   `/v1/responses` (stateless, function tools), `/v1/models`; `beam serve`.
+- Prefix store with recurrent-state checkpoints: hybrid models resume from
+  the last system or user boundary instead of re-prefilling everything.
 - Quantized KV cache for the batch path and a tiled quantized attention,
   ported from mlx-optiq; the rotating-cache merge guard (see `VENDORED.md`).
 - Vendored mlx-lm (inference subset, pinned commit) with four local changes:

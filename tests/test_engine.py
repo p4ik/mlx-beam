@@ -66,7 +66,7 @@ def test_prompt_cache_is_reused():
     prompt = list(range(1, 20))
     with Engine(model) as engine:
         first = collect(engine.submit(GenerationRequest(prompt, max_tokens=4)))
-        assert engine.health()["prompt_cache"]["entries"] == 1
+        assert engine.health()["prefix_store"]["entries"] == 1
         again = engine.submit(GenerationRequest(prompt, max_tokens=4))
         assert collect(again) == first
         assert again.prompt_cached >= len(prompt) - 1

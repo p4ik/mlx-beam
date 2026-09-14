@@ -16,13 +16,9 @@ from typing import Any
 import mlx.core as mx
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
-from mlx_beam._vendor.mlx_lm.models.cache import (
-    LRUPromptCache,
-    can_trim_prompt_cache,
-    trim_prompt_cache,
-)
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
+from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -75,8 +71,8 @@ class Engine:
             prefill_slice=prefill_slice,
             decode_share=decode_share,
         )
-        self.prompt_cache = LRUPromptCache(
-            max_size=prompt_cache_size,
+        self.prefix_store = PrefixStore(
+            max_entries=prompt_cache_size,
             max_bytes=prompt_cache_bytes if prompt_cache_bytes else 1 << 63,
         )
         self._inbox: queue.Queue = queue.Queue()
@@ -86,6 +82,8 @@ class Engine:
         self._lock = threading.Lock()
         self._cancelled: set = set()
         self._live: dict[int, ResultStream] = {}
+        # uid -> (tokens already covered, checkpoints collected so far)
+        self._bookkeeping: dict[int, tuple[int, dict]] = {}
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
@@ -181,10 +179,7 @@ class Engine:
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
             },
-            "prompt_cache": {
-                "entries": len(self.prompt_cache),
-                "bytes": self.prompt_cache.nbytes,
-            },
+            "prefix_store": self.prefix_store.describe(),
         }
 
     # -- the worker -------------------------------------------------------
@@ -205,6 +200,7 @@ class Engine:
         for stream in self._live.values():
             stream.put(dead)
         self._live.clear()
+        self._bookkeeping.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -215,27 +211,32 @@ class Engine:
     def _admit(self, gen: BatchGenerator, stream: ResultStream) -> None:
         req = stream.request
         try:
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_key, req.tokens
+            hit = self.prefix_store.fetch(self.model_key, list(req.tokens))
+            if hit is None:
+                cache, covered, carried = (
+                    make_request_cache(self.model, self.kv_policy),
+                    0,
+                    {},
+                )
+            else:
+                cache, covered, carried = hit.cache, hit.covered, hit.checkpoints
+            rest = list(req.tokens[covered:])
+            # Segments end where a checkpoint is wanted; the generator reports
+            # each end, and the last token always stands alone.
+            cuts = sorted(
+                {b - covered for b in req.boundaries if covered < b < len(req.tokens)}
             )
-            if cache is None:
-                cache = make_request_cache(self.model, self.kv_policy)
-                rest = req.tokens
-            elif not rest:
-                # An exact hit: the generator still needs one token to start.
-                if can_trim_prompt_cache(cache):
-                    trim_prompt_cache(cache, 1)
-                    rest = req.tokens[-1:]
-                else:
-                    cache = make_request_cache(self.model, self.kv_policy)
-                    rest = req.tokens
-            cached = len(req.tokens) - len(rest)
+            segments, start = [], 0
+            for c in cuts:
+                segments.append(rest[start:c])
+                start = c
+            segments.append(rest[start:])
             stop = StopSequences(req.stop_sequences or None)
             (uid,) = gen.insert_segments(
-                segments=[[list(rest)]],
+                segments=[segments],
                 max_tokens=[req.max_tokens],
                 caches=[cache],
-                all_tokens=[list(req.tokens[:cached])],
+                all_tokens=[list(req.tokens[:covered])],
                 samplers=[_sampler(req.sampling)],
                 logits_processors=[_logits_processors(req.sampling)],
                 stop_sequences=[stop],
@@ -243,9 +244,28 @@ class Engine:
         except Exception as e:  # noqa: BLE001 - one bad request, not the worker
             stream.put(e)
             return
-        stream.prompt_cached = cached
-        stream.put(PromptProgress(0, len(rest), cached))
+        stream.prompt_cached = covered
+        stream.put(PromptProgress(0, len(rest), covered))
         self._live[uid] = stream
+        self._bookkeeping[uid] = (covered, dict(carried))
+
+    def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
+        """Snapshot the recurrent layers of one sequence at a boundary."""
+        found = gen._find_uids([uid]).get(uid)
+        if found is None:
+            return
+        stage, idx = found
+        batch = gen._prompt_batch if stage == 1 else gen._generation_batch
+        if stage == 0:
+            return
+        caches = batch.prompt_cache
+        rec = recurrent_layers(caches)
+        if not rec:
+            return
+        snap = {i: caches[i].extract(idx).cache for i in rec}
+        for arrays in snap.values():
+            mx.eval(*[a for a in arrays if a is not None])
+        self._bookkeeping[uid][1][position] = snap
 
     def _drop_cancelled(self, gen: BatchGenerator) -> None:
         with self._lock:
@@ -258,6 +278,7 @@ class Engine:
             gen.remove(uids)
         for u in uids:
             self._live.pop(u).put(None)
+            self._bookkeeping.pop(u, None)
 
     def _warmup(self, gen: BatchGenerator) -> None:
         cache = make_request_cache(self.model, self.kv_policy)
@@ -304,12 +325,16 @@ class Engine:
 
                 for r in prompt_responses:
                     s = self._live.get(r.uid)
-                    if s is not None:
-                        s.put(
-                            PromptProgress(
-                                r.progress[0], r.progress[1], s.prompt_cached
-                            )
-                        )
+                    if s is None:
+                        continue
+                    s.put(PromptProgress(r.progress[0], r.progress[1], s.prompt_cached))
+                    # The generator splits the last prompt token into its own
+                    # segment; that end is no boundary of ours.
+                    if r.end_of_segment and (
+                        r.end_of_prompt or r.progress[0] != r.progress[1] - 1
+                    ):
+                        covered = self._bookkeeping[r.uid][0]
+                        self._checkpoint(gen, r.uid, covered + r.progress[0])
 
                 for r in gen_responses:
                     s = self._live.get(r.uid)
@@ -324,10 +349,12 @@ class Engine:
                     )
                     if r.finish_reason is not None:
                         del self._live[r.uid]
-                        self.prompt_cache.insert_cache(
+                        _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
+                        self.prefix_store.insert(
                             self.model_key,
                             list(r.all_tokens),
                             r.prompt_cache,
+                            checkpoints=checkpoints,
                             cache_type="assistant",
                         )
         finally:

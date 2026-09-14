@@ -31,6 +31,9 @@ class GenerationRequest:
     sampling: SamplingParams = field(default_factory=SamplingParams)
     # Token-id sequences that end the generation; the model's eos ids belong here.
     stop_sequences: Sequence[Sequence[int]] = ()
+    # Prompt positions worth a recurrent-state checkpoint (system end, user
+    # ends); the prompt end always gets one.
+    boundaries: Sequence[int] = ()
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):

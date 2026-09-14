@@ -178,6 +178,60 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     return list(tokens)
 
 
+# Boundaries are found by re-rendering message prefixes; the last few user
+# turns are enough, older ones are covered by earlier stored entries.
+BOUNDARY_TURNS = 4
+
+
+def _common_prefix(a: list[int], b: list[int]) -> int:
+    n = 0
+    for x, y in zip(a, b):  # noqa: B905 - lengths differ on purpose
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def prompt_boundaries(tokenizer, req: ChatRequest, prompt: list[int]) -> list[int]:
+    """Prompt positions where a recurrent-state checkpoint pays off: the end
+    of the system block and the end of the last user turns."""
+    kwargs = dict(req.template_kwargs)
+    if req.tools:
+        kwargs["tools"] = req.tools
+    messages = req.messages
+    ends: set[int] = set()
+
+    def render(msgs, generation_prompt):
+        try:
+            return list(
+                tokenizer.apply_chat_template(
+                    msgs,
+                    add_generation_prompt=generation_prompt,
+                    tokenize=True,
+                    **kwargs,
+                )
+            )
+        except Exception:  # noqa: BLE001 - a template that refuses a prefix
+            return []
+
+    n_system = 0
+    for m in messages:
+        if m["role"] != "system":
+            break
+        n_system += 1
+    if n_system:
+        sys_tokens = render(
+            messages[:n_system] + [{"role": "user", "content": ""}], False
+        )
+        ends.add(_common_prefix(sys_tokens, prompt))
+    user_idx = [i for i, m in enumerate(messages) if m["role"] == "user"]
+    for i in user_idx[-BOUNDARY_TURNS:]:
+        if i == len(messages) - 1:
+            continue  # the prompt end is a boundary by itself
+        ends.add(_common_prefix(render(messages[: i + 1], True), prompt))
+    return sorted(e for e in ends if 0 < e < len(prompt))
+
+
 def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
     prompt = build_prompt(tokenizer, req)
     return GenerationRequest(
@@ -185,6 +239,7 @@ def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
         max_tokens=req.max_tokens,
         sampling=req.sampling,
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
+        boundaries=prompt_boundaries(tokenizer, req, prompt),
     )
 
 
