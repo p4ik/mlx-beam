@@ -202,3 +202,56 @@ def test_mirroring_fills_only_the_keys_the_renderer_reads_and_the_client_left():
     )
     chat.build_prompt(StubTokenizer(), req)
     assert req.messages[1]["reasoning_content"] == "w3"
+
+
+@pytest.mark.parametrize(
+    "server, body, expected",
+    [
+        (
+            {"enable_thinking": False},
+            {"enable_thinking": True},
+            {"enable_thinking": True},
+        ),
+        (
+            {"enable_thinking": True},
+            {"reasoning_effort": "none"},
+            {"enable_thinking": False},
+        ),
+        (
+            {"reasoning_effort": "low"},
+            {"reasoning_effort": "high"},
+            {"reasoning_effort": "xhigh"},
+        ),
+        ({"lang": "de"}, {}, {"lang": "de"}),
+    ],
+)
+def test_request_aliases_override_the_server_template_args(server, body, expected):
+    from mlx_beam.api.defaults import RequestDefaults
+
+    d = RequestDefaults.resolve(flags={"chat_template_args": server})
+    req = chat.parse_chat_request({"messages": MSGS, **body}, "m", d)
+    assert req.template_kwargs == expected
+    # Explicit chat_template_kwargs still sit on top of both.
+    req = chat.parse_chat_request(
+        {"messages": MSGS, **body, "chat_template_kwargs": {"enable_thinking": None}},
+        "m",
+        d,
+    )
+    assert req.template_kwargs["enable_thinking"] is None
+
+
+def test_responses_take_the_prompt_cap_and_the_reserve():
+    from mlx_beam.api.defaults import RequestDefaults
+
+    d = RequestDefaults.resolve(flags={"min_response_tokens": 12})
+    r = responses.parse_responses_request(
+        {"input": "w1", "max_prompt_tokens": 2, "min_response_tokens": 0}, "m", d
+    )
+    gen = responses.to_generation_request(StubTokenizer(), r, d)
+    assert gen.max_prompt_tokens == 2 and gen.min_response_tokens == 0
+    r = responses.parse_responses_request({"input": "w1"}, "m", d)
+    assert (
+        responses.to_generation_request(StubTokenizer(), r, d).min_response_tokens == 12
+    )
+    with pytest.raises(ApiError):
+        responses.parse_responses_request({"input": "w1", "max_prompt_tokens": 0}, "m")

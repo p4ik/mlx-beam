@@ -96,3 +96,12 @@ def test_seeded_requests_repeat_and_batch_with_shared_samplers():
         outs = [collect(s) for s in streams]
         assert all(len(o) == 6 for o in outs)
         assert engine.health()["sampling"]["samplers"] == 1
+
+
+def test_ruled_out_tokens_are_no_alternatives():
+    import json
+
+    lp = mx.array([0.0, -mx.inf, -mx.inf, -1.5])
+    out = top_logprobs(lp, 3)
+    assert out == ((0, 0.0), (3, -1.5))
+    json.dumps(out, allow_nan=False)

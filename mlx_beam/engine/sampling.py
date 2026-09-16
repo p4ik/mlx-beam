@@ -9,6 +9,7 @@ so a seed can only be honoured by a sampler that carries its own key.
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 
 import mlx.core as mx
@@ -117,12 +118,14 @@ class SeededSampler:
 
 
 def top_logprobs(logprobs: mx.array, n: int) -> tuple[tuple[int, float], ...]:
-    """The n most likely token ids with their log probabilities, best first."""
+    """The n most likely token ids with their log probabilities, best first.
+    Tokens a processor ruled out (-inf) are no alternatives and are left
+    out, so the list is JSON-clean and may be shorter than n."""
     n = min(n, logprobs.shape[-1])
     idx = mx.argpartition(-logprobs, kth=n - 1, axis=-1)[..., :n]
     vals = mx.take_along_axis(logprobs, idx, axis=-1)
     pairs = sorted(zip(idx.tolist(), vals.tolist(), strict=True), key=lambda x: -x[1])
-    return tuple((int(i), float(v)) for i, v in pairs)
+    return tuple((int(i), float(v)) for i, v in pairs if math.isfinite(v))
 
 
 __all__ = ["SamplerPool", "SeededSampler", "greedy_sampler", "top_logprobs"]

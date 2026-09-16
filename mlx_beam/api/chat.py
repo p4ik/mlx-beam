@@ -192,17 +192,16 @@ def parse_chat_request(
             raise ApiError("tools must be a list of function tools", param="tools")
         if body.get("tool_choice") == "none":
             tools = None
-    template_kwargs = {
-        **defaults.chat_template_args,
-        **(body.get("chat_template_kwargs") or {}),
-    }
+    # Server defaults, then what the request says through its aliases, then
+    # an explicit chat_template_kwargs on top of everything.
+    template_kwargs = dict(defaults.chat_template_args)
     aliases = read_aliases(body)
     level, thinking = parse_thinking(aliases)
     if thinking is not None:
-        # An explicit chat_template_kwargs.enable_thinking still wins.
-        template_kwargs.setdefault("enable_thinking", thinking)
+        template_kwargs["enable_thinking"] = thinking
     if level is not None:
-        template_kwargs.setdefault("reasoning_effort", level)
+        template_kwargs["reasoning_effort"] = level
+    template_kwargs.update(body.get("chat_template_kwargs") or {})
     stream_opts = body.get("stream_options") or {}
     return ChatRequest(
         messages=_normalise_messages(body.get("messages")),

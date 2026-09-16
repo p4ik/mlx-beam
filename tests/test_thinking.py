@@ -288,3 +288,59 @@ def test_flags_are_right_without_a_budget():
             engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, reasoning=limits))
         )[-1]
         assert last.thinking_truncated and not last.response_truncated
+
+
+def test_forced_close_logprobs_serialize_strictly():
+    import json
+
+    from mlx_beam.api import chat, completions
+    from tests.stub_tokenizer import THINK_END, THINK_START, StubTokenizer
+
+    model = tiny_hybrid()
+    tok = StubTokenizer()
+    with Engine(model) as engine:
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w1"}],
+                "max_tokens": 8,
+                "logprobs": True,
+                "top_logprobs": 3,
+                "max_reasoning_tokens": 2,
+            },
+            "m",
+        )
+        gen = chat.to_generation_request(tok, req)
+        gen.tokens.append(THINK_START)
+        gen.reasoning = ReasoningLimits(
+            (THINK_START,), (THINK_END,), (THINK_END,), seeded=True, max_tokens=2
+        )
+        out = chat.ChatResponder(tok, req, gen.tokens).complete(engine.submit(gen), 0)
+        json.dumps(out, allow_nan=False)
+        content = out["choices"][0]["logprobs"]["content"]
+        # The forced marker has no alternatives at all.
+        forced = next(c for c in content if c["token"] == "</think>")
+        assert forced["top_logprobs"] == [
+            {"token": "</think>", "logprob": 0.0, "bytes": list(b"</think>")}
+        ]
+        req.stream = True
+        gen = chat.to_generation_request(tok, req)
+        gen.tokens.append(THINK_START)
+        gen.reasoning = ReasoningLimits(
+            (THINK_START,), (THINK_END,), (THINK_END,), seeded=True, max_tokens=2
+        )
+        for chunk in chat.ChatResponder(tok, req, gen.tokens).stream(
+            engine.submit(gen), 0
+        ):
+            json.dumps(chunk, allow_nan=False)
+        creq = completions.parse_completion_request(
+            {"prompt": "w1", "logprobs": 2, "max_tokens": 6}, "m"
+        )
+        cgen = completions.to_generation_request(tok, creq)
+        cgen.tokens.append(THINK_START)
+        cgen.reasoning = ReasoningLimits(
+            (THINK_START,), (THINK_END,), (THINK_END,), seeded=True, max_tokens=0
+        )
+        out = completions.CompletionResponder(tok, creq, cgen.tokens).complete(
+            engine.submit(cgen), 0
+        )
+        json.dumps(out, allow_nan=False)

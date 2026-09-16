@@ -208,6 +208,8 @@ def parse_responses_request(
         max_reasoning_tokens=_number(
             aliases, "max_reasoning_tokens", None, 0, None, int
         ),
+        min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
+        max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
     )
     return ResponsesRequest(
