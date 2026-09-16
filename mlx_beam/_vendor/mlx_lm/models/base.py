@@ -7,6 +7,8 @@ from typing import Optional
 import mlx.core as mx
 from mlx.utils import tree_map
 
+from ...optiq import fused_quant_sdpa
+
 
 @dataclass
 class BaseModelArgs:
@@ -119,6 +121,18 @@ def scaled_dot_product_attention(
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
+        # The tiled path bounds the prefill transient; the stock one takes
+        # the shapes and masks it does not cover (VENDORED.md, tiled SDPA).
+        if fused_quant_sdpa.supported(queries, cache.bits, cache.group_size, mask):
+            return fused_quant_sdpa.fused_quantized_scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                scale=scale,
+                mask=mask,
+                group_size=cache.group_size,
+                bits=cache.bits,
+            )
         return quantized_scaled_dot_product_attention(
             queries,
             keys,

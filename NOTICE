@@ -10,3 +10,8 @@ vendored part with its upstream, commit, license and local changes.
 mlx-lm (https://github.com/ml-explore/mlx-lm)
 Copyright (c) 2023 Apple Inc.
 MIT License - mlx_beam/_vendor/mlx_lm/LICENSE
+
+mlx-optiq (https://mlx-optiq.com), files runtime/kv/batch.py and
+runtime/fused_quant_sdpa.py
+Copyright (c) 2026 Thin Signal
+MIT License - mlx_beam/_vendor/optiq/LICENSE

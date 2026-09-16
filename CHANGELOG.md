@@ -7,6 +7,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- Quantized KV cache for the batch path and a tiled quantized attention,
+  ported from mlx-optiq; the rotating-cache merge guard (see `VENDORED.md`).
 - Vendored mlx-lm (inference subset, pinned commit) with four local changes:
   package-relative imports, prefill mask for hybrids, per-step cache eval,
   and a scheduler that neither pads nor stalls (see `VENDORED.md`).

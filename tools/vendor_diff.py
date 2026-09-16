@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Compare the vendored parts under mlx_beam/_vendor with their upstream.
 
-    tools/vendor_diff.py                 diff every part against its pinned commit
+    tools/vendor_diff.py                 diff every part against its pin
     tools/vendor_diff.py --part mlx-lm   one part
-    tools/vendor_diff.py --clock         also report how far upstream moved
+    tools/vendor_diff.py --clock         also report how far a git upstream moved
 
-Exit status 1 when a file differs that VENDORED.md does not list as modified,
-when a listed file is missing, or when the vendored tree carries files that
-are neither upstream's nor ours.
+A part is pinned to a git commit (repo + commit + include list) or to a PyPI
+wheel (wheel + sha256 + a dest-to-upstream file map). Exit status 1 when a
+file differs that tools/vendor.toml does not list as modified, when a listed
+file is missing or identical, or when the vendored tree carries files that are
+neither upstream's nor listed as local.
 """
 
 import argparse
 import difflib
+import hashlib
 import subprocess
 import sys
 import tempfile
 import tomllib
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +40,16 @@ def checkout(repo, commit, into):
     git("checkout", "-q", "FETCH_HEAD", cwd=into)
 
 
+def unpack_wheel(url, sha256, into):
+    data = urllib.request.urlopen(url, timeout=120).read()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != sha256:
+        raise SystemExit(f"{url}: sha256 {digest} != pinned {sha256}")
+    whl = Path(into) / "wheel.whl"
+    whl.write_bytes(data)
+    zipfile.ZipFile(whl).extractall(into)
+
+
 def upstream_files(src, include):
     for entry in include:
         p = src / entry
@@ -45,15 +60,29 @@ def upstream_files(src, include):
         elif p.is_file():
             yield p.relative_to(src)
         else:
-            raise SystemExit(f"{entry}: not in upstream at the pinned commit")
+            raise SystemExit(f"{entry}: not in upstream at the pin")
+
+
+def fetch_upstream(part, tmp):
+    """Materialise the upstream at its pin; returns {dest rel path: upstream file}."""
+    if "repo" in part:
+        checkout(part["repo"], part["commit"], tmp)
+        src = Path(tmp) / part["upstream_subdir"]
+        return {rel: src / rel for rel in upstream_files(src, part["include"])}
+    unpack_wheel(part["wheel"], part["sha256"], tmp)
+    src = Path(tmp) / part["upstream_subdir"]
+    return {Path(d): src / u for d, u in part["files"].items()}
+
+
+def pin_label(part):
+    return part["commit"][:12] if "repo" in part else f"wheel {part['version']}"
 
 
 def diff_part(name, part, clock):
     dest = ROOT / part["dest"]
     with tempfile.TemporaryDirectory() as tmp:
-        checkout(part["repo"], part["commit"], tmp)
-        src = Path(tmp) / part["upstream_subdir"]
-        expected = set(upstream_files(src, part["include"]))
+        upstream = fetch_upstream(part, tmp)
+        expected = set(upstream)
         listed = set(map(Path, part["modified"]))
         ours = set(map(Path, part["local"]))
         present = {
@@ -68,9 +97,7 @@ def diff_part(name, part, clock):
             if not here.exists():
                 errors.append(f"missing: {rel}")
                 continue
-            a = (src / rel).read_bytes()
-            b = here.read_bytes()
-            if a != b:
+            if upstream[rel].read_bytes() != here.read_bytes():
                 changed.append(rel)
                 if rel not in listed:
                     errors.append(f"changed but not listed as modified: {rel}")
@@ -79,16 +106,16 @@ def diff_part(name, part, clock):
         for rel in sorted(present - expected - ours):
             errors.append(f"not upstream's and not listed as local: {rel}")
         print(
-            f"{name} @ {part['commit'][:12]}: {len(expected)} upstream files, "
+            f"{name} @ {pin_label(part)}: {len(expected)} upstream files, "
             f"{len(changed)} modified, {len(ours)} local"
         )
         for rel in changed:
-            a = (src / rel).read_text().splitlines(keepends=True)
+            a = upstream[rel].read_text().splitlines(keepends=True)
             b = (dest / rel).read_text().splitlines(keepends=True)
             sys.stdout.writelines(
                 difflib.unified_diff(a, b, f"upstream/{rel}", f"vendored/{rel}", n=2)
             )
-        if clock:
+        if clock and "repo" in part:
             head = git("ls-remote", part["repo"], "HEAD").split()[0]
             git("fetch", "-q", "--depth", "200", "origin", head, cwd=tmp)
             behind = git("rev-list", "--count", f"{part['commit']}..{head}", cwd=tmp)
