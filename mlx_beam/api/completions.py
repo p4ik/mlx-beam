@@ -8,7 +8,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from mlx_beam.api.chat import DEFAULT_MAX_TOKENS, _number, parse_sampling, parse_stop
+from mlx_beam.api.chat import DEFAULTS, _number, parse_sampling, parse_stop
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
 from mlx_beam.api.text import TextAssembler, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
@@ -26,7 +27,9 @@ class CompletionRequest:
     stream_usage: bool = False
 
 
-def parse_completion_request(body: dict, default_model: str) -> CompletionRequest:
+def parse_completion_request(
+    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+) -> CompletionRequest:
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     if body.get("n", 1) not in (None, 1):
@@ -45,8 +48,10 @@ def parse_completion_request(body: dict, default_model: str) -> CompletionReques
     return CompletionRequest(
         prompt=prompt,
         model=body.get("model") or default_model,
-        max_tokens=_number(body, "max_tokens", DEFAULT_MAX_TOKENS, 1, None, int),
-        sampling=parse_sampling(body),
+        max_tokens=_number(
+            body, "max_tokens", defaults.max_completion_tokens, 1, None, int
+        ),
+        sampling=parse_sampling(body, defaults),
         stream=bool(body.get("stream", False)),
         stop=parse_stop(body),
         echo=bool(body.get("echo", False)),

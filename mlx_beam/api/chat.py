@@ -9,11 +9,13 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, missing_extra, unsupported
 from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 
-DEFAULT_MAX_TOKENS = 512
+# What a parser falls back to when no server defaults are handed in (tests).
+DEFAULTS = RequestDefaults()
 
 
 @dataclass
@@ -47,7 +49,7 @@ def _number(body, key, default, lo=None, hi=None, kind=float):
     return value
 
 
-def parse_sampling(body: dict) -> SamplingParams:
+def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> SamplingParams:
     logit_bias = body.get("logit_bias")
     if logit_bias:
         try:
@@ -56,15 +58,18 @@ def parse_sampling(body: dict) -> SamplingParams:
             raise ApiError(
                 "logit_bias must map token ids to numbers", param="logit_bias"
             ) from None
-    penalty = _number(body, "repetition_penalty", None, 0.0)
-    presence = _number(body, "presence_penalty", 0.0, -2.0, 2.0)
-    frequency = _number(body, "frequency_penalty", 0.0, -2.0, 2.0)
+    d = defaults
+    penalty = _number(body, "repetition_penalty", d.repetition_penalty, 0.0)
+    presence = _number(body, "presence_penalty", d.presence_penalty or 0.0, -2.0, 2.0)
+    frequency = _number(
+        body, "frequency_penalty", d.frequency_penalty or 0.0, -2.0, 2.0
+    )
     return SamplingParams(
-        temperature=_number(body, "temperature", 1.0, 0.0, 2.0),
-        top_p=_number(body, "top_p", 1.0, 0.0, 1.0),
+        temperature=_number(body, "temperature", d.temperature, 0.0, 2.0),
+        top_p=_number(body, "top_p", d.top_p, 0.0, 1.0),
         # -1 and 0 both mean "off" (the vLLM and HF convention).
-        top_k=max(0, _number(body, "top_k", 0, -1, None, int)),
-        min_p=_number(body, "min_p", 0.0, 0.0, 1.0),
+        top_k=max(0, _number(body, "top_k", d.top_k, -1, None, int)),
+        min_p=_number(body, "min_p", d.min_p, 0.0, 1.0),
         repetition_penalty=penalty if penalty not in (None, 1.0) else None,
         repetition_context_size=_number(
             body, "repetition_context_size", 20, 1, None, int
@@ -131,13 +136,16 @@ def _normalise_messages(messages: Any) -> list[dict]:
     return out
 
 
-def parse_chat_request(body: dict, default_model: str) -> ChatRequest:
+def parse_chat_request(
+    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+) -> ChatRequest:
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     _reject_unsupported(body)
+    # max_tokens is OpenAI's old name; it is accepted here and nowhere else.
     max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
     max_tokens = (
-        DEFAULT_MAX_TOKENS
+        defaults.max_completion_tokens
         if max_tokens is None
         else _number(body, "max_completion_tokens", max_tokens, 1, None, int)
     )
@@ -158,7 +166,7 @@ def parse_chat_request(body: dict, default_model: str) -> ChatRequest:
         messages=_normalise_messages(body.get("messages")),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
-        sampling=parse_sampling(body),
+        sampling=parse_sampling(body, defaults),
         stream=bool(body.get("stream", False)),
         stop=parse_stop(body),
         tools=tools,

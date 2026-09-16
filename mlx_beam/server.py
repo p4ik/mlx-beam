@@ -21,6 +21,7 @@ from typing import Any
 
 from mlx_beam import __version__
 from mlx_beam.api import chat, completions, responses
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.engine import ContextTooLong, Engine, EngineDead, InvalidRequest
 
@@ -40,6 +41,7 @@ class Served:
         tokenizer,
         model_name: str,
         reasoning_field: str = "reasoning",
+        defaults: RequestDefaults | None = None,
     ):
         if reasoning_field not in chat.REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
@@ -47,6 +49,7 @@ class Served:
         self.tokenizer = tokenizer
         self.model_name = model_name
         self.reasoning_field = reasoning_field
+        self.defaults = defaults or RequestDefaults()
         self.started_at = time.time()
 
     def capabilities(self) -> dict:
@@ -77,7 +80,10 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
-        h["api"] = {"reasoning_field": self.reasoning_field}
+        h["api"] = {
+            "reasoning_field": self.reasoning_field,
+            "defaults": self.defaults.describe(),
+        }
         h["version"] = __version__
         return h
 
@@ -262,7 +268,9 @@ class Handler(BaseHTTPRequestHandler):
     def _chat(self, body: dict) -> None:
         self._check_model(body)
         tok = self.served.tokenizer
-        req = chat.parse_chat_request(body, self.served.model_name)
+        req = chat.parse_chat_request(
+            body, self.served.model_name, self.served.defaults
+        )
         gen_request = chat.to_generation_request(tok, req)
         responder = chat.ChatResponder(
             tok, req, gen_request.tokens, reasoning_field=self.served.reasoning_field
@@ -272,7 +280,9 @@ class Handler(BaseHTTPRequestHandler):
     def _completions(self, body: dict) -> None:
         self._check_model(body)
         tok = self.served.tokenizer
-        req = completions.parse_completion_request(body, self.served.model_name)
+        req = completions.parse_completion_request(
+            body, self.served.model_name, self.served.defaults
+        )
         gen_request = completions.to_generation_request(tok, req)
         responder = completions.CompletionResponder(tok, req, gen_request.tokens)
         self._run(gen_request, responder, req.stream)
@@ -280,7 +290,9 @@ class Handler(BaseHTTPRequestHandler):
     def _responses(self, body: dict) -> None:
         self._check_model(body)
         tok = self.served.tokenizer
-        req = responses.parse_responses_request(body, self.served.model_name)
+        req = responses.parse_responses_request(
+            body, self.served.model_name, self.served.defaults
+        )
         gen_request = responses.to_generation_request(tok, req)
         responder = responses.ResponsesResponder(
             tok,

@@ -66,7 +66,7 @@ def test_prompt_cache_is_reused():
     prompt = list(range(1, 20))
     with Engine(model) as engine:
         first = collect(engine.submit(GenerationRequest(prompt, max_tokens=4)))
-        assert engine.health()["prefix_store"]["entries"] == 1
+        assert engine.health()["prompt_cache"]["entries"] == 1
         again = engine.submit(GenerationRequest(prompt, max_tokens=4))
         assert collect(again) == first
         assert again.prompt_cached >= len(prompt) - 1
@@ -148,7 +148,7 @@ def test_sampling_with_temperature_runs():
 
 def test_submissions_from_many_threads():
     model = tiny_hybrid()
-    with Engine(model, completion_batch_size=8, prefill_batch_size=4) as engine:
+    with Engine(model, decode_concurrency=8, prompt_concurrency=4) as engine:
         results = {}
 
         def run(i):
@@ -171,7 +171,7 @@ def test_stored_prefixes_yield_to_running_requests():
         collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
         # One byte of budget: the store cannot keep anything once a request runs.
         collect(engine.submit(GenerationRequest([4, 5, 6], max_tokens=2)))
-        assert engine.health()["prefix_store"]["entries"] <= 1
+        assert engine.health()["prompt_cache"]["entries"] <= 1
     with Engine(model, max_context=8) as engine:
         with pytest.raises(ContextTooLong):
             engine.submit(GenerationRequest([1, 2, 3], max_tokens=6))

@@ -31,8 +31,9 @@ def test_chat_request_defaults_and_limits():
     req = chat.parse_chat_request(
         {"messages": [{"role": "user", "content": "w1"}]}, "m"
     )
-    assert req.max_tokens == chat.DEFAULT_MAX_TOKENS and req.model == "m"
-    assert req.sampling.temperature == 1.0 and req.sampling.top_p == 1.0
+    assert req.max_tokens == chat.DEFAULTS.max_completion_tokens and req.model == "m"
+    # mlx-lm's defaults: greedy unless the client or a flag says otherwise.
+    assert req.sampling.temperature == 0.0 and req.sampling.top_p == 1.0
     req = chat.parse_chat_request(
         {
             "messages": [{"role": "user", "content": "w1"}],
@@ -405,3 +406,32 @@ def test_reasoning_field_none_leaves_the_markers_in_the_content():
     assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
     with pytest.raises(ValueError):
         chat.ChatResponder(tok, req, gen.tokens, reasoning_field="thoughts")
+
+
+def test_request_defaults_precedence(tmp_path):
+    from mlx_beam.api.defaults import RequestDefaults
+
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "do_sample": true}'
+    )
+    d = RequestDefaults.resolve(tmp_path, flags={"top_p": 0.95, "temp": None})
+    assert (d.temperature, d.top_p, d.top_k, d.min_p) == (0.7, 0.95, 20, 0.0)
+    assert d.sources["temperature"] == "generation_config.json"
+    assert d.sources["top_p"] == "flag" and d.sources["min_p"] == "mlx-lm"
+    # A request still wins over every server-side default.
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "temperature": 0.1},
+        "m",
+        d,
+    )
+    assert req.sampling.temperature == 0.1 and req.sampling.top_p == 0.95
+    # do_sample false is the author saying greedy, whatever temperature says.
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": 0.7, "do_sample": false}'
+    )
+    assert RequestDefaults.resolve(tmp_path).temperature == 0.0
+    # No file, no flags: mlx-lm's numbers.
+    assert RequestDefaults.resolve(tmp_path / "missing").describe()["top_k"] == {
+        "value": 0,
+        "source": "mlx-lm",
+    }

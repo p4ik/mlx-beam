@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="local path or Hugging Face repo id")
-    p.add_argument("--served-name", help="model id shown to clients (default: --model)")
+    p.add_argument("--model-alias", help="model id shown to clients (default: --model)")
     p.add_argument(
         "--reasoning-field",
         default="reasoning",
@@ -80,27 +80,93 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument(
-        "--kv-bits", type=int, choices=(4, 8), help="quantize full-attention KV"
+    limits = p.add_argument_group(
+        "token limits", "every value counts tokens; each one counts a different set"
     )
-    p.add_argument("--kv-group-size", type=int, default=64, choices=(32, 64, 128))
-    p.add_argument(
-        "--kv-config",
-        help='JSON file: {"bits": 4, "group_size": 64, "layers": {"3": 8}}',
-    )
-    p.add_argument("--decode-concurrency", type=int, default=8)
-    p.add_argument("--prompt-concurrency", type=int, default=2)
-    p.add_argument("--prefill-step-size", type=int, default=2048)
-    p.add_argument("--prefill-slice", type=int, default=512)
-    p.add_argument("--decode-share", type=float, default=0.5)
-    p.add_argument("--prompt-cache-size", type=int, default=16)
-    p.add_argument(
-        "--prompt-cache-gb", type=float, help="RAM budget for stored prefixes"
-    )
-    p.add_argument(
+    limits.add_argument(
         "--max-context",
         type=int,
-        help="prompt plus generation cap in tokens (default: the model's own)",
+        help="prompt plus generated tokens, a hard cap: a request over it is a "
+        "400 (default: the model's own context length)",
+    )
+    limits.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=512,
+        help="generated tokens when the client sends no max_tokens / "
+        "max_completion_tokens / max_output_tokens; the request overrides "
+        "(mlx-lm: --max-tokens, default 512)",
+    )
+    sampling = p.add_argument_group(
+        "sampling defaults",
+        "used when the client sends nothing; a flag beats the model's "
+        "generation_config.json, which beats mlx-lm's defaults",
+    )
+    sampling.add_argument("--temp", type=float, help="temperature")
+    sampling.add_argument("--top-p", type=float, help="nucleus sampling")
+    sampling.add_argument("--top-k", type=int, help="top-k sampling (0 = off)")
+    sampling.add_argument("--min-p", type=float, help="min-p sampling (0 = off)")
+    kv = p.add_argument_group("KV cache")
+    kv.add_argument(
+        "--kv-bits",
+        type=int,
+        choices=(4, 8),
+        help="quantize the full-attention KV cache to this many bits",
+    )
+    kv.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        choices=(32, 64, 128),
+        help="group size of the KV quantization",
+    )
+    kv.add_argument(
+        "--kv-config",
+        help='JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": {"3": 8}}',
+    )
+    batching = p.add_argument_group("batching")
+    batching.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=8,
+        help="sequences decoded in one batch",
+    )
+    batching.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=2,
+        help="prompts prefilled in one batch",
+    )
+    batching.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="prompt tokens per model call while prefilling",
+    )
+    batching.add_argument(
+        "--prefill-slice",
+        type=int,
+        default=512,
+        help="prompt tokens a prefill runs before decode gets a turn",
+    )
+    batching.add_argument(
+        "--decode-share",
+        type=float,
+        default=0.5,
+        help="share of the worker's time decode keeps while a prefill runs (0-1)",
+    )
+    cache = p.add_argument_group("prompt cache")
+    cache.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=16,
+        help="stored prefixes: a number of entries, not a size in bytes",
+    )
+    cache.add_argument(
+        "--prompt-cache-bytes",
+        type=int,
+        help="RAM budget in bytes for the stored prefixes (default: unlimited); "
+        "stored prefixes yield to the caches of running requests",
     )
     p.add_argument(
         "--trust-remote-code",
@@ -125,8 +191,10 @@ def kv_policy_from_args(args):
 
 def serve(args) -> int:
     import logging
+    from pathlib import Path
 
-    from mlx_beam._vendor.mlx_lm.utils import load
+    from mlx_beam._vendor.mlx_lm.utils import hf_repo_to_path, load
+    from mlx_beam.api.defaults import RequestDefaults
     from mlx_beam.engine import Engine, EngineDead
     from mlx_beam.server import Served
     from mlx_beam.server import serve as run_server
@@ -137,20 +205,31 @@ def serve(args) -> int:
     log = logging.getLogger("beam")
     log.info("loading %s", args.model)
     model, tokenizer = load(args.model, trust_remote_code=args.trust_remote_code)
+    model_path = (
+        Path(args.model) if Path(args.model).exists() else hf_repo_to_path(args.model)
+    )
+    defaults = RequestDefaults.resolve(
+        model_path,
+        flags={
+            "max_completion_tokens": args.max_completion_tokens,
+            "temperature": args.temp,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+        },
+    )
     policy = kv_policy_from_args(args)
     engine = Engine(
         model,
         model_key=args.model,
         kv_policy=policy,
-        completion_batch_size=args.decode_concurrency,
-        prefill_batch_size=args.prompt_concurrency,
+        decode_concurrency=args.decode_concurrency,
+        prompt_concurrency=args.prompt_concurrency,
         prefill_step_size=args.prefill_step_size,
         prefill_slice=args.prefill_slice,
         decode_share=args.decode_share,
         prompt_cache_size=args.prompt_cache_size,
-        prompt_cache_bytes=(
-            int(args.prompt_cache_gb * 2**30) if args.prompt_cache_gb else None
-        ),
+        prompt_cache_bytes=args.prompt_cache_bytes or None,
         max_context=args.max_context,
     )
     try:
@@ -161,21 +240,29 @@ def serve(args) -> int:
     served = Served(
         engine,
         tokenizer,
-        args.served_name or args.model,
+        args.model_alias or args.model,
         reasoning_field=args.reasoning_field,
+        defaults=defaults,
     )
     health = served.health()
     applied = health["kv"]["applied"] or []
     quantized = sum(1 for c in applied if "bits" in c)
     log.info(
         "ready: %d layers, %d with quantized KV (%s), batching %s, capabilities %s, "
-        "reasoning field %s",
+        "reasoning field %s, wired limit %s",
         len(applied),
         quantized,
         policy.describe(),
         health["batching"],
         health["capabilities"],
         args.reasoning_field,
+        health["wired_limit"],
+    )
+    log.info(
+        "defaults: %s",
+        ", ".join(
+            f"{k}={v['value']} ({v['source']})" for k, v in defaults.describe().items()
+        ),
     )
     try:
         run_server(served, args.host, args.port)

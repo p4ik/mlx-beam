@@ -17,13 +17,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mlx_beam.api.chat import (
-    DEFAULT_MAX_TOKENS,
+    DEFAULTS,
     ChatRequest,
     _normalise_messages,
     _number,
     build_prompt,
     parse_sampling,
 )
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
 from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest
@@ -157,7 +158,9 @@ def _tools_to_chat(tools: Any) -> list[dict] | None:
     return out
 
 
-def parse_responses_request(body: dict, default_model: str) -> ResponsesRequest:
+def parse_responses_request(
+    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+) -> ResponsesRequest:
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     for key in ("previous_response_id", "conversation"):
@@ -180,7 +183,9 @@ def parse_responses_request(body: dict, default_model: str) -> ResponsesRequest:
     if tool_choice not in ("auto", "none"):
         raise unsupported("tool_choice other than auto or none", "tool_choice")
     tools = _tools_to_chat(body.get("tools")) if tool_choice != "none" else None
-    max_tokens = _number(body, "max_output_tokens", DEFAULT_MAX_TOKENS, 1, None, int)
+    max_tokens = _number(
+        body, "max_output_tokens", defaults.max_completion_tokens, 1, None, int
+    )
     template_kwargs: dict[str, Any] = {}
     effort = (body.get("reasoning") or {}).get("effort")
     if effort == "none":
@@ -191,7 +196,7 @@ def parse_responses_request(body: dict, default_model: str) -> ResponsesRequest:
         ),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
-        sampling=parse_sampling(body),
+        sampling=parse_sampling(body, defaults),
         stream=bool(body.get("stream", False)),
         stop=[],
         tools=tools,

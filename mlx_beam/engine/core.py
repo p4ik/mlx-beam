@@ -75,8 +75,8 @@ class Engine:
         *,
         model_key: str = "model",
         kv_policy: KVPolicy | None = None,
-        completion_batch_size: int = 8,
-        prefill_batch_size: int = 2,
+        decode_concurrency: int = 8,
+        prompt_concurrency: int = 2,
         prefill_step_size: int = 2048,
         prefill_slice: int = 512,
         decode_share: float = 0.5,
@@ -99,9 +99,18 @@ class Engine:
         self.vocab_size = model_vocab_size(model)
         self._prompt_cache_bytes = prompt_cache_bytes
         self._dead = False
+        # Our names on the outside (mlx-lm's server flags), the generator's
+        # keyword names on the inside.
+        self.batching = dict(
+            decode_concurrency=decode_concurrency,
+            prompt_concurrency=prompt_concurrency,
+            prefill_step_size=prefill_step_size,
+            prefill_slice=prefill_slice,
+            decode_share=decode_share,
+        )
         self._gen_args = dict(
-            completion_batch_size=completion_batch_size,
-            prefill_batch_size=prefill_batch_size,
+            completion_batch_size=decode_concurrency,
+            prefill_batch_size=prompt_concurrency,
             prefill_step_size=prefill_step_size,
             prefill_slice=prefill_slice,
             decode_share=decode_share,
@@ -239,14 +248,20 @@ class Engine:
                 else None
             ),
             "counters": counters,
-            "batching": dict(self._gen_args),
+            "batching": dict(self.batching),
+            # What the generator wired at start (None on a device without a
+            # recommended working set) and what it found before.
+            "wired_limit": {
+                "recommended": mx.device_info().get("max_recommended_working_set_size"),
+                "before": getattr(gen, "_old_wired_limit", None),
+            },
             "max_context": self.max_context,
             "kv": {
                 "policy": self.kv_policy.describe(),
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
             },
-            "prefix_store": self.prefix_store.describe(),
+            "prompt_cache": self.prefix_store.describe(),
         }
 
     # -- the worker -------------------------------------------------------
