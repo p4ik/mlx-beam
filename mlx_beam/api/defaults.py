@@ -51,6 +51,12 @@ class RequestDefaults:
     chat_template_args: dict = field(default_factory=dict)
     sources: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self):
+        # A bare instance carries mlx-lm's numbers, so say so.
+        for f in fields(self):
+            if f.name != "sources":
+                self.sources.setdefault(f.name, "mlx-lm")
+
     @classmethod
     def resolve(
         cls, model_path: str | Path | None = None, flags: dict | None = None

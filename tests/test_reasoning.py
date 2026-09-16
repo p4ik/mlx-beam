@@ -17,9 +17,7 @@ MSGS = [{"role": "user", "content": "w1"}]
 
 def test_aliases_resolve_and_the_explicit_name_wins():
     assert read_aliases({}) == {}
-    assert read_aliases({"thinking_token_budget": 100}) == {
-        "max_reasoning_tokens": 100
-    }
+    assert read_aliases({"thinking_token_budget": 100}) == {"max_reasoning_tokens": 100}
     assert read_aliases({"reasoning": {"effort": "high", "max_tokens": 50}}) == {
         "reasoning_effort": "high",
         "max_reasoning_tokens": 50,
@@ -109,9 +107,14 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
     tok.accepted = ()
     with pytest.raises(ApiError) as exc:
         chat.build_prompt(
-            tok, chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "high"}, "m")
+            tok,
+            chat.parse_chat_request(
+                {"messages": MSGS, "reasoning_effort": "high"}, "m"
+            ),
         )
-    assert exc.value.param == "reasoning_effort" and "xhigh, max, high" in str(exc.value)
+    assert exc.value.param == "reasoning_effort" and "xhigh, max, high" in str(
+        exc.value
+    )
 
     class Broken(StubTokenizer):
         def apply_chat_template(self, messages, **kw):
@@ -119,7 +122,8 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
 
     with pytest.raises(ApiError) as exc:
         chat.build_prompt(
-            Broken(), chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
+            Broken(),
+            chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m"),
         )
     assert exc.value.param == "messages"
 
@@ -130,7 +134,10 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
         ("{{ message.reasoning_content }}", ("reasoning_content",)),
         ("{{ m['thinking'] }} {{ enable_thinking }}", ("thinking",)),
         ('{% if message["reasoning"] %}{{ reasoning_effort }}', ("reasoning",)),
-        ("{{ message.reasoning_content }}{{ message.thinking }}", ("reasoning_content", "thinking")),
+        (
+            "{{ message.reasoning_content }}{{ message.thinking }}",
+            ("reasoning_content", "thinking"),
+        ),
         ("{{ message.content }}", ()),
     ],
 )
@@ -153,7 +160,12 @@ def test_mirroring_fills_only_the_keys_the_renderer_reads_and_the_client_left():
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "a", "reasoning": "r1"},
         {"role": "assistant", "content": "b", "thinking": "t", "reasoning": "r2"},
-        {"role": "assistant", "content": "c", "reasoning_content": "", "reasoning": "r3"},
+        {
+            "role": "assistant",
+            "content": "c",
+            "reasoning_content": "",
+            "reasoning": "r3",
+        },
         {"role": "assistant", "content": "d"},
     ]
     mirror_reasoning(msgs, ("reasoning_content",))
@@ -163,16 +175,29 @@ def test_mirroring_fills_only_the_keys_the_renderer_reads_and_the_client_left():
     assert msgs[3]["reasoning_content"] == "r3"
     assert "reasoning_content" not in msgs[4] and "reasoning" not in msgs[0]
     # A key the client filled is never overwritten.
-    msgs = [{"role": "assistant", "content": "a", "reasoning_content": "x", "thinking": "y"}]
+    msgs = [
+        {"role": "assistant", "content": "a", "reasoning_content": "x", "thinking": "y"}
+    ]
     mirror_reasoning(msgs, ("reasoning_content", "thinking"))
-    assert msgs[0] == {"role": "assistant", "content": "a", "reasoning_content": "x", "thinking": "y"}
+    assert msgs[0] == {
+        "role": "assistant",
+        "content": "a",
+        "reasoning_content": "x",
+        "thinking": "y",
+    }
     # A renderer that reads none of them leaves the message alone.
     msgs = [{"role": "assistant", "content": "a", "reasoning": "r"}]
     mirror_reasoning(msgs, ())
     assert msgs[0] == {"role": "assistant", "content": "a", "reasoning": "r"}
     # Through build_prompt: the stub template reads reasoning_content.
     req = chat.parse_chat_request(
-        {"messages": [{"role": "user", "content": "w1"}, {"role": "assistant", "content": "w2", "reasoning": "w3"}, {"role": "user", "content": "w4"}]},
+        {
+            "messages": [
+                {"role": "user", "content": "w1"},
+                {"role": "assistant", "content": "w2", "reasoning": "w3"},
+                {"role": "user", "content": "w4"},
+            ]
+        },
         "m",
     )
     chat.build_prompt(StubTokenizer(), req)
