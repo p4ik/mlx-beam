@@ -15,9 +15,14 @@ from tests.test_engine import tiny_hybrid
 from tests.test_vendor_optiq_kv import tiny_llama
 
 
-def run(engine, tokens, max_tokens=4, boundaries=()):
+def run(engine, tokens, max_tokens=4, boundaries=(), system_end=None):
     stream = engine.submit(
-        GenerationRequest(list(tokens), max_tokens=max_tokens, boundaries=boundaries)
+        GenerationRequest(
+            list(tokens),
+            max_tokens=max_tokens,
+            boundaries=boundaries,
+            system_end=system_end,
+        )
     )
     out = [e.token for e in stream]
     return out, stream.prompt_cached
@@ -120,3 +125,99 @@ def test_chat_boundaries_from_the_template():
     # same for any next user message); the first user turn ends after the
     # assistant header that follows it.
     assert bounds == [5, 7]
+
+
+def test_system_entry_outlives_the_conversations():
+    model = tiny_llama()
+    system = [2, 6, 1, 2]
+    with Engine(model, prompt_cache_size=2) as engine:
+        for turn in ([7, 3], [5, 4], [3, 3, 6]):
+            run(engine, system + turn, 2)
+        d = engine.prefix_store.describe()
+        # Two conversation entries fit; the third pushed the oldest out, the
+        # system entry stayed untouched.
+        assert d["by_type"] == {"assistant": 2, "user": 0, "system": 0}
+    with Engine(model, prompt_cache_size=2) as engine:
+        for turn in ([7, 3], [5, 4], [3, 3, 6]):
+            run(engine, system + turn, 2, system_end=len(system))
+        d = engine.prefix_store.describe()
+        assert d["by_type"]["system"] == 1 and d["by_type"]["assistant"] == 1
+        # A fourth conversation still starts from the system block.
+        _, cached = run(engine, system + [9, 9], 2, system_end=len(system))
+        assert cached == len(system)
+
+
+def test_hybrid_system_entry_needs_its_checkpoint():
+    model = tiny_hybrid()
+    system = list(range(1, 9))
+    with Engine(model, prompt_cache_size=1) as engine:
+        run(engine, system + [20, 21], 2, boundaries=[8], system_end=8)
+        assert engine.prefix_store.describe()["by_type"]["system"] == 1
+        run(engine, system + [30, 31, 32], 2, boundaries=[8], system_end=8)
+        _, cached = run(engine, system + [40], 2, boundaries=[8], system_end=8)
+        assert cached == 8
+
+
+def test_stride_checkpoints_inside_a_long_prefill():
+    model = tiny_hybrid()
+    prompt = list(range(1, 41))
+    with Engine(model, prefill_slice=4) as cold:
+        ref, _ = run(cold, prompt[:20] + [50, 51], 2)
+    with Engine(
+        model, prefill_slice=4, checkpoint_stride=8, checkpoint_stride_max=4
+    ) as engine:
+        run(engine, prompt, 2)
+        entry = engine.prefix_store._trie.get(
+            engine.model_key, prompt + entry_tail(engine, prompt)
+        )
+        assert {8, 16, 24, 32} <= set(entry.checkpoints)
+        out, cached = run(engine, prompt[:20] + [50, 51], 2)
+        assert cached == 16 and out == ref
+
+
+def test_stride_checkpoints_are_thinned_to_the_cap():
+    model = tiny_hybrid()
+    prompt = list(range(1, 41))
+    with Engine(
+        model, prefill_slice=4, checkpoint_stride=8, checkpoint_stride_max=2
+    ) as engine:
+        run(engine, prompt, 2)
+        entry = engine.prefix_store._trie.get(
+            engine.model_key, prompt + entry_tail(engine, prompt)
+        )
+        stride_points = [p for p in entry.checkpoints if p < 40]
+        assert len(stride_points) == 2 and max(stride_points) == 32
+
+
+def test_cancel_during_prefill_keeps_the_prefilled_part():
+    from mlx_beam.engine.request import PromptProgress
+
+    model = tiny_llama()
+    prompt = [2, 6, 1, 2, 7, 3, 5, 4, 3, 3, 6, 7, 1, 2, 6, 5]
+    with Engine(model, prefill_slice=4) as engine:
+        stream = engine.submit(GenerationRequest(prompt, max_tokens=4))
+        while True:
+            item = stream._queue.get(timeout=30)
+            if isinstance(item, PromptProgress) and item.processed >= 4:
+                break
+        stream.cancel()
+        for _ in stream:
+            pass
+        # Whatever the worker had computed is in the store now.
+        for _ in range(50):
+            if engine.prefix_store.describe()["entries"]:
+                break
+            import time
+
+            time.sleep(0.05)
+        _, cached = run(engine, prompt, 2)
+        assert cached >= 4
+
+
+def entry_tail(engine, prompt):
+    """The generated tokens of the last run, from the store's own keys."""
+    store = engine.prefix_store
+    for _model, key in list(store._lru["assistant"]):
+        if list(key[: len(prompt)]) == list(prompt):
+            return list(key[len(prompt) :])
+    raise AssertionError("no entry for the prompt")

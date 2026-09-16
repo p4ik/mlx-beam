@@ -195,6 +195,14 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
 def prompt_boundaries(tokenizer, req: ChatRequest, prompt: list[int]) -> list[int]:
     """Prompt positions where a recurrent-state checkpoint pays off: the end
     of the system block and the end of the last user turns."""
+    return boundaries_and_system_end(tokenizer, req, prompt)[0]
+
+
+def boundaries_and_system_end(
+    tokenizer, req: ChatRequest, prompt: list[int]
+) -> tuple[list[int], int | None]:
+    """The boundaries plus, separately, where the system block ends (None
+    without a system message)."""
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
@@ -219,27 +227,34 @@ def prompt_boundaries(tokenizer, req: ChatRequest, prompt: list[int]) -> list[in
         if m["role"] != "system":
             break
         n_system += 1
+    system_end = None
     if n_system:
         sys_tokens = render(
             messages[:n_system] + [{"role": "user", "content": ""}], False
         )
-        ends.add(_common_prefix(sys_tokens, prompt))
+        system_end = _common_prefix(sys_tokens, prompt)
+        ends.add(system_end)
     user_idx = [i for i, m in enumerate(messages) if m["role"] == "user"]
     for i in user_idx[-BOUNDARY_TURNS:]:
         if i == len(messages) - 1:
             continue  # the prompt end is a boundary by itself
         ends.add(_common_prefix(render(messages[: i + 1], True), prompt))
-    return sorted(e for e in ends if 0 < e < len(prompt))
+    bounds = sorted(e for e in ends if 0 < e < len(prompt))
+    if system_end is not None and not 0 < system_end < len(prompt):
+        system_end = None
+    return bounds, system_end
 
 
 def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
     prompt = build_prompt(tokenizer, req)
+    bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
     return GenerationRequest(
         tokens=prompt,
         max_tokens=req.max_tokens,
         sampling=req.sampling,
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
-        boundaries=prompt_boundaries(tokenizer, req, prompt),
+        boundaries=bounds,
+        system_end=system_end,
     )
 
 

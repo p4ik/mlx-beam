@@ -185,14 +185,44 @@ class PrefixStore:
             self._forget(model, tokens, prev)
         self._nbytes += entry.nbytes
         self._lru[cache_type].append((model, tokens))
-        # Prefixes this entry can be cut back to are redundant copies.
+        # Prefixes this entry can be cut back to are redundant copies - except
+        # a system entry, which exists to outlive the conversations above it.
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
-            if recurrent_layers(cache) and prefix_len not in entry.checkpoints:
+            if old.cache_type == "system" or (
+                recurrent_layers(cache) and prefix_len not in entry.checkpoints
+            ):
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue
             self._nbytes -= old.nbytes
             self._remove_lru(model, tokens[:prefix_len])
         self._evict()
+
+    def has(self, model: Any, tokens: list[int]) -> bool:
+        try:
+            return self._trie.get(model, tokens) is not None
+        except KeyError:
+            return False
+
+    def insert_prefix(
+        self,
+        model: Any,
+        tokens: list[int],
+        cache: list[Any],
+        checkpoints: dict[int, dict[int, list]],
+        upto: int,
+        cache_type: str = "system",
+    ) -> bool:
+        """Store the first ``upto`` tokens of a finished cache as an entry of
+        its own; a recurrent layer needs a checkpoint at exactly ``upto``.
+        Returns False when the prefix is already stored or cannot be cut."""
+        if upto <= 0 or upto > len(tokens) or self.has(model, tokens[:upto]):
+            return False
+        copy_ = copy.deepcopy(cache)
+        if cut_back(copy_, len(tokens), upto, checkpoints) != upto:
+            return False
+        kept = {p: s for p, s in checkpoints.items() if p <= upto}
+        self.insert(model, tokens[:upto], copy_, kept, cache_type)
+        return True
 
     def _touch(self, model, key, cache_type) -> None:
         q = self._lru[cache_type]
