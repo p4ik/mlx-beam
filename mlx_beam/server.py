@@ -23,6 +23,7 @@ from mlx_beam import __version__
 from mlx_beam.api import chat, completions, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
+from mlx_beam.api.reasoning import renderer_reasoning_keys
 from mlx_beam.engine import ContextTooLong, Engine, EngineDead, InvalidRequest
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,8 @@ class Served:
             "defaults": self.defaults.describe(),
             "allowed_origins": list(self.allowed_origins),
             "chat_template": self.chat_template_source,
+            # Which message keys the template reads earlier reasoning from.
+            "reasoning_keys_read": list(renderer_reasoning_keys(self.tokenizer)),
         }
         h["version"] = __version__
         return h

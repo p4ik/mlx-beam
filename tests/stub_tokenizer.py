@@ -32,6 +32,10 @@ class StubTokenizer:
     tool_call_start = "<tool_call>"
     tool_call_end = "</tool_call>"
     structural_markers = ()
+    # What the key detection reads: this "template" takes reasoning_content.
+    chat_template = (
+        "{% for message in messages %}{{ message.reasoning_content }}{% endfor %}"
+    )
 
     def __init__(self):
         self._words = [f"w{t} " for t in range(64)]

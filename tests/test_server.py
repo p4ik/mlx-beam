@@ -53,6 +53,10 @@ def test_health_and_models(server):
     assert status == 200 and models["data"][0]["id"] == "tiny"
     assert models["data"][0]["capabilities"]["tools"] is True
     assert h["api"]["reasoning_field"] == "reasoning"
+    assert h["api"]["reasoning_keys_read"] == ["reasoning_content"]
+    assert h["api"]["defaults"]["temperature"] == {"value": 0.0, "source": "mlx-lm"}
+    assert h["prompt_cache"]["entries"] >= 0 and "decode_concurrency" in h["batching"]
+    assert set(h["wired_limit"]) == {"recommended", "before"}
 
 
 def test_chat_completion(server):

@@ -11,6 +11,14 @@ from typing import Any
 
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, missing_extra, unsupported
+from mlx_beam.api.reasoning import (
+    effort_candidates,
+    is_effort_rejection,
+    map_effort,
+    mirror_reasoning,
+    read_aliases,
+    renderer_reasoning_keys,
+)
 from mlx_beam.api.text import (
     TextAssembler,
     TextDelta,
@@ -36,7 +44,12 @@ class ChatRequest:
     logprobs: bool = False
     top_logprobs: int = 0
     stream_usage: bool = False
+    # The template level (low, medium, xhigh) or None: off or not asked.
     reasoning_effort: str | None = None
+    # Decoder limits the request set; None means the server's value.
+    max_reasoning_tokens: int | None = None
+    min_response_tokens: int | None = None
+    max_prompt_tokens: int | None = None
     template_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -181,9 +194,13 @@ def parse_chat_request(
         **defaults.chat_template_args,
         **(body.get("chat_template_kwargs") or {}),
     }
-    effort = body.get("reasoning_effort")
-    if effort == "none":
-        template_kwargs.setdefault("enable_thinking", False)
+    aliases = read_aliases(body)
+    level, thinking = parse_thinking(aliases)
+    if thinking is not None:
+        # An explicit chat_template_kwargs.enable_thinking still wins.
+        template_kwargs.setdefault("enable_thinking", thinking)
+    if level is not None:
+        template_kwargs.setdefault("reasoning_effort", level)
     stream_opts = body.get("stream_options") or {}
     return ChatRequest(
         messages=_normalise_messages(body.get("messages")),
@@ -196,25 +213,73 @@ def parse_chat_request(
         logprobs=bool(body.get("logprobs", False)),
         top_logprobs=parse_top_logprobs(body),
         stream_usage=bool(stream_opts.get("include_usage", False)),
-        reasoning_effort=effort,
+        reasoning_effort=level,
+        max_reasoning_tokens=_number(
+            aliases, "max_reasoning_tokens", None, 0, None, int
+        ),
+        min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
+        max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
     )
+
+
+def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
+    """(template level, enable_thinking) from the resolved aliases: an effort
+    of none switches thinking off, a level asks for it."""
+    thinking = aliases.get("enable_thinking")
+    if "reasoning_effort" not in aliases:
+        return None, thinking
+    level = map_effort(aliases["reasoning_effort"])
+    if level is None:
+        return None, False if thinking is None else thinking
+    return level, thinking
 
 
 def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     if not getattr(tokenizer, "has_chat_template", True):
         raise ApiError("this model has no chat template; use /v1/completions")
+    mirror_reasoning(req.messages, renderer_reasoning_keys(tokenizer))
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    try:
-        tokens = tokenizer.apply_chat_template(
-            req.messages, add_generation_prompt=True, tokenize=True, **kwargs
+
+    def render(**extra):
+        return tokenizer.apply_chat_template(
+            req.messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            **{**kwargs, **extra},
         )
+
+    level = kwargs.get("reasoning_effort")
+    try:
+        tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
-        raise ApiError(
-            f"the chat template rejected the messages: {e}", param="messages"
-        ) from None
+        if not (level and is_effort_rejection(e)):
+            raise ApiError(
+                f"the chat template rejected the messages: {e}", param="messages"
+            ) from None
+        # The template knows the levels but not this name: climb the ladder
+        # and remember the rung that rendered, so every re-render agrees.
+        tokens = None
+        for candidate in effort_candidates(level)[1:]:
+            try:
+                tokens = render(reasoning_effort=candidate)
+            except Exception as e2:  # noqa: BLE001
+                if not is_effort_rejection(e2):
+                    raise ApiError(
+                        f"the chat template rejected the messages: {e2}",
+                        param="messages",
+                    ) from None
+                continue
+            req.template_kwargs["reasoning_effort"] = candidate
+            break
+        if tokens is None:
+            raise ApiError(
+                f"the chat template accepts none of the reasoning_effort levels "
+                f"{', '.join(effort_candidates(level))}: {e}",
+                param="reasoning_effort",
+            ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
     return list(tokens)

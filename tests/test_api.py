@@ -410,9 +410,38 @@ def test_reasoning_field_none_leaves_the_markers_in_the_content():
     msg = out["choices"][0]["message"]
     assert msg["content"] == "<think>w10 </think>w11 "
     assert not any(k.startswith("reasoning") for k in msg)
-    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
+    # The automaton runs in every mode; only the routing follows the switch.
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 2
     with pytest.raises(ValueError):
         chat.ChatResponder(tok, req, gen.tokens, reasoning_field="thoughts")
+
+
+def test_reasoning_field_none_shows_a_think_block_the_prompt_opened():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    # Qwen-style: the template ends the prompt with the open marker, the
+    # model never emits it, so a client parsing the text would miss it.
+    prompt = chat.to_generation_request(tok, req).tokens + [THINK_START]
+    out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
+        events([10, THINK_END, 11]), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think>w10 </think>w11 "
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 1
+    req.stream = True
+    chunks = list(
+        chat.ChatResponder(tok, req, prompt, reasoning_field="none").stream(
+            events([10, THINK_END, 11]), cached=0
+        )
+    )
+    assert chunks[0]["choices"][0]["delta"]["content"] == "<think>w10 "
+    # Routed, the same prompt yields the reasoning field, no marker anywhere.
+    out = chat.ChatResponder(tok, req, prompt).complete(
+        events([10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["reasoning"] == "w10 " and msg["content"] == "w11 "
 
 
 def test_request_defaults_precedence(tmp_path):

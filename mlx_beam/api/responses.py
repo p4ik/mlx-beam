@@ -23,10 +23,12 @@ from mlx_beam.api.chat import (
     _number,
     build_prompt,
     parse_sampling,
+    parse_thinking,
     with_xtc_specials,
 )
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
+from mlx_beam.api.reasoning import read_aliases
 from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest
 
@@ -185,10 +187,13 @@ def parse_responses_request(
     max_tokens = _number(
         body, "max_output_tokens", defaults.max_completion_tokens, 1, None, int
     )
-    template_kwargs: dict[str, Any] = {}
-    effort = (body.get("reasoning") or {}).get("effort")
-    if effort == "none":
-        template_kwargs["enable_thinking"] = False
+    template_kwargs: dict[str, Any] = dict(defaults.chat_template_args)
+    aliases = read_aliases(body)
+    level, thinking = parse_thinking(aliases)
+    if thinking is not None:
+        template_kwargs["enable_thinking"] = thinking
+    if level is not None:
+        template_kwargs["reasoning_effort"] = level
     chat = ChatRequest(
         messages=_normalise_messages(
             items_to_messages(body.get("input"), body.get("instructions"))
@@ -199,7 +204,10 @@ def parse_responses_request(
         stream=bool(body.get("stream", False)),
         stop=[],
         tools=tools,
-        reasoning_effort=effort,
+        reasoning_effort=level,
+        max_reasoning_tokens=_number(
+            aliases, "max_reasoning_tokens", None, 0, None, int
+        ),
         template_kwargs=template_kwargs,
     )
     return ResponsesRequest(
