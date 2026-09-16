@@ -193,6 +193,11 @@ class TextAssembler:
             self._state, clean, current = TextStateMachine.step(
                 self._state, self._detok.last_segment
             )
+            if event.forced and (self._prev == "reasoning" or current == "reasoning"):
+                # The budget cut a byte-level tokenizer mid-character: the
+                # detokenizer flushes the fragment as U+FFFD together with
+                # the first forced token. That fragment was never a character.
+                clean = clean.replace("\ufffd", "")
             if event.finish_reason == "length" and current is not None:
                 # A stop word already matched leaves its tail in the buffer;
                 # that tail is not output.

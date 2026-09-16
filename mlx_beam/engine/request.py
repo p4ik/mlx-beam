@@ -86,6 +86,9 @@ class TokenEvent:
     # length limit; the answer after it was cut by the length limit.
     thinking_truncated: bool = False
     response_truncated: bool = False
+    # The budget put this token there, not the model: part of a forced
+    # close, up to and including the end marker.
+    forced: bool = False
 
 
 @dataclass(frozen=True)

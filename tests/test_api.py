@@ -567,3 +567,39 @@ def test_server_template_args_are_overridden_by_the_request():
     assert req.template_kwargs == {"enable_thinking": True, "lang": "de"}
     # A plain server keeps sending nothing extra.
     assert chat.parse_chat_request({"messages": msgs}, "m").template_kwargs == {}
+
+
+def test_forced_close_drops_the_half_character_the_cut_left():
+    # A byte-level tokenizer cut mid-character flushes the fragment as U+FFFD
+    # together with the first forced token; the stub plays that token.
+    tok = StubTokenizer()
+    tok._words[40] = "�\n"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    evs = [
+        TokenEvent(THINK_START, -0.1),
+        TokenEvent(10, -0.1),
+        TokenEvent(40, 0.0, forced=True),
+        TokenEvent(THINK_END, 0.0, forced=True),
+        TokenEvent(11, -0.1),
+        TokenEvent(EOS, -0.1, "stop"),
+    ]
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    msg = out["choices"][0]["message"]
+    assert msg["reasoning"] == "w10 \n" and msg["content"] == "w11 "
+    # Streamed, the fragment never reaches the wire either.
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
+    joined = "".join(c["choices"][0]["delta"].get("reasoning", "") for c in chunks)
+    assert joined == "w10 \n"
+    # In none mode the same text sits in the content, markers and all.
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        iter(evs), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think>w10 \n</think>w11 "
+    # The model's own U+FFFD, not forced, is left alone.
+    evs[2] = TokenEvent(40, -0.1)
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    assert out["choices"][0]["message"]["reasoning"] == "w10 �\n"

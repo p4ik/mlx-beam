@@ -649,6 +649,7 @@ class Engine:
                             ),
                             response_truncated=cut
                             and (thinking is None or not thinking.in_reasoning),
+                            forced=thinking is not None and thinking.last_forced,
                         )
                     )
                     if r.finish_reason is not None:

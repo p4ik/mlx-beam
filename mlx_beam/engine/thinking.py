@@ -120,6 +120,10 @@ class ThinkingBudget:
         self._end = _Matcher(limits.end)
         self.reasoning_tokens = 0
         self.thinking_truncated = False
+        # Set by observe(): the token just seen came from the force queue.
+        self.last_forced = False
+        # The free token began the end marker itself: the queue stood down.
+        self._natural = False
         # Forced tokens, consumed by the processor one per step, and the
         # alternative when the free token already began the end marker: the
         # rest of that marker, then the model goes on by itself.
@@ -193,6 +197,7 @@ class ThinkingBudget:
 
     def observe(self, token: int, finish_reason: str | None) -> None:
         """One generated token, in order; called after the generator returned it."""
+        self.last_forced = self._is_forced(token)
         if self._state == "reasoning":
             if self._end.feed(token):
                 self._state = "normal"
@@ -220,6 +225,18 @@ class ThinkingBudget:
     def in_reasoning(self) -> bool:
         return self._state == "reasoning"
 
+    def _is_forced(self, token: int) -> bool:
+        """Once armed, the tokens after the free one are the queue's - unless
+        the free token itself began the end marker, then the model's own
+        close is merely completed and nothing counts as forced."""
+        if self._armed_at is None or self._state != "reasoning":
+            return False
+        since = self.reasoning_tokens - self._armed_at
+        if since < self._free:
+            self._natural = token == self.limits.end[0]
+            return False
+        return not self._natural
+
     def _maybe_arm(self) -> None:
         limit = self.limits.max_tokens
         if limit is None or self._armed_at is not None:
@@ -233,6 +250,7 @@ class ThinkingBudget:
         self._queue = tuple(self.limits.close)
         self._pos = 0
         self._closed = None
+        self._natural = False
         self._armed_at = self.reasoning_tokens
         self._free = free
 
