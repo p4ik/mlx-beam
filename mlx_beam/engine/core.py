@@ -283,6 +283,12 @@ class Engine:
             raise InvalidRequest(f"token ids must be in [0, {vocab})")
         if request.sampling.top_k >= vocab:
             raise InvalidRequest(f"top_k must be below the vocabulary size {vocab}")
+        if request.sampling.min_tokens_to_keep > vocab:
+            # min_p keeps that many by argpartition, which rejects more than
+            # the vocabulary holds - inside the worker.
+            raise InvalidRequest(
+                f"min_tokens_to_keep must not exceed the vocabulary size {vocab}"
+            )
         if request.top_logprobs > vocab:
             raise InvalidRequest(f"top_logprobs must not exceed the vocabulary {vocab}")
         if any(not (0 <= t < vocab) for t in request.sampling.xtc_special_tokens):

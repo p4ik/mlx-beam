@@ -215,8 +215,27 @@ def test_bad_token_ids_and_top_k_are_400s(server):
         {"prompt": [1, 2], "max_tokens": 1, "top_k": 500, "temperature": 0.5},
     )
     assert status == 400 and "top_k" in json.loads(raw)["error"]["message"]
-    status, _, _ = call(server, "GET", "/health")
+    # min_p keeps min_tokens_to_keep by argpartition; more than the vocabulary
+    # would raise inside the worker.
+    status, _, raw = call(
+        server,
+        "POST",
+        "/v1/completions",
+        {
+            "prompt": [1, 2],
+            "max_tokens": 1,
+            "temperature": 1,
+            "min_p": 0.1,
+            "min_tokens_to_keep": 65,
+        },
+    )
+    assert status == 400 and "min_tokens_to_keep" in json.loads(raw)["error"]["message"]
+    status, _, raw = call(
+        server, "POST", "/v1/completions", {"prompt": [1, 2], "max_tokens": 1}
+    )
     assert status == 200
+    status, _, raw = call(server, "GET", "/health")
+    assert status == 200 and json.loads(raw)["alive"]
 
 
 @pytest.mark.parametrize(
