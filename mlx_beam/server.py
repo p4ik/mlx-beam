@@ -269,21 +269,24 @@ class Handler(BaseHTTPRequestHandler):
                     raise ApiError("the engine produced nothing", status=500)
                 events = _chain(first, result)
                 pending = bytearray()
-                for payload in responder.stream(events, result.prompt_cached):
-                    pending += self._sse_bytes(
-                        payload, payload.get("type") if sse_events else None
-                    )
-                    # Flush when the engine has nothing more ready, or the
-                    # batch is large enough as it is.
-                    if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
+                try:
+                    for payload in responder.stream(events, result.prompt_cached):
+                        pending += self._sse_bytes(
+                            payload, payload.get("type") if sse_events else None
+                        )
+                        # Flush when the engine has nothing more ready, or
+                        # the batch is large enough as it is.
+                        if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
+                            self.wfile.write(pending)
+                            self.wfile.flush()
+                            pending = bytearray()
+                    if not sse_events:
+                        pending += self._sse_bytes("[DONE]")
+                finally:
+                    # What was generated goes out before any error does.
+                    if pending:
                         self.wfile.write(pending)
                         self.wfile.flush()
-                        pending = bytearray()
-                if not sse_events:
-                    pending += self._sse_bytes("[DONE]")
-                if pending:
-                    self.wfile.write(pending)
-                    self.wfile.flush()
             else:
                 first = self._await_first(result, keepalive=False)
                 if first is None:

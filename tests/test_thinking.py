@@ -112,14 +112,15 @@ def test_engine_forces_the_close_and_reports_the_flags():
         start, end, nl, nl2 = unused[:4]
         limits = ReasoningLimits((start,), (end,), (nl, end, nl2), seeded=True)
         req = GenerationRequest(
-            [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=4
+            [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=3
         )
         events = list(engine.submit(req))
         tokens = [e.token for e in events]
-        # 8 to generate, 4 kept for the answer: the block gets 4, the last of
-        # them the forced newline, then the marker and the blank line.
-        assert tokens[3:6] == [nl, end, nl2]
-        assert tokens[:3] == free[:3]
+        # 8 to generate, 3 kept for the answer, 2 for the close's tail: the
+        # block gets 3, the last of them the forced newline, then the marker
+        # and the blank line, then the 3 answer tokens.
+        assert tokens[2:5] == [nl, end, nl2] and len(tokens) == 8
+        assert tokens[:2] == free[:2]
         assert events[-1].thinking_truncated and events[-1].finish_reason == "length"
         assert events[-1].response_truncated
         # A client stop on the marker ends the request there, flagged.
@@ -127,7 +128,7 @@ def test_engine_forces_the_close_and_reports_the_flags():
             [3, 7, 11],
             max_tokens=8,
             reasoning=limits,
-            min_response_tokens=4,
+            min_response_tokens=3,
             stop_sequences=[(end,)],
         )
         events = list(engine.submit(req))
@@ -203,4 +204,62 @@ def test_chat_budget_switches_thinking_off_or_refuses(monkeypatch):
     )
     req = chat.parse_chat_request({"messages": msgs, "max_tokens": 300}, "m", d)
     gen = chat.to_generation_request(Seeding(), req, d, max_context=2000)
-    assert gen.reasoning.max_tokens == 200
+    # 300 minus the reserve of 100 minus the close's tail (the stub's close
+    # is the marker alone, so 1).
+    assert gen.reasoning.max_tokens == 199
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 4, 6])
+def test_small_budgets_never_overshoot(limit):
+    limits = ReasoningLimits(**{**LIMITS.__dict__, "max_tokens": limit})
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START] + list(range(10, 30))).run(12)
+    assert tracker.reasoning_tokens <= limit
+    if limit < 3:
+        # Too small for the opener, a free token and the close: no block.
+        assert START not in out and tracker.reasoning_tokens == 0
+    else:
+        assert tracker.reasoning_tokens == limit and END in out
+    seeded = ReasoningLimits(**{**LIMITS.__dict__, "seeded": True, "max_tokens": limit})
+    tracker = ThinkingBudget(seeded)
+    out = Steps(tracker, list(range(10, 30))).run(12)
+    assert tracker.reasoning_tokens <= limit and END in out
+
+
+def test_multi_token_end_marker_guard_recovers_from_a_false_start():
+    E1, E2 = 54, 55
+    limits = ReasoningLimits((START,), (E1, E2), (NL, E1, E2, NL2), max_tokens=5)
+    tracker = ThinkingBudget(limits)
+    # The free token starts the marker but the model does not finish it.
+    out = Steps(tracker, [START, 10, 11, E1, 12, 13, 14, 15, 16, 17]).run(10)
+    assert tracker.thinking_truncated and not tracker.in_reasoning
+    assert out[-4:-1] != [12, 13, 14] and E2 in out
+    # A real two-token close on the free token is left alone.
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, 10, 11, E1, E2, 20, 21, 22]).run(8)
+    assert out == [START, 10, 11, E1, E2, 20, 21, 22] and not tracker.thinking_truncated
+
+
+def test_a_reopened_block_is_closed_again():
+    S1, S2 = 56, 57
+    limits = ReasoningLimits((S1, S2), (END,), (NL, END, NL2), max_tokens=4)
+    tracker = ThinkingBudget(limits)
+    script = [S1, S2, 10, 11, 12, 13, 14, S1, S2, 20, 21, 22, 23, 24]
+    out = Steps(tracker, script).run(14)
+    assert out.count(END) == 2 and tracker.thinking_truncated
+    # The second block is closed by force as soon as the lag allows.
+    second = out.index(S2, out.index(END))
+    assert END in out[second : second + 4]
+
+
+def test_flags_are_right_without_a_budget():
+    model = tiny_hybrid()
+    with Engine(model) as engine:
+        free = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=6)))
+        start = next(t for t in range(63, 0, -1) if t not in free)
+        # Seeded, no budget: the length limit hits inside the block.
+        limits = ReasoningLimits((start,), (start - 1,), (start - 1,), seeded=True)
+        last = list(
+            engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, reasoning=limits))
+        )[-1]
+        assert last.thinking_truncated and not last.response_truncated

@@ -231,8 +231,11 @@ class TextAssembler:
                 self._pending_tools.append(self._tool_text)
                 self._tool_text = ""
                 self._made_tool_call = True
-            closed = self._think_end if self._prev == "reasoning" else ""
-            delta.content = (closed if not self._route else "") + clean
+            closed = ""
+            if self._prev == "reasoning" and not self._route:
+                # A block the prompt opened may close on the first token.
+                closed = self._take_lead() + self._think_end
+            delta.content = closed + clean
         self._prev = current
 
         if event.finish_reason is not None:

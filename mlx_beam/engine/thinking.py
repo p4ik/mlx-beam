@@ -60,6 +60,26 @@ def budget(
     return completion_cap, completion_cap - min(min_response_tokens, completion_cap)
 
 
+def close_counted(limits: ReasoningLimits) -> int:
+    """Tokens of the close before the end marker: the part that still counts
+    as reasoning. The rest of the close is generated but belongs to neither."""
+    end = limits.end
+    return next(
+        (
+            i
+            for i in range(len(limits.close) - len(end) + 1)
+            if limits.close[i : i + len(end)] == end
+        ),
+        len(limits.close),
+    )
+
+
+def close_tail(limits: ReasoningLimits) -> int:
+    """Tokens the forced close spends after the block: the marker and what
+    follows it. The answer's reserve begins after them."""
+    return len(limits.close) - close_counted(limits)
+
+
 class _Matcher:
     """Advances through a token sequence; True when the last token completed it."""
 
@@ -100,24 +120,24 @@ class ThinkingBudget:
         self._free = 0
         # Lazy scalar: the model closed the block itself as the forcing began.
         self._closed = None
-        # Tokens of the close before the end marker count as reasoning.
-        end = limits.end
-        self._close_counted = next(
-            (
-                i
-                for i in range(len(limits.close) - len(end) + 1)
-                if limits.close[i : i + len(end)] == end
-            ),
-            len(limits.close),
-        )
+        # Observations left to confirm a close the guard took for natural.
+        self._suspect = 0
+        self._close_counted = close_counted(limits)
         self._one_hot: dict[int, mx.array] = {}
         # A single-token opener can be masked out: no block at budget 0, no
         # reopening after a forced close.
         self._block = False
-        if limits.max_tokens == 0 and not limits.seeded:
+        limit = limits.max_tokens
+        if limit is None:
+            return
+        if limits.seeded:
+            # Below this the observe-and-arm path cannot land exactly; force
+            # from the first token instead and stay under the budget.
+            if limit <= self._close_counted + 1:
+                self._arm(free=0)
+        elif limit < 2 + self._close_counted:
+            # The opener, a free token and the close would already exceed it.
             self._block_opener()
-        elif limits.seeded:
-            self._maybe_arm(free=0)
 
     # -- the generator's side -----------------------------------------------
 
@@ -150,6 +170,7 @@ class ThinkingBudget:
         if self._state == "reasoning":
             if self._end.feed(token):
                 self._state = "normal"
+                self._suspect = 0
                 if self._armed_at is not None:
                     # A close this early came from the model itself, before
                     # the forced one could reach the logits.
@@ -163,6 +184,7 @@ class ThinkingBudget:
                     self._after_close() if forced else self._disarm()
             else:
                 self.reasoning_tokens += 1
+                self._check_guard(token)
                 self._maybe_arm()
         elif self._start.feed(token):
             self._state = "reasoning"
@@ -175,28 +197,48 @@ class ThinkingBudget:
     def in_reasoning(self) -> bool:
         return self._state == "reasoning"
 
-    def _maybe_arm(self, free: int = 1) -> None:
+    def _check_guard(self, token: int) -> None:
+        """The device guard reads only the first token of the end marker. A
+        free token that starts the marker without finishing it fooled it:
+        once that shows, arm again with a fresh guard."""
+        end = self.limits.end
+        if self._armed_at is None or len(end) < 2:
+            return
+        if self.reasoning_tokens == self._armed_at + self._free and token == end[0]:
+            self._suspect = len(end) - 1
+        elif self._suspect:
+            self._suspect -= 1
+            if not self._suspect:
+                self._disarm()
+
+    def _maybe_arm(self) -> None:
         limit = self.limits.max_tokens
         if limit is None or self._armed_at is not None:
             return
         # After arming, the free token follows, then the counted part of the
         # close: arm so that those still fit the budget.
-        if self.reasoning_tokens >= limit - free - self._close_counted:
-            self._queue = tuple(self.limits.close)
-            self._pos = 0
-            self._closed = None
-            self._armed_at = self.reasoning_tokens
-            self._free = free
+        if self.reasoning_tokens >= limit - 1 - self._close_counted:
+            self._arm(free=1)
+
+    def _arm(self, free: int) -> None:
+        self._queue = tuple(self.limits.close)
+        self._pos = 0
+        self._closed = None
+        self._armed_at = self.reasoning_tokens
+        self._free = free
 
     def _disarm(self) -> None:
         self._queue = ()
         self._pos = 0
         self._armed_at = None
         self._closed = None
+        self._suspect = 0
 
     def _after_close(self) -> None:
-        # The forced close is through: the model does not get to reopen.
+        # The forced close is through. A single-token opener is masked from
+        # here on; a longer one that reopens is closed again at once.
         self.thinking_truncated = True
+        self._disarm()
         self._block_opener()
 
     def _block_opener(self) -> None:

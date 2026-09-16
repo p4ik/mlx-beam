@@ -28,7 +28,7 @@ from mlx_beam.api.text import (
     xtc_special_ids,
 )
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
-from mlx_beam.engine.thinking import ReasoningLimits, budget
+from mlx_beam.engine.thinking import ReasoningLimits, budget, close_tail
 
 # What a parser falls back to when no server defaults are handed in (tests).
 DEFAULTS = RequestDefaults()
@@ -374,6 +374,9 @@ def to_generation_request(
     completion_cap, reasoning_cap = budget(
         max_context, len(prompt), req.max_tokens, min_response
     )
+    markers = reasoning_limits(tokenizer, prompt, None)
+    if reasoning_cap is not None and markers is not None:
+        reasoning_cap = max(0, reasoning_cap - close_tail(markers))
     bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
     limit = min(bounded) if bounded else None
     if limit == 0 and getattr(tokenizer, "has_thinking", False):

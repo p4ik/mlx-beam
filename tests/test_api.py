@@ -436,6 +436,11 @@ def test_reasoning_field_none_shows_a_think_block_the_prompt_opened():
         )
     )
     assert chunks[0]["choices"][0]["delta"]["content"] == "<think>w10 "
+    # The block closes on the very first token: the opener still goes first.
+    out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
+        events([THINK_END, 11]), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think></think>w11 "
     # Routed, the same prompt yields the reasoning field, no marker anywhere.
     out = chat.ChatResponder(tok, req, prompt).complete(
         events([10, THINK_END, 11]), cached=0

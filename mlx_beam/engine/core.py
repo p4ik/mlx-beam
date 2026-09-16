@@ -28,7 +28,12 @@ from mlx_beam.engine.request import (
     TokenEvent,
 )
 from mlx_beam.engine.sampling import SamplerPool, top_logprobs
-from mlx_beam.engine.thinking import ContextTooLong, ThinkingBudget, budget
+from mlx_beam.engine.thinking import (
+    ContextTooLong,
+    ThinkingBudget,
+    budget,
+    close_tail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +251,10 @@ class Engine:
             self.max_context, prompt, request.max_tokens, request.min_response_tokens
         )
         limits = request.reasoning
+        if limits is not None and reasoning_cap is not None:
+            # The reserve starts after the close's tail, which is neither
+            # reasoning nor answer.
+            reasoning_cap = max(0, reasoning_cap - close_tail(limits))
         if limits is not None and limits.max_tokens is not None:
             reasoning_cap = (
                 limits.max_tokens
@@ -394,11 +403,14 @@ class Engine:
             stop = StopSequences(req.stop_sequences or None)
             processors = _logits_processors(req.sampling)
             thinking = None
-            if req.reasoning is not None and stream.reasoning_cap is not None:
+            if req.reasoning is not None:
+                # The tracker always runs, for the flags; it touches the
+                # logits only when there is a budget to enforce.
                 thinking = ThinkingBudget(
                     replace(req.reasoning, max_tokens=stream.reasoning_cap)
                 )
-                processors = [*processors, thinking]
+                if stream.reasoning_cap is not None:
+                    processors = [*processors, thinking]
             (uid,) = gen.insert_segments(
                 segments=[segments],
                 max_tokens=[stream.completion_cap],
