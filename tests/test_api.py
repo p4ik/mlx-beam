@@ -8,8 +8,14 @@ from mlx_beam.api import chat, completions, responses
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.text import TextAssembler
 from mlx_beam.engine.request import TokenEvent
-from tests.stub_tokenizer import EOS, THINK_END, THINK_START, TOOL_END, TOOL_START
-from tests.stub_tokenizer import StubTokenizer
+from tests.stub_tokenizer import (
+    EOS,
+    THINK_END,
+    THINK_START,
+    TOOL_END,
+    TOOL_START,
+    StubTokenizer,
+)
 
 
 def events(ids, finish="stop"):
@@ -22,7 +28,9 @@ def events(ids, finish="stop"):
 
 
 def test_chat_request_defaults_and_limits():
-    req = chat.parse_chat_request({"messages": [{"role": "user", "content": "w1"}]}, "m")
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
     assert req.max_tokens == chat.DEFAULT_MAX_TOKENS and req.model == "m"
     assert req.sampling.temperature == 1.0 and req.sampling.top_p == 1.0
     req = chat.parse_chat_request(
@@ -45,7 +53,10 @@ def test_chat_request_defaults_and_limits():
     [
         ({"messages": []}, "messages"),
         ({"messages": [{"content": "x"}]}, "messages"),
-        ({"messages": [{"role": "user", "content": "x"}], "temperature": 3}, "temperature"),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "temperature": 3},
+            "temperature",
+        ),
         ({"messages": [{"role": "user", "content": "x"}], "n": 2}, "n"),
         ({"messages": [{"role": "user", "content": "x"}], "seed": 1}, "seed"),
         ({"messages": [{"role": "user", "content": "x"}], "stop": 3}, "stop"),
@@ -77,7 +88,12 @@ def test_image_parts_name_the_missing_extra():
 def test_chat_prompt_goes_through_the_template():
     tok = StubTokenizer()
     req = chat.parse_chat_request(
-        {"messages": [{"role": "system", "content": "w1"}, {"role": "user", "content": "w2 w3"}]},
+        {
+            "messages": [
+                {"role": "system", "content": "w1"},
+                {"role": "user", "content": "w2 w3"},
+            ]
+        },
         "m",
     )
     gen = chat.to_generation_request(tok, req)
@@ -113,13 +129,19 @@ def test_assembler_length_flushes_and_stop_hides_the_eos():
     assert deltas[-1].finish_reason == "length"
     asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
     deltas = [asm.feed(e) for e in events([10])]
-    assert "".join(d.content for d in deltas) == "w10 " and deltas[-1].finish_reason == "stop"
+    assert (
+        "".join(d.content for d in deltas) == "w10 "
+        and deltas[-1].finish_reason == "stop"
+    )
 
 
 def test_chat_responder_shapes():
     tok = StubTokenizer()
     req = chat.parse_chat_request(
-        {"messages": [{"role": "user", "content": "w1"}], "stream_options": {"include_usage": True}},
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "stream_options": {"include_usage": True},
+        },
         "m",
     )
     gen = chat.to_generation_request(tok, req)
@@ -130,7 +152,9 @@ def test_chat_responder_shapes():
     assert out["usage"]["completion_tokens"] == 3
     assert out["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
     req.stream = True
-    chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(events([10, 11]), cached=0))
+    chunks = list(
+        chat.ChatResponder(tok, req, gen.tokens).stream(events([10, 11]), cached=0)
+    )
     assert chunks[0]["choices"][0]["delta"] == {"role": "assistant", "content": "w10 "}
     assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["choices"] == [] and "usage" in chunks[-1]
@@ -138,10 +162,14 @@ def test_chat_responder_shapes():
 
 def test_completions_accept_token_ids_and_echo():
     tok = StubTokenizer()
-    req = completions.parse_completion_request({"prompt": [1, 2, 3], "echo": True, "max_tokens": 2}, "m")
+    req = completions.parse_completion_request(
+        {"prompt": [1, 2, 3], "echo": True, "max_tokens": 2}, "m"
+    )
     gen = completions.to_generation_request(tok, req)
     assert gen.tokens == [1, 2, 3]
-    out = completions.CompletionResponder(tok, req, gen.tokens).complete(events([10, 11], "length"), 0)
+    out = completions.CompletionResponder(tok, req, gen.tokens).complete(
+        events([10, 11], "length"), 0
+    )
     assert out["choices"][0]["text"] == "w1 w2 w3 w10 w11 "
     assert out["choices"][0]["finish_reason"] == "length"
     with pytest.raises(ApiError):
@@ -153,8 +181,17 @@ def test_responses_items_become_messages_and_back():
     body = {
         "instructions": "w1",
         "input": [
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "w2"}]},
-            {"type": "function_call", "call_id": "c1", "name": "w20", "arguments": "{}"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "w2"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "w20",
+                "arguments": "{}",
+            },
             {"type": "function_call_output", "call_id": "c1", "output": "w3"},
         ],
         "tools": [{"type": "function", "name": "w20", "parameters": {}}],
@@ -163,7 +200,9 @@ def test_responses_items_become_messages_and_back():
     req = responses.parse_responses_request(body, "m")
     roles = [m["role"] for m in req.chat.messages]
     assert roles == ["system", "user", "assistant", "tool"]
-    assert req.chat.tools == [{"type": "function", "function": {"name": "w20", "parameters": {}}}]
+    assert req.chat.tools == [
+        {"type": "function", "function": {"name": "w20", "parameters": {}}}
+    ]
     gen = responses.to_generation_request(tok, req)
     out = responses.ResponsesResponder(tok, req, gen.tokens).complete(
         events([THINK_START, 10, THINK_END, 11, TOOL_START, 20, 21, TOOL_END]), 0
@@ -177,10 +216,14 @@ def test_responses_items_become_messages_and_back():
 
 def test_responses_refuse_state_and_hosted_tools():
     with pytest.raises(ApiError) as exc:
-        responses.parse_responses_request({"input": "w1", "previous_response_id": "resp_x"}, "m")
+        responses.parse_responses_request(
+            {"input": "w1", "previous_response_id": "resp_x"}, "m"
+        )
     assert "full input" in exc.value.message
     with pytest.raises(ApiError) as exc:
-        responses.parse_responses_request({"input": "w1", "tools": [{"type": "web_search"}]}, "m")
+        responses.parse_responses_request(
+            {"input": "w1", "tools": [{"type": "web_search"}]}, "m"
+        )
     assert exc.value.code == "unsupported"
 
 
@@ -188,7 +231,9 @@ def test_responses_stream_events():
     tok = StubTokenizer()
     req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
     gen = responses.to_generation_request(tok, req)
-    evs = list(responses.ResponsesResponder(tok, req, gen.tokens).stream(events([10, 11]), 0))
+    evs = list(
+        responses.ResponsesResponder(tok, req, gen.tokens).stream(events([10, 11]), 0)
+    )
     types = [e["type"] for e in evs]
     assert types[0] == "response.created" and types[-1] == "response.completed"
     assert types.count("response.output_text.delta") == 2

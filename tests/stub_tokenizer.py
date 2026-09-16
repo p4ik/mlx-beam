@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 EOS = 63
 THINK_START, THINK_END = 60, 61
 TOOL_START, TOOL_END = 58, 59

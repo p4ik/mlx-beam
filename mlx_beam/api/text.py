@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 
 from mlx_beam._vendor.mlx_lm.generate import (
     TextStateMachine,

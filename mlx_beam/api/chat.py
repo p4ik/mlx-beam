@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
-from collections.abc import Iterator
 
 from mlx_beam.api.errors import ApiError, missing_extra, unsupported
 from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids

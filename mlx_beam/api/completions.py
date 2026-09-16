@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
-from collections.abc import Iterator
 
 from mlx_beam.api.chat import DEFAULT_MAX_TOKENS, _number, parse_sampling, parse_stop
 from mlx_beam.api.errors import ApiError, unsupported
@@ -102,7 +102,12 @@ class CompletionResponder:
         }
 
     def _choice(self, text: str, finish_reason) -> dict[str, Any]:
-        return {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason}
+        return {
+            "index": 0,
+            "text": text,
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        }
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         first = True

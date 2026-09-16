@@ -12,15 +12,15 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
-from collections.abc import Iterator
 
 from mlx_beam.api.chat import (
-    ChatRequest,
     DEFAULT_MAX_TOKENS,
-    _number,
+    ChatRequest,
     _normalise_messages,
+    _number,
     build_prompt,
     parse_sampling,
 )
@@ -42,18 +42,24 @@ def _content_text(content: Any, item_index: int) -> str | None:
     if content is None or isinstance(content, str):
         return content
     if not isinstance(content, list):
-        raise ApiError(f"input[{item_index}].content must be text or parts", param="input")
+        raise ApiError(
+            f"input[{item_index}].content must be text or parts", param="input"
+        )
     texts = []
     for part in content:
         kind = part.get("type") if isinstance(part, dict) else None
         if kind in ("input_text", "output_text", "text"):
             texts.append(part.get("text", ""))
         elif kind in ("input_image",):
-            raise ApiError("image input needs the 'vision' extra", code="extra_not_installed")
+            raise ApiError(
+                "image input needs the 'vision' extra", code="extra_not_installed"
+            )
         elif kind in ("input_audio", "input_file"):
             raise unsupported(f"input part {kind}", "input")
         else:
-            raise ApiError(f"input[{item_index}] has an unknown part type {kind!r}", param="input")
+            raise ApiError(
+                f"input[{item_index}] has an unknown part type {kind!r}", param="input"
+            )
     return "".join(texts)
 
 
@@ -73,11 +79,15 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
         kind = item.get("type", "message")
         if kind == "message":
             if pending_calls:
-                messages.append({"role": "assistant", "content": None, "tool_calls": pending_calls})
+                messages.append(
+                    {"role": "assistant", "content": None, "tool_calls": pending_calls}
+                )
                 pending_calls = []
             role = item.get("role")
             if role not in ("user", "assistant", "system", "developer"):
-                raise ApiError(f"input[{i}] has an unknown role {role!r}", param="input")
+                raise ApiError(
+                    f"input[{i}] has an unknown role {role!r}", param="input"
+                )
             messages.append(
                 {
                     "role": "system" if role == "developer" else role,
@@ -97,14 +107,18 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
             )
         elif kind == "function_call_output":
             if pending_calls:
-                messages.append({"role": "assistant", "content": None, "tool_calls": pending_calls})
+                messages.append(
+                    {"role": "assistant", "content": None, "tool_calls": pending_calls}
+                )
                 pending_calls = []
             output = item.get("output")
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id"),
-                    "content": output if isinstance(output, str) else json.dumps(output),
+                    "content": (
+                        output if isinstance(output, str) else json.dumps(output)
+                    ),
                 }
             )
         elif kind == "reasoning":
@@ -114,7 +128,9 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
         else:
             raise unsupported(f"input item type {kind}", "input")
     if pending_calls:
-        messages.append({"role": "assistant", "content": None, "tool_calls": pending_calls})
+        messages.append(
+            {"role": "assistant", "content": None, "tool_calls": pending_calls}
+        )
     if not messages:
         raise ApiError("input is empty", param="input")
     return messages
@@ -129,8 +145,12 @@ def _tools_to_chat(tools: Any) -> list[dict] | None:
     for t in tools:
         kind = t.get("type") if isinstance(t, dict) else None
         if kind != "function":
-            raise ApiError(f"unsupported tool type {kind!r}", param="tools", code="unsupported")
-        fn = {k: t[k] for k in ("name", "description", "parameters", "strict") if k in t}
+            raise ApiError(
+                f"unsupported tool type {kind!r}", param="tools", code="unsupported"
+            )
+        fn = {
+            k: t[k] for k in ("name", "description", "parameters", "strict") if k in t
+        }
         if "function" in t and isinstance(t["function"], dict):
             fn = {**t["function"], **fn}
         out.append({"type": "function", "function": fn})
@@ -153,7 +173,9 @@ def parse_responses_request(body: dict, default_model: str) -> ResponsesRequest:
         raise unsupported("seed", "seed")
     text_format = ((body.get("text") or {}).get("format") or {}).get("type")
     if text_format not in (None, "text"):
-        raise ApiError("text.format needs the 'structured' extra", code="extra_not_installed")
+        raise ApiError(
+            "text.format needs the 'structured' extra", code="extra_not_installed"
+        )
     tool_choice = body.get("tool_choice", "auto")
     if tool_choice not in ("auto", "none"):
         raise unsupported("tool_choice other than auto or none", "tool_choice")
@@ -164,7 +186,9 @@ def parse_responses_request(body: dict, default_model: str) -> ResponsesRequest:
     if effort == "none":
         template_kwargs["enable_thinking"] = False
     chat = ChatRequest(
-        messages=_normalise_messages(items_to_messages(body.get("input"), body.get("instructions"))),
+        messages=_normalise_messages(
+            items_to_messages(body.get("input"), body.get("instructions"))
+        ),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
         sampling=parse_sampling(body),
@@ -199,11 +223,16 @@ class ResponsesResponder:
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self.assembler = TextAssembler(
-            tokenizer, prompt_tokens=prompt_tokens, tools=req.chat.tools, streaming=False
+            tokenizer,
+            prompt_tokens=prompt_tokens,
+            tools=req.chat.tools,
+            streaming=False,
         )
         self.msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
-    def _response(self, status: str, output: list[dict], cached: int, incomplete=None) -> dict:
+    def _response(
+        self, status: str, output: list[dict], cached: int, incomplete=None
+    ) -> dict:
         out = {
             "id": self.id,
             "object": "response",
@@ -251,7 +280,11 @@ class ResponsesResponder:
                     "status": "completed",
                     "role": "assistant",
                     "content": [
-                        {"type": "output_text", "text": total.content, "annotations": []}
+                        {
+                            "type": "output_text",
+                            "text": total.content,
+                            "annotations": [],
+                        }
                     ],
                 }
             )
@@ -277,7 +310,9 @@ class ResponsesResponder:
             total.tool_calls += d.tool_calls
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
-        incomplete = {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
+        incomplete = (
+            {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
+        )
         status = "incomplete" if incomplete else "completed"
         return self._response(status, self._output_items(total), cached, incomplete)
 
@@ -304,7 +339,13 @@ class ResponsesResponder:
                     yield ev(
                         "response.output_item.added",
                         output_index=0,
-                        item={"id": self.msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
+                        item={
+                            "id": self.msg_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
                     )
                 total.content += d.content
                 yield ev(
@@ -324,7 +365,12 @@ class ResponsesResponder:
                 content_index=0,
                 text=total.content,
             )
-        incomplete = {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
+        incomplete = (
+            {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
+        )
         status = "incomplete" if incomplete else "completed"
         final = self._response(status, self._output_items(total), cached, incomplete)
-        yield ev("response.completed" if not incomplete else "response.incomplete", response=final)
+        yield ev(
+            "response.completed" if not incomplete else "response.incomplete",
+            response=final,
+        )

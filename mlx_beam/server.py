@@ -9,10 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable, Iterator
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from collections.abc import Callable, Iterator
 
 from mlx_beam import __version__
 from mlx_beam.api import chat, completions, responses

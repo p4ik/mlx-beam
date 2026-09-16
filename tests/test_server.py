@@ -55,7 +55,11 @@ def test_health_and_models(server):
 
 
 def test_chat_completion(server):
-    body = {"messages": [{"role": "user", "content": "w1 w2"}], "max_tokens": 4, "temperature": 0}
+    body = {
+        "messages": [{"role": "user", "content": "w1 w2"}],
+        "max_tokens": 4,
+        "temperature": 0,
+    }
     status, ctype, raw = call(server, "POST", "/v1/chat/completions", body)
     out = json.loads(raw)
     assert status == 200 and ctype.startswith("application/json")
@@ -82,34 +86,51 @@ def test_chat_completion_streams(server):
 
 
 def test_completions_with_token_ids(server):
-    status, _, raw = call(server, "POST", "/v1/completions", {"prompt": [1, 2, 3], "max_tokens": 2})
+    status, _, raw = call(
+        server, "POST", "/v1/completions", {"prompt": [1, 2, 3], "max_tokens": 2}
+    )
     out = json.loads(raw)
     assert status == 200 and out["object"] == "text_completion"
     assert out["usage"]["prompt_tokens"] == 3
 
 
 def test_responses(server):
-    status, _, raw = call(server, "POST", "/v1/responses", {"input": "w1", "max_output_tokens": 2})
+    status, _, raw = call(
+        server, "POST", "/v1/responses", {"input": "w1", "max_output_tokens": 2}
+    )
     out = json.loads(raw)
     assert status == 200 and out["object"] == "response"
     assert out["status"] in ("completed", "incomplete")
     status, ctype, raw = call(
-        server, "POST", "/v1/responses", {"input": "w1", "max_output_tokens": 2, "stream": True}
+        server,
+        "POST",
+        "/v1/responses",
+        {"input": "w1", "max_output_tokens": 2, "stream": True},
     )
     assert status == 200 and ctype.startswith("text/event-stream")
     assert "event: response.created" in raw.decode()
 
 
 def test_errors_are_openai_shaped(server):
-    status, _, raw = call(server, "POST", "/v1/chat/completions", {"messages": [], "seed": 3})
+    status, _, raw = call(
+        server, "POST", "/v1/chat/completions", {"messages": [], "seed": 3}
+    )
     err = json.loads(raw)["error"]
     assert status == 400 and err["type"] == "invalid_request_error" and err["param"]
     status, _, raw = call(server, "POST", "/v1/nothing", {})
     assert status == 404
     conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
-    conn.request("POST", "/v1/chat/completions", body=b"{not json", headers={"Content-Type": "application/json"})
+    conn.request(
+        "POST",
+        "/v1/chat/completions",
+        body=b"{not json",
+        headers={"Content-Type": "application/json"},
+    )
     resp = conn.getresponse()
-    assert resp.status == 400 and "invalid JSON" in json.loads(resp.read())["error"]["message"]
+    assert (
+        resp.status == 400
+        and "invalid JSON" in json.loads(resp.read())["error"]["message"]
+    )
     conn.close()
 
 
