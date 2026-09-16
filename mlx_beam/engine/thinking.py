@@ -60,9 +60,7 @@ def budget(
     return completion_cap, completion_cap - min(min_response_tokens, completion_cap)
 
 
-def close_counted(limits: ReasoningLimits) -> int:
-    """Tokens of the close before the end marker: the part that still counts
-    as reasoning. The rest of the close is generated but belongs to neither."""
+def _end_index(limits: ReasoningLimits) -> int:
     end = limits.end
     return next(
         (
@@ -70,13 +68,19 @@ def close_counted(limits: ReasoningLimits) -> int:
             for i in range(len(limits.close) - len(end) + 1)
             if limits.close[i : i + len(end)] == end
         ),
-        len(limits.close),
+        len(limits.close) - len(end),
     )
 
 
+def close_counted(limits: ReasoningLimits) -> int:
+    """Tokens of the close that still count as reasoning: everything before
+    the end marker's last token, since only that one leaves the block."""
+    return _end_index(limits) + len(limits.end) - 1
+
+
 def close_tail(limits: ReasoningLimits) -> int:
-    """Tokens the forced close spends after the block: the marker and what
-    follows it. The answer's reserve begins after them."""
+    """Tokens the forced close spends after the block: the marker's last
+    token and what follows it. The answer's reserve begins after them."""
     return len(limits.close) - close_counted(limits)
 
 
@@ -102,7 +106,12 @@ class _Matcher:
 
 class ThinkingBudget:
     """Per-request: the logits processor the generator calls each step, and
-    the tracker the engine feeds with every token as it becomes known."""
+    the tracker the engine feeds with every token as it becomes known.
+
+    The budget is a hard cap for single- and multi-token markers: the opener
+    is masked when the remaining allowance could not hold a block, a close
+    the model starts on its own is completed rather than second-guessed, and
+    a forced close disarms so a reopened block is judged afresh."""
 
     def __init__(self, limits: ReasoningLimits):
         self.limits = limits
@@ -111,57 +120,74 @@ class ThinkingBudget:
         self._end = _Matcher(limits.end)
         self.reasoning_tokens = 0
         self.thinking_truncated = False
-        # Forced tokens, consumed by the processor one per step.
+        # Forced tokens, consumed by the processor one per step, and the
+        # alternative when the free token already began the end marker: the
+        # rest of that marker, then the model goes on by itself.
         self._queue: tuple[int, ...] = ()
+        self._cont = tuple(limits.end[1:])
         self._pos = 0
         self._armed_at: int | None = None
         # Tokens sampled before the force reaches the logits: one when armed
         # from an observation, none when armed before the first step.
         self._free = 0
-        # Lazy scalar: the model closed the block itself as the forcing began.
+        # Lazy scalar: the model began the close itself on the free token.
         self._closed = None
-        # Observations left to confirm a close the guard took for natural.
-        self._suspect = 0
         self._close_counted = close_counted(limits)
         self._one_hot: dict[int, mx.array] = {}
-        # A single-token opener can be masked out: no block at budget 0, no
-        # reopening after a forced close.
+        self._start_prefix = mx.array(limits.start[:-1], dtype=mx.int32)
+        # While set, the opener cannot complete: no block fits any more.
         self._block = False
         limit = limits.max_tokens
         if limit is None:
             return
-        if limits.seeded:
+        if limits.seeded and limit <= self._close_counted + 1:
             # Below this the observe-and-arm path cannot land exactly; force
             # from the first token instead and stay under the budget.
-            if limit <= self._close_counted + 1:
-                self._arm(free=0)
-        elif limit < 2 + self._close_counted:
-            # The opener, a free token and the close would already exceed it.
-            self._block_opener()
+            self._arm(free=0)
+        elif not limits.seeded:
+            self._gate_opener()
 
     # -- the generator's side -----------------------------------------------
 
     def __call__(self, context: mx.array, logits: mx.array) -> mx.array:
-        vocab = logits.shape[-1]
+        shape, vocab = logits.shape, logits.shape[-1]
         if self._block:
-            logits = mx.where(self._hot(self.limits.start[0], vocab), -mx.inf, logits)
+            logits = self._mask_opener(context, logits, vocab)
         if self._pos < len(self._queue):
-            token = self._queue[self._pos]
+            k = self._pos
             self._pos += 1
-            forced = mx.where(self._hot(token, vocab), 0.0, -mx.inf).astype(
-                logits.dtype
-            )
+            forced = self._forced(self._queue[k], vocab, logits.dtype)
             if self._closed is None:
-                # The free token in between: did it start the close by itself?
                 self._closed = context[-1] == self.limits.end[0]
-            logits = mx.where(self._closed, logits, forced)
+            if k < len(self._cont):
+                # The model started the marker: finish it, do not double it.
+                other = self._forced(self._cont[k], vocab, logits.dtype)
+                logits = mx.where(self._closed, other, forced)
+            else:
+                logits = mx.where(self._closed, logits, forced)
+            logits = mx.broadcast_to(logits, shape)
         return logits
+
+    def _forced(self, token: int, vocab: int, dtype) -> mx.array:
+        return mx.where(self._hot(token, vocab), 0.0, -mx.inf).astype(dtype)
 
     def _hot(self, token: int, vocab: int) -> mx.array:
         hot = self._one_hot.get(token)
         if hot is None:
             hot = self._one_hot[token] = mx.arange(vocab) == token
         return hot
+
+    def _mask_opener(self, context: mx.array, logits: mx.array, vocab: int):
+        start = self.limits.start
+        if len(start) == 1:
+            return mx.where(self._hot(start[0], vocab), -mx.inf, logits)
+        # A longer opener is cut at its last token, once the ones before it
+        # are in place; the fragment before stays ordinary text.
+        n = len(start) - 1
+        if context.shape[-1] < n:
+            return logits
+        prefix = mx.all(context[-n:] == self._start_prefix)
+        return mx.where(prefix & self._hot(start[-1], vocab), -mx.inf, logits)
 
     # -- the engine's side --------------------------------------------------
 
@@ -170,25 +196,22 @@ class ThinkingBudget:
         if self._state == "reasoning":
             if self._end.feed(token):
                 self._state = "normal"
-                self._suspect = 0
                 if self._armed_at is not None:
-                    # A close this early came from the model itself, before
-                    # the forced one could reach the logits.
+                    # Before this count the close came from the model itself
+                    # (finished by the force, at most); from it on it was forced.
                     forced = self.reasoning_tokens >= (
-                        self._armed_at
-                        + self._free
-                        + self._close_counted
-                        + len(self.limits.end)
-                        - 1
+                        self._armed_at + self._free + self._close_counted
                     )
-                    self._after_close() if forced else self._disarm()
+                    self.thinking_truncated |= forced
+                    self._disarm()
             else:
                 self.reasoning_tokens += 1
-                self._check_guard(token)
+                self._gate_opener()
                 self._maybe_arm()
         elif self._start.feed(token):
             self._state = "reasoning"
             self.reasoning_tokens += 1
+            self._gate_opener()
             self._maybe_arm()
         if finish_reason == "length" and self._state == "reasoning":
             self.thinking_truncated = True
@@ -196,20 +219,6 @@ class ThinkingBudget:
     @property
     def in_reasoning(self) -> bool:
         return self._state == "reasoning"
-
-    def _check_guard(self, token: int) -> None:
-        """The device guard reads only the first token of the end marker. A
-        free token that starts the marker without finishing it fooled it:
-        once that shows, arm again with a fresh guard."""
-        end = self.limits.end
-        if self._armed_at is None or len(end) < 2:
-            return
-        if self.reasoning_tokens == self._armed_at + self._free and token == end[0]:
-            self._suspect = len(end) - 1
-        elif self._suspect:
-            self._suspect -= 1
-            if not self._suspect:
-                self._disarm()
 
     def _maybe_arm(self) -> None:
         limit = self.limits.max_tokens
@@ -232,14 +241,16 @@ class ThinkingBudget:
         self._pos = 0
         self._armed_at = None
         self._closed = None
-        self._suspect = 0
 
-    def _after_close(self) -> None:
-        # The forced close is through. A single-token opener is masked from
-        # here on; a longer one that reopens is closed again at once.
-        self.thinking_truncated = True
-        self._disarm()
-        self._block_opener()
-
-    def _block_opener(self) -> None:
-        self._block = len(self.limits.start) == 1
+    def _gate_opener(self) -> None:
+        """Another block costs the opener, a free token and the counted part
+        of the close before the force can land: mask the opener as soon as
+        the allowance left cannot hold that. Checked on every counted token,
+        because the mask reaches the logits two tokens later - by the time a
+        block closes it must already be in place."""
+        limit = self.limits.max_tokens
+        if (
+            limit is not None
+            and limit - self.reasoning_tokens < 2 + self._close_counted
+        ):
+            self._block = True

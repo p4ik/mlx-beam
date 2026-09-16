@@ -226,30 +226,55 @@ def test_small_budgets_never_overshoot(limit):
     assert tracker.reasoning_tokens <= limit and END in out
 
 
-def test_multi_token_end_marker_guard_recovers_from_a_false_start():
+def test_two_token_end_marker_is_exact_and_a_started_close_is_finished():
     E1, E2 = 54, 55
     limits = ReasoningLimits((START,), (E1, E2), (NL, E1, E2, NL2), max_tokens=5)
     tracker = ThinkingBudget(limits)
-    # The free token starts the marker but the model does not finish it.
-    out = Steps(tracker, [START, 10, 11, E1, 12, 13, 14, 15, 16, 17]).run(10)
-    assert tracker.thinking_truncated and not tracker.in_reasoning
-    assert out[-4:-1] != [12, 13, 14] and E2 in out
-    # A real two-token close on the free token is left alone.
+    # Opener, two free tokens, then the forced newline and the marker's
+    # first token still count: five, not six.
+    out = Steps(tracker, [START, 10, 11, 12, 13, 14, 15, 16, 17, 18]).run(10)
+    assert out[:6] == [START, 10, 11, NL, E1, E2]
+    assert tracker.reasoning_tokens == 5 and tracker.thinking_truncated
+    # The model starts the marker on the free token and would wander off:
+    # the marker is completed instead, so no second run-up eats the answer.
     tracker = ThinkingBudget(limits)
-    out = Steps(tracker, [START, 10, 11, E1, E2, 20, 21, 22]).run(8)
-    assert out == [START, 10, 11, E1, E2, 20, 21, 22] and not tracker.thinking_truncated
+    out = Steps(tracker, [START, 10, E1, 12, 13, 14, 15, 16]).run(8)
+    assert out[:4] == [START, 10, E1, E2] and out[4:] == [13, 14, 15, 16]
+    assert tracker.reasoning_tokens == 3 and not tracker.thinking_truncated
+    assert not tracker.in_reasoning
 
 
-def test_a_reopened_block_is_closed_again():
+def test_no_reopening_once_the_allowance_is_spent():
+    limits = ReasoningLimits(**{**LIMITS.__dict__, "max_tokens": 5})
+    tracker = ThinkingBudget(limits)
+    # Closed by itself at three, reopened: the rest could not hold another
+    # block, so the opener is masked and the count stays at three.
+    out = Steps(tracker, [START, 10, 11, END, START, 20, 21, 22, 23, 24]).run(10)
+    assert out[:4] == [START, 10, 11, END] and START not in out[4:]
+    assert tracker.reasoning_tokens == 3 and not tracker.thinking_truncated
+    # With room left, a second block is allowed and closed at the cap.
+    limits = ReasoningLimits(**{**LIMITS.__dict__, "max_tokens": 8})
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, 10, END, START, 20, 21, 22, 23, 24, 25]).run(10)
+    assert out.count(END) == 2 and tracker.reasoning_tokens == 8
+    assert tracker.thinking_truncated
+
+
+def test_multi_token_opener_is_cut_at_its_last_token():
     S1, S2 = 56, 57
+    limits = ReasoningLimits((S1, S2), (END,), (NL, END, NL2), max_tokens=0)
+    tracker = ThinkingBudget(limits)
+    # Budget 0: the block cannot form; the fragment before stays text.
+    out = Steps(tracker, [S1, S2, 10, 11, 12, 13]).run(6)
+    assert out[0] == S1 and out[1] != S2 and tracker.reasoning_tokens == 0
+    # After a forced close the same gate holds for the reopening.
     limits = ReasoningLimits((S1, S2), (END,), (NL, END, NL2), max_tokens=4)
     tracker = ThinkingBudget(limits)
-    script = [S1, S2, 10, 11, 12, 13, 14, S1, S2, 20, 21, 22, 23, 24]
-    out = Steps(tracker, script).run(14)
-    assert out.count(END) == 2 and tracker.thinking_truncated
-    # The second block is closed by force as soon as the lag allows.
-    second = out.index(S2, out.index(END))
-    assert END in out[second : second + 4]
+    out = Steps(tracker, [S1, S2, 10, 11, 12, 13, 14, S1, S2, 20, 21, 22]).run(12)
+    assert out[:6] == [S1, S2, 10, 11, NL, END] and tracker.thinking_truncated
+    assert tracker.reasoning_tokens == 4
+    later = out[6:]
+    assert all(later[i + 1] != S2 for i in range(len(later) - 1) if later[i] == S1)
 
 
 def test_flags_are_right_without_a_budget():
