@@ -23,6 +23,7 @@ from mlx_beam.api.chat import (
     _number,
     build_prompt,
     parse_sampling,
+    with_xtc_specials,
 )
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
@@ -172,8 +173,6 @@ def parse_responses_request(
             )
     if body.get("n", 1) not in (None, 1):
         raise unsupported("n > 1", "n")
-    if body.get("seed") is not None:
-        raise unsupported("seed", "seed")
     text_format = ((body.get("text") or {}).get("format") or {}).get("type")
     if text_format not in (None, "text"):
         raise ApiError(
@@ -216,7 +215,7 @@ def to_generation_request(tokenizer, req: ResponsesRequest) -> GenerationRequest
     return GenerationRequest(
         tokens=prompt,
         max_tokens=req.chat.max_tokens,
-        sampling=req.chat.sampling,
+        sampling=with_xtc_specials(tokenizer, req.chat.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, None),
     )
 

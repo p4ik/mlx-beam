@@ -52,6 +52,26 @@ def stop_sequence_ids(tokenizer, stop_words: list[str] | None) -> list[tuple]:
     return seqs
 
 
+def xtc_special_ids(tokenizer) -> tuple[int, ...]:
+    """Ids XTC must not cut: eos and the newline (mlx-lm's server does the same)."""
+    ids = list(tokenizer.eos_token_ids)
+    ids += list(tokenizer.encode("\n", add_special_tokens=False))
+    return tuple(dict.fromkeys(ids))
+
+
+def logprob_entry(tokenizer, event: TokenEvent) -> dict:
+    """One OpenAI logprobs item: the token's text, bytes and its alternatives."""
+
+    def item(token_id: int, logprob: float) -> dict:
+        text = tokenizer.decode([token_id])
+        return {"token": text, "logprob": logprob, "bytes": list(text.encode())}
+
+    out = item(event.token, event.logprob)
+    if event.top_logprobs is not None:
+        out["top_logprobs"] = [item(t, lp) for t, lp in event.top_logprobs]
+    return out
+
+
 def make_state_machine(
     tokenizer, stop_words, route_thinking: bool = True
 ) -> TextStateMachine:
@@ -138,6 +158,8 @@ class TextAssembler:
         self.tokens = 0
         self.token_ids: list[int] = []
         self.logprobs: list[float] = []
+        # Events since the last chunk went out; the responder drains them.
+        self.pending_events: list[TokenEvent] = []
         # True once a text-level stop word ended the stream early.
         self.stopped = False
         self.reasoning_tokens = 0
@@ -149,6 +171,7 @@ class TextAssembler:
         self.tokens += 1
         self.token_ids.append(event.token)
         self.logprobs.append(event.logprob)
+        self.pending_events.append(event)
         delta = TextDelta(tokens=1)
 
         if event.finish_reason == "stop":

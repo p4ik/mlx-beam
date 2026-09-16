@@ -16,7 +16,7 @@ from typing import Any
 import mlx.core as mx
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
-from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
 from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
 from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
 from mlx_beam.engine.request import (
@@ -26,6 +26,7 @@ from mlx_beam.engine.request import (
     SamplingParams,
     TokenEvent,
 )
+from mlx_beam.engine.sampling import SamplerPool, top_logprobs
 
 
 class EngineDead(RuntimeError):
@@ -54,17 +55,15 @@ def model_context_length(model: Any) -> int | None:
     return None
 
 
-def _sampler(p: SamplingParams):
-    return make_sampler(temp=p.temperature, top_p=p.top_p, min_p=p.min_p, top_k=p.top_k)
-
-
 def _logits_processors(p: SamplingParams):
     return make_logits_processors(
         logit_bias=p.logit_bias,
         repetition_penalty=p.repetition_penalty,
         repetition_context_size=p.repetition_context_size,
         presence_penalty=p.presence_penalty,
+        presence_context_size=p.presence_context_size,
         frequency_penalty=p.frequency_penalty,
+        frequency_context_size=p.frequency_context_size,
     )
 
 
@@ -130,6 +129,7 @@ class Engine:
         self._bookkeeping: dict[int, tuple[int, dict]] = {}
         # uid -> positions of the stride checkpoints (boundaries are never thinned)
         self._stride: dict[int, list[int]] = {}
+        self._samplers = SamplerPool()
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
@@ -200,6 +200,16 @@ class Engine:
                 f"prompt ({len(request.tokens)} tokens) plus max_tokens "
                 f"({request.max_tokens}) exceeds the context length {self.max_context}"
             )
+        p = request.sampling
+        # These raise inside the sampler, i.e. inside the worker.
+        if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:
+            raise InvalidRequest(
+                "xtc_probability must be in [0, 1], xtc_threshold in [0, 0.5]"
+            )
+        if p.min_tokens_to_keep < 1:
+            raise InvalidRequest("min_tokens_to_keep must be at least 1")
+        if p.temperature < 0:
+            raise InvalidRequest("temperature must not be negative")
         vocab = self.vocab_size
         if vocab is None:
             return
@@ -209,6 +219,10 @@ class Engine:
             raise InvalidRequest(f"token ids must be in [0, {vocab})")
         if request.sampling.top_k >= vocab:
             raise InvalidRequest(f"top_k must be below the vocabulary size {vocab}")
+        if request.top_logprobs > vocab:
+            raise InvalidRequest(f"top_logprobs must not exceed the vocabulary {vocab}")
+        if any(not (0 <= t < vocab) for t in request.sampling.xtc_special_tokens):
+            raise InvalidRequest(f"xtc_special_tokens must be in [0, {vocab})")
         bias = request.sampling.logit_bias or {}
         if any(not (0 <= t < vocab) for t in bias):
             raise InvalidRequest(f"logit_bias token ids must be in [0, {vocab})")
@@ -262,6 +276,7 @@ class Engine:
                 "applied": self._applied_caches,
             },
             "prompt_cache": self.prefix_store.describe(),
+            "sampling": self._samplers.describe(),
         }
 
     # -- the worker -------------------------------------------------------
@@ -324,7 +339,7 @@ class Engine:
                 max_tokens=[req.max_tokens],
                 caches=[cache],
                 all_tokens=[list(req.tokens[:covered])],
-                samplers=[_sampler(req.sampling)],
+                samplers=[self._samplers.get(req.sampling)],
                 logits_processors=[_logits_processors(req.sampling)],
                 stop_sequences=[stop],
             )
@@ -526,6 +541,11 @@ class Engine:
                             token=r.token,
                             logprob=float(r.logprobs[r.token].item()),
                             finish_reason=r.finish_reason,
+                            top_logprobs=(
+                                top_logprobs(r.logprobs, s.request.top_logprobs)
+                                if s.request.top_logprobs
+                                else None
+                            ),
                         )
                     )
                     if r.finish_reason is not None:

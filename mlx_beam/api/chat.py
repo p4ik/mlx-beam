@@ -6,12 +6,18 @@ import math
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, missing_extra, unsupported
-from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
+from mlx_beam.api.text import (
+    TextAssembler,
+    TextDelta,
+    logprob_entry,
+    stop_sequence_ids,
+    xtc_special_ids,
+)
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 
 # What a parser falls back to when no server defaults are handed in (tests).
@@ -28,6 +34,7 @@ class ChatRequest:
     stop: list[str] = field(default_factory=list)
     tools: list[dict] | None = None
     logprobs: bool = False
+    top_logprobs: int = 0
     stream_usage: bool = False
     reasoning_effort: str | None = None
     template_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -70,14 +77,30 @@ def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> Sampling
         # -1 and 0 both mean "off" (the vLLM and HF convention).
         top_k=max(0, _number(body, "top_k", d.top_k, -1, None, int)),
         min_p=_number(body, "min_p", d.min_p, 0.0, 1.0),
+        min_tokens_to_keep=_number(body, "min_tokens_to_keep", 1, 1, None, int),
+        xtc_probability=_number(body, "xtc_probability", 0.0, 0.0, 1.0),
+        xtc_threshold=_number(body, "xtc_threshold", 0.1, 0.0, 0.5),
         repetition_penalty=penalty if penalty not in (None, 1.0) else None,
         repetition_context_size=_number(
             body, "repetition_context_size", 20, 1, None, int
         ),
         presence_penalty=presence or None,
+        presence_context_size=_number(body, "presence_context_size", 20, 1, None, int),
         frequency_penalty=frequency or None,
+        frequency_context_size=_number(
+            body, "frequency_context_size", 20, 1, None, int
+        ),
         logit_bias=logit_bias or None,
+        seed=_number(body, "seed", None, 0, 2**63 - 1, int),
     )
+
+
+def parse_top_logprobs(body: dict) -> int:
+    """OpenAI's shape: ``logprobs: true`` plus ``top_logprobs: 0..20``."""
+    n = _number(body, "top_logprobs", 0, 0, 20, int)
+    if n and not body.get("logprobs"):
+        raise ApiError("top_logprobs needs logprobs: true", param="top_logprobs")
+    return n
 
 
 def parse_stop(body: dict) -> list[str]:
@@ -95,9 +118,6 @@ def _reject_unsupported(body: dict) -> None:
     n = body.get("n", 1)
     if n not in (None, 1):
         raise unsupported("n > 1", "n")
-    if body.get("seed") is not None:
-        # Sequences share a batch; a per-request seed cannot be honoured.
-        raise unsupported("seed", "seed")
     rf = body.get("response_format")
     if rf and rf.get("type") not in (None, "text"):
         raise missing_extra("response_format", "structured")
@@ -171,6 +191,7 @@ def parse_chat_request(
         stop=parse_stop(body),
         tools=tools,
         logprobs=bool(body.get("logprobs", False)),
+        top_logprobs=parse_top_logprobs(body),
         stream_usage=bool(stream_opts.get("include_usage", False)),
         reasoning_effort=effort,
         template_kwargs=template_kwargs,
@@ -269,11 +290,18 @@ def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
     return GenerationRequest(
         tokens=prompt,
         max_tokens=req.max_tokens,
-        sampling=req.sampling,
+        sampling=with_xtc_specials(tokenizer, req.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
         boundaries=bounds,
         system_end=system_end,
+        top_logprobs=req.top_logprobs if req.logprobs else 0,
     )
+
+
+def with_xtc_specials(tokenizer, sampling: SamplingParams) -> SamplingParams:
+    if sampling.xtc_probability <= 0.0:
+        return sampling
+    return replace(sampling, xtc_special_tokens=xtc_special_ids(tokenizer))
 
 
 def _usage(
@@ -311,6 +339,7 @@ class ChatResponder:
         if reasoning_field not in REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
+        self._tokenizer = tokenizer
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
@@ -355,10 +384,15 @@ class ChatResponder:
             delta = {"role": "assistant", **delta}
             self._sent_role = True
         out = self._envelope("chat.completion.chunk")
-        out["choices"] = [
-            {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
-        ]
+        choice = {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
+        if self.req.logprobs:
+            choice["logprobs"] = self._logprobs()
+        out["choices"] = [choice]
         return out
+
+    def _logprobs(self) -> dict:
+        events, self.assembler.pending_events = self.assembler.pending_events, []
+        return {"content": [logprob_entry(self._tokenizer, e) for e in events]}
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         """Chunks as the tokens arrive; tool-call text is held until complete."""
@@ -398,14 +432,7 @@ class ChatResponder:
             "finish_reason": total.finish_reason or "stop",
         }
         if self.req.logprobs:
-            choice["logprobs"] = {
-                "content": [
-                    {"token": str(t), "logprob": lp}
-                    for t, lp in zip(
-                        self.assembler.token_ids, self.assembler.logprobs, strict=True
-                    )
-                ]
-            }
+            choice["logprobs"] = self._logprobs()
         out["choices"] = [choice]
         out["usage"] = _usage(
             self.prompt_len,

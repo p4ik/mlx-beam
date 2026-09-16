@@ -16,11 +16,21 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     min_p: float = 0.0
+    # Tokens min_p may never filter away.
+    min_tokens_to_keep: int = 1
+    xtc_probability: float = 0.0
+    xtc_threshold: float = 0.1
+    # Ids XTC leaves alone (eos and newline, so it cannot cut the answer short).
+    xtc_special_tokens: tuple[int, ...] = ()
     repetition_penalty: float | None = None
     repetition_context_size: int = 20
     presence_penalty: float | None = None
+    presence_context_size: int = 20
     frequency_penalty: float | None = None
+    frequency_context_size: int = 20
     logit_bias: dict[int, float] | None = None
+    # A seeded request samples with its own random key.
+    seed: int | None = None
 
 
 @dataclass
@@ -38,6 +48,8 @@ class GenerationRequest:
     # Where the system block ends; the store keeps that prefix as its own
     # entry, evicted after every conversation entry.
     system_end: int | None = None
+    # How many of the most likely tokens each event reports (0: none).
+    top_logprobs: int = 0
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
@@ -45,6 +57,8 @@ class GenerationRequest:
             raise ValueError("prompt is empty")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
+        if self.top_logprobs < 0:
+            raise ValueError("top_logprobs must not be negative")
 
 
 @dataclass(frozen=True)
@@ -53,6 +67,8 @@ class TokenEvent:
     logprob: float
     # "stop", "length", or None while the sequence keeps going.
     finish_reason: str | None = None
+    # (token id, logprob) pairs, best first; only when the request asked.
+    top_logprobs: tuple[tuple[int, float], ...] | None = None
 
 
 @dataclass(frozen=True)

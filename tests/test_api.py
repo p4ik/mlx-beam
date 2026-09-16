@@ -59,7 +59,14 @@ def test_chat_request_defaults_and_limits():
             "temperature",
         ),
         ({"messages": [{"role": "user", "content": "x"}], "n": 2}, "n"),
-        ({"messages": [{"role": "user", "content": "x"}], "seed": 1}, "seed"),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "top_logprobs": 2},
+            "top_logprobs",
+        ),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "xtc_threshold": 0.7},
+            "xtc_threshold",
+        ),
         ({"messages": [{"role": "user", "content": "x"}], "stop": 3}, "stop"),
     ],
 )
@@ -435,3 +442,77 @@ def test_request_defaults_precedence(tmp_path):
         "value": 0,
         "source": "mlx-lm",
     }
+
+
+def test_seed_and_xtc_reach_the_engine_request():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "seed": 42,
+            "xtc_probability": 0.5,
+            "presence_penalty": 0.5,
+            "presence_context_size": 7,
+        },
+        "m",
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert gen.sampling.seed == 42 and gen.sampling.presence_context_size == 7
+    # XTC may not cut the eos or the newline; the tokenizer says which ids.
+    assert EOS in gen.sampling.xtc_special_tokens
+    plain = chat.to_generation_request(
+        tok, chat.parse_chat_request({"messages": req.messages}, "m")
+    )
+    assert plain.sampling.xtc_special_tokens == () and plain.sampling.seed is None
+
+
+def test_chat_logprobs_carry_text_bytes_and_alternatives():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "top_logprobs": 2,
+        },
+        "m",
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert gen.top_logprobs == 2
+    evs = [
+        TokenEvent(10, -0.1, None, ((10, -0.1), (11, -2.5))),
+        TokenEvent(11, -0.3, None, ((11, -0.3), (10, -1.0))),
+        TokenEvent(EOS, -0.1, "stop", ((EOS, -0.1), (10, -3.0))),
+    ]
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    content = out["choices"][0]["logprobs"]["content"]
+    assert [c["token"] for c in content] == ["w10 ", "w11 ", tok.decode([EOS])]
+    assert content[0]["bytes"] == list(b"w10 ")
+    assert [t["token"] for t in content[0]["top_logprobs"]] == ["w10 ", "w11 "]
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
+    streamed = [c for ch in chunks for c in ch["choices"][0]["logprobs"]["content"]]
+    assert [c["token"] for c in streamed] == [c["token"] for c in content]
+    # Without the flag the field stays away entirely.
+    req.logprobs = False
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    assert "logprobs" not in out["choices"][0]
+
+
+def test_completions_logprobs_use_the_legacy_columns():
+    tok = StubTokenizer()
+    req = completions.parse_completion_request(
+        {"prompt": "w1", "logprobs": 1, "max_tokens": 2}, "m"
+    )
+    gen = completions.to_generation_request(tok, req)
+    assert gen.top_logprobs == 1
+    evs = [
+        TokenEvent(10, -0.1, None, ((10, -0.1),)),
+        TokenEvent(11, -0.3, "length", ((12, -0.2),)),
+    ]
+    out = completions.CompletionResponder(tok, req, gen.tokens).complete(iter(evs), 0)
+    lp = out["choices"][0]["logprobs"]
+    assert lp["tokens"] == ["w10 ", "w11 "] and lp["token_logprobs"] == [-0.1, -0.3]
+    assert lp["top_logprobs"] == [{"w10 ": -0.1}, {"w12 ": -0.2}]
+    assert lp["text_offset"] == [0, 4]
+    with pytest.raises(ApiError):
+        completions.parse_completion_request({"prompt": "w1", "logprobs": 21}, "m")

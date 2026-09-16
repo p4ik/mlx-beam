@@ -8,10 +8,16 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from mlx_beam.api.chat import DEFAULTS, _number, parse_sampling, parse_stop
+from mlx_beam.api.chat import (
+    DEFAULTS,
+    _number,
+    parse_sampling,
+    parse_stop,
+    with_xtc_specials,
+)
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
-from mlx_beam.api.text import TextAssembler, stop_sequence_ids
+from mlx_beam.api.text import TextAssembler, logprob_entry, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 
 
@@ -24,6 +30,8 @@ class CompletionRequest:
     stream: bool = False
     stop: list[str] = field(default_factory=list)
     echo: bool = False
+    # OpenAI's legacy shape: an integer, the number of alternatives per token.
+    logprobs: int | None = None
     stream_usage: bool = False
 
 
@@ -34,8 +42,6 @@ def parse_completion_request(
         raise ApiError("the request body must be a JSON object")
     if body.get("n", 1) not in (None, 1):
         raise unsupported("n > 1", "n")
-    if body.get("seed") is not None:
-        raise unsupported("seed", "seed")
     if body.get("best_of", 1) not in (None, 1):
         raise unsupported("best_of", "best_of")
     prompt = body.get("prompt")
@@ -55,6 +61,7 @@ def parse_completion_request(
         stream=bool(body.get("stream", False)),
         stop=parse_stop(body),
         echo=bool(body.get("echo", False)),
+        logprobs=_number(body, "logprobs", None, 0, 20, int),
         stream_usage=bool(stream_opts.get("include_usage", False)),
     )
 
@@ -73,8 +80,9 @@ def to_generation_request(tokenizer, req: CompletionRequest) -> GenerationReques
     return GenerationRequest(
         tokens=build_prompt(tokenizer, req),
         max_tokens=req.max_tokens,
-        sampling=req.sampling,
+        sampling=with_xtc_specials(tokenizer, req.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
+        top_logprobs=req.logprobs or 0,
     )
 
 
@@ -84,7 +92,9 @@ class CompletionResponder:
         self.id = f"cmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.prompt_tokens = prompt_tokens
+        self._tokenizer = tokenizer
         self.echo_text = tokenizer.decode(prompt_tokens) if req.echo else ""
+        self._offset = len(self.echo_text)
         self.assembler = TextAssembler(
             tokenizer, prompt_tokens=prompt_tokens, stop_words=req.stop
         )
@@ -110,9 +120,29 @@ class CompletionResponder:
         return {
             "index": 0,
             "text": text,
-            "logprobs": None,
+            "logprobs": self._logprobs() if self.req.logprobs is not None else None,
             "finish_reason": finish_reason,
         }
+
+    def _logprobs(self) -> dict:
+        """The legacy columns; offsets count characters of the text so far."""
+        events, self.assembler.pending_events = self.assembler.pending_events, []
+        out: dict[str, list] = {
+            "tokens": [],
+            "token_logprobs": [],
+            "top_logprobs": [],
+            "text_offset": [],
+        }
+        for e in events:
+            entry = logprob_entry(self._tokenizer, e)
+            out["tokens"].append(entry["token"])
+            out["token_logprobs"].append(entry["logprob"])
+            out["top_logprobs"].append(
+                {t["token"]: t["logprob"] for t in entry.get("top_logprobs", [])}
+            )
+            out["text_offset"].append(self._offset)
+            self._offset += len(entry["token"])
+        return out
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         first = True
