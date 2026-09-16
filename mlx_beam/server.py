@@ -290,7 +290,9 @@ class Handler(BaseHTTPRequestHandler):
         req = chat.parse_chat_request(
             body, self.served.model_name, self.served.defaults
         )
-        gen_request = chat.to_generation_request(tok, req)
+        gen_request = chat.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
         responder = chat.ChatResponder(
             tok, req, gen_request.tokens, reasoning_field=self.served.reasoning_field
         )
@@ -302,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
         req = completions.parse_completion_request(
             body, self.served.model_name, self.served.defaults
         )
-        gen_request = completions.to_generation_request(tok, req)
+        gen_request = completions.to_generation_request(tok, req, self.served.defaults)
         responder = completions.CompletionResponder(tok, req, gen_request.tokens)
         self._run(gen_request, responder, req.stream)
 
@@ -312,7 +314,9 @@ class Handler(BaseHTTPRequestHandler):
         req = responses.parse_responses_request(
             body, self.served.model_name, self.served.defaults
         )
-        gen_request = responses.to_generation_request(tok, req)
+        gen_request = responses.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
         responder = responses.ResponsesResponder(
             tok,
             req,

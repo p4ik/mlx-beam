@@ -29,6 +29,8 @@ class StubTokenizer:
     has_tool_calling = True
     think_start = "<think>"
     think_end = "</think>"
+    think_start_tokens = (THINK_START,)
+    think_end_tokens = (THINK_END,)
     tool_call_start = "<tool_call>"
     tool_call_end = "</tool_call>"
     structural_markers = ()

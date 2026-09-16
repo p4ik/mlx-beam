@@ -173,8 +173,16 @@ def test_stored_prefixes_yield_to_running_requests():
         collect(engine.submit(GenerationRequest([4, 5, 6], max_tokens=2)))
         assert engine.health()["prompt_cache"]["entries"] <= 1
     with Engine(model, max_context=8) as engine:
+        # A large client limit is served and capped at what the context holds.
+        out = collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=6)))
+        assert len(out) == 5
+        # Only a reserve the context cannot hold is refused.
         with pytest.raises(ContextTooLong):
-            engine.submit(GenerationRequest([1, 2, 3], max_tokens=6))
+            engine.submit(
+                GenerationRequest([1, 2, 3], max_tokens=6, min_response_tokens=6)
+            )
+        with pytest.raises(ContextTooLong):
+            engine.submit(GenerationRequest([1, 2, 3, 4, 5, 6, 7, 8], max_tokens=1))
         assert engine.health()["max_context"] == 8
 
 

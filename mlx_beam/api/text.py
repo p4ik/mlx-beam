@@ -166,6 +166,9 @@ class TextAssembler:
         # True once a text-level stop word ended the stream early.
         self.stopped = False
         self.reasoning_tokens = 0
+        # From the engine's last event: which limit cut what.
+        self.thinking_truncated = False
+        self.response_truncated = False
 
     def feed(self, event: TokenEvent) -> TextDelta:
         """One token in, the text it releases out."""
@@ -175,6 +178,8 @@ class TextAssembler:
         self.token_ids.append(event.token)
         self.logprobs.append(event.logprob)
         self.pending_events.append(event)
+        self.thinking_truncated |= event.thinking_truncated
+        self.response_truncated |= event.response_truncated
         delta = TextDelta(tokens=1)
 
         if event.finish_reason == "stop":

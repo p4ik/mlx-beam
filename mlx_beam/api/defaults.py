@@ -24,6 +24,9 @@ MLX_LM_DEFAULTS = {
     "chat_template_args": {},
 }
 
+# Ours, with no mlx-lm counterpart: no reasoning budget, no reserve.
+BEAM_DEFAULTS = {"max_reasoning_tokens": None, "min_response_tokens": 0}
+
 # The generation_config.json keys we read, and what they map to.
 GENERATION_CONFIG_KEYS = {
     "temperature": "temperature",
@@ -49,13 +52,19 @@ class RequestDefaults:
     # Handed to every chat template render; a request's chat_template_kwargs
     # override it key by key.
     chat_template_args: dict = field(default_factory=dict)
+    # Reasoning tokens a request may spend when it names no budget (None:
+    # unbounded) and the room the answer keeps after the think block.
+    max_reasoning_tokens: int | None = None
+    min_response_tokens: int = 0
     sources: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
-        # A bare instance carries mlx-lm's numbers, so say so.
+        # A bare instance carries the built-in numbers, so say so.
         for f in fields(self):
             if f.name != "sources":
-                self.sources.setdefault(f.name, "mlx-lm")
+                self.sources.setdefault(
+                    f.name, "mlx-beam" if f.name in BEAM_DEFAULTS else "mlx-lm"
+                )
 
     @classmethod
     def resolve(
@@ -67,6 +76,8 @@ class RequestDefaults:
             for k, v in MLX_LM_DEFAULTS.items()
         }
         sources = {k: "mlx-lm" for k in values}
+        values.update(BEAM_DEFAULTS)
+        sources.update({k: "mlx-beam" for k in BEAM_DEFAULTS})
         cfg = read_generation_config(model_path) if model_path else {}
         for key, ours in GENERATION_CONFIG_KEYS.items():
             if key in cfg and cfg[key] is not None:

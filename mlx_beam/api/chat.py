@@ -22,11 +22,13 @@ from mlx_beam.api.reasoning import (
 from mlx_beam.api.text import (
     TextAssembler,
     TextDelta,
+    initial_state,
     logprob_entry,
     stop_sequence_ids,
     xtc_special_ids,
 )
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
+from mlx_beam.engine.thinking import ReasoningLimits, budget
 
 # What a parser falls back to when no server defaults are handed in (tests).
 DEFAULTS = RequestDefaults()
@@ -352,8 +354,45 @@ def boundaries_and_system_end(
     return bounds, system_end
 
 
-def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
+def to_generation_request(
+    tokenizer,
+    req: ChatRequest,
+    defaults: RequestDefaults = DEFAULTS,
+    max_context: int | None = None,
+) -> GenerationRequest:
     prompt = build_prompt(tokenizer, req)
+    min_response = (
+        defaults.min_response_tokens
+        if req.min_response_tokens is None
+        else req.min_response_tokens
+    )
+    max_reasoning = (
+        defaults.max_reasoning_tokens
+        if req.max_reasoning_tokens is None
+        else req.max_reasoning_tokens
+    )
+    completion_cap, reasoning_cap = budget(
+        max_context, len(prompt), req.max_tokens, min_response
+    )
+    bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
+    limit = min(bounded) if bounded else None
+    if limit == 0 and getattr(tokenizer, "has_thinking", False):
+        # No room to think: ask the template to leave the block out, which
+        # a Qwen template does; then check whether it did.
+        if req.template_kwargs.get("enable_thinking") is not False:
+            req.template_kwargs["enable_thinking"] = False
+            prompt = build_prompt(tokenizer, req)
+            completion_cap, _ = budget(
+                max_context, len(prompt), req.max_tokens, min_response
+            )
+        limits = reasoning_limits(tokenizer, prompt, 0)
+        if limits is not None and limits.seeded and len(limits.close) >= completion_cap:
+            raise ApiError(
+                "the prompt opens a think block the template cannot switch off; "
+                f"closing it takes {len(limits.close)} tokens, the request leaves "
+                f"{completion_cap} for the answer",
+                code="context_length_exceeded",
+            )
     bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
     return GenerationRequest(
         tokens=prompt,
@@ -363,6 +402,32 @@ def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
         boundaries=bounds,
         system_end=system_end,
         top_logprobs=req.top_logprobs if req.logprobs else 0,
+        min_response_tokens=min_response,
+        max_prompt_tokens=req.max_prompt_tokens,
+        reasoning=reasoning_limits(tokenizer, prompt, limit),
+    )
+
+
+def reasoning_limits(
+    tokenizer, prompt: list[int], max_tokens: int | None
+) -> ReasoningLimits | None:
+    """The think markers as ids and the budget; None for a model without."""
+    if not getattr(tokenizer, "has_thinking", False):
+        return None
+    start = tuple(getattr(tokenizer, "think_start_tokens", None) or ())
+    end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
+    if not start or not end:
+        return None
+    newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
+    # Closed the way the models were trained to close: a line break, the
+    # marker, a blank line.
+    close = newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+    return ReasoningLimits(
+        start=start,
+        end=end,
+        close=close,
+        seeded=initial_state(tokenizer, prompt)[0] == "reasoning",
+        max_tokens=max_tokens,
     )
 
 
@@ -372,15 +437,22 @@ def with_xtc_specials(tokenizer, sampling: SamplingParams) -> SamplingParams:
     return replace(sampling, xtc_special_tokens=xtc_special_ids(tokenizer))
 
 
-def _usage(
-    prompt_tokens: int, completion_tokens: int, cached: int, reasoning: int = 0
-) -> dict:
+def _usage(prompt_tokens: int, assembler: TextAssembler, cached: int) -> dict:
     return {
         "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "completion_tokens": assembler.tokens,
+        "total_tokens": prompt_tokens + assembler.tokens,
         "prompt_tokens_details": {"cached_tokens": cached},
-        "completion_tokens_details": {"reasoning_tokens": reasoning},
+        "completion_tokens_details": completion_details(assembler),
+    }
+
+
+def completion_details(assembler: TextAssembler) -> dict:
+    """OpenAI's reasoning_tokens plus which limit, if any, cut the output."""
+    return {
+        "reasoning_tokens": assembler.reasoning_tokens,
+        "thinking_truncated": assembler.thinking_truncated,
+        "response_truncated": assembler.response_truncated,
     }
 
 
@@ -474,12 +546,7 @@ class ChatResponder:
         if self.req.stream_usage:
             out = self._envelope("chat.completion.chunk")
             out["choices"] = []
-            out["usage"] = _usage(
-                self.prompt_len,
-                self.assembler.tokens,
-                cached,
-                self.assembler.reasoning_tokens,
-            )
+            out["usage"] = _usage(self.prompt_len, self.assembler, cached)
             yield out
 
     def complete(self, events, cached: int) -> dict:
@@ -502,10 +569,5 @@ class ChatResponder:
         if self.req.logprobs:
             choice["logprobs"] = self._logprobs()
         out["choices"] = [choice]
-        out["usage"] = _usage(
-            self.prompt_len,
-            self.assembler.tokens,
-            cached,
-            self.assembler.reasoning_tokens,
-        )
+        out["usage"] = _usage(self.prompt_len, self.assembler, cached)
         return out

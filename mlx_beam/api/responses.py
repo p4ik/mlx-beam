@@ -21,15 +21,15 @@ from mlx_beam.api.chat import (
     ChatRequest,
     _normalise_messages,
     _number,
-    build_prompt,
+    completion_details,
     parse_sampling,
     parse_thinking,
-    with_xtc_specials,
 )
+from mlx_beam.api.chat import to_generation_request as chat_to_generation_request
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
 from mlx_beam.api.reasoning import read_aliases
-from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
+from mlx_beam.api.text import TextAssembler, TextDelta
 from mlx_beam.engine.request import GenerationRequest
 
 
@@ -218,14 +218,14 @@ def parse_responses_request(
     )
 
 
-def to_generation_request(tokenizer, req: ResponsesRequest) -> GenerationRequest:
-    prompt = build_prompt(tokenizer, req.chat)
-    return GenerationRequest(
-        tokens=prompt,
-        max_tokens=req.chat.max_tokens,
-        sampling=with_xtc_specials(tokenizer, req.chat.sampling),
-        stop_sequences=stop_sequence_ids(tokenizer, None),
-    )
+def to_generation_request(
+    tokenizer,
+    req: ResponsesRequest,
+    defaults: RequestDefaults = DEFAULTS,
+    max_context: int | None = None,
+) -> GenerationRequest:
+    # Same prompt, budget and markers as chat; only the response shape differs.
+    return chat_to_generation_request(tokenizer, req.chat, defaults, max_context)
 
 
 class ResponsesResponder:
@@ -275,9 +275,7 @@ class ResponsesResponder:
                 "output_tokens": self.assembler.tokens,
                 "total_tokens": self.prompt_len + self.assembler.tokens,
                 "input_tokens_details": {"cached_tokens": cached},
-                "output_tokens_details": {
-                    "reasoning_tokens": self.assembler.reasoning_tokens
-                },
+                "output_tokens_details": completion_details(self.assembler),
             },
         }
         return out

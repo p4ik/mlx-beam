@@ -11,6 +11,7 @@ from typing import Any
 from mlx_beam.api.chat import (
     DEFAULTS,
     _number,
+    completion_details,
     parse_sampling,
     parse_stop,
     with_xtc_specials,
@@ -33,6 +34,8 @@ class CompletionRequest:
     # OpenAI's legacy shape: an integer, the number of alternatives per token.
     logprobs: int | None = None
     stream_usage: bool = False
+    max_prompt_tokens: int | None = None
+    min_response_tokens: int | None = None
 
 
 def parse_completion_request(
@@ -63,6 +66,8 @@ def parse_completion_request(
         echo=bool(body.get("echo", False)),
         logprobs=_number(body, "logprobs", None, 0, 20, int),
         stream_usage=bool(stream_opts.get("include_usage", False)),
+        max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
+        min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
     )
 
 
@@ -76,13 +81,23 @@ def build_prompt(tokenizer, req: CompletionRequest) -> list[int]:
     return tokens
 
 
-def to_generation_request(tokenizer, req: CompletionRequest) -> GenerationRequest:
+def to_generation_request(
+    tokenizer, req: CompletionRequest, defaults: RequestDefaults = DEFAULTS
+) -> GenerationRequest:
+    # Raw text: no chat template, no think block to budget; the reserve
+    # still decides whether a prompt near the context end is served.
     return GenerationRequest(
         tokens=build_prompt(tokenizer, req),
         max_tokens=req.max_tokens,
         sampling=with_xtc_specials(tokenizer, req.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
         top_logprobs=req.logprobs or 0,
+        max_prompt_tokens=req.max_prompt_tokens,
+        min_response_tokens=(
+            defaults.min_response_tokens
+            if req.min_response_tokens is None
+            else req.min_response_tokens
+        ),
     )
 
 
@@ -114,6 +129,7 @@ class CompletionResponder:
             "completion_tokens": c,
             "total_tokens": p + c,
             "prompt_tokens_details": {"cached_tokens": cached},
+            "completion_tokens_details": completion_details(self.assembler),
         }
 
     def _choice(self, text: str, finish_reason) -> dict[str, Any]:

@@ -8,6 +8,10 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mlx_beam.engine.thinking import ReasoningLimits
 
 
 @dataclass
@@ -50,6 +54,13 @@ class GenerationRequest:
     system_end: int | None = None
     # How many of the most likely tokens each event reports (0: none).
     top_logprobs: int = 0
+    # Room the answer keeps after the think block; the reasoning budget is
+    # cut to leave it (0: none reserved).
+    min_response_tokens: int = 0
+    # A prompt cap this request asks for; only lower than the engine's.
+    max_prompt_tokens: int | None = None
+    # Think markers and the reasoning budget; None: no budget, no forcing.
+    reasoning: ReasoningLimits | None = None
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
@@ -59,6 +70,8 @@ class GenerationRequest:
             raise ValueError("max_tokens must be at least 1")
         if self.top_logprobs < 0:
             raise ValueError("top_logprobs must not be negative")
+        if self.min_response_tokens < 0:
+            raise ValueError("min_response_tokens must not be negative")
 
 
 @dataclass(frozen=True)
@@ -69,6 +82,10 @@ class TokenEvent:
     finish_reason: str | None = None
     # (token id, logprob) pairs, best first; only when the request asked.
     top_logprobs: tuple[tuple[int, float], ...] | None = None
+    # On the last event: the think block was closed by force or cut by the
+    # length limit; the answer after it was cut by the length limit.
+    thinking_truncated: bool = False
+    response_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,9 @@ class ResultStream:
         self._cancelled = threading.Event()
         self.progress: PromptProgress | None = None
         self.prompt_cached = 0
+        # What the engine admitted: generated tokens, reasoning tokens within.
+        self.completion_cap = request.max_tokens
+        self.reasoning_cap: int | None = None
         self._done = False
 
     def put(self, item) -> None:

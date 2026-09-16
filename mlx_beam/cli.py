@@ -117,12 +117,33 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "400 (default: the model's own context length)",
     )
     limits.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        help="prompt tokens, a hard cap below the context: a longer prompt is "
+        "a 400; a request's max_prompt_tokens may only lower it",
+    )
+    limits.add_argument(
         "--max-completion-tokens",
         type=int,
         default=512,
         help="generated tokens when the client sends no max_tokens / "
         "max_completion_tokens / max_output_tokens; the request overrides "
         "(mlx-lm: --max-tokens, default 512)",
+    )
+    limits.add_argument(
+        "--max-reasoning-tokens",
+        type=int,
+        help="reasoning tokens (what usage.reasoning_tokens counts) when the "
+        "client sends no max_reasoning_tokens; the think block is closed by "
+        "force at the budget (default: unbounded)",
+    )
+    limits.add_argument(
+        "--min-response-tokens",
+        type=int,
+        default=0,
+        help="tokens kept for the answer after the think block when the client "
+        "sends no min_response_tokens; the reasoning budget is cut to leave "
+        "them, and a request whose context cannot hold them is a 400",
     )
     sampling = p.add_argument_group(
         "sampling defaults",
@@ -285,6 +306,8 @@ def serve(args) -> int:
             "top_k": args.top_k,
             "min_p": args.min_p,
             "chat_template_args": args.chat_template_args or None,
+            "max_reasoning_tokens": args.max_reasoning_tokens,
+            "min_response_tokens": args.min_response_tokens or None,
         },
     )
     policy = kv_policy_from_args(args)
@@ -300,6 +323,7 @@ def serve(args) -> int:
         prompt_cache_size=args.prompt_cache_size,
         prompt_cache_bytes=args.prompt_cache_bytes or None,
         max_context=args.max_context,
+        max_prompt_tokens=args.max_prompt_tokens,
     )
     try:
         engine.start()

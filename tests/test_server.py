@@ -154,11 +154,17 @@ def test_concurrent_clients(server):
     assert results == {i: 200 for i in range(5)}
 
 
-def test_context_cap_is_a_400(server):
+def test_context_cap_serves_a_big_limit_and_refuses_a_big_reserve(server):
+    context = json.loads(call(server, "GET", "/health")[2])["max_context"]
     body = {"prompt": [1, 2, 3], "max_tokens": 100000}
+    status, _, raw = call(server, "POST", "/v1/completions", body)
+    out = json.loads(raw)
+    assert status == 200 and out["usage"]["completion_tokens"] <= context - 3
+    body["min_response_tokens"] = 100000
     status, _, raw = call(server, "POST", "/v1/completions", body)
     err = json.loads(raw)["error"]
     assert status == 400 and err["code"] == "context_length_exceeded"
+    assert str(context) in err["message"]
 
 
 def test_client_disconnect_cancels_the_request(server):

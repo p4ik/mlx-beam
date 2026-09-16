@@ -10,7 +10,7 @@ import queue
 import threading
 import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import mlx.core as mx
@@ -27,14 +27,11 @@ from mlx_beam.engine.request import (
     TokenEvent,
 )
 from mlx_beam.engine.sampling import SamplerPool, top_logprobs
+from mlx_beam.engine.thinking import ContextTooLong, ThinkingBudget, budget
 
 
 class EngineDead(RuntimeError):
     """The worker thread has ended; the engine answers nothing any more."""
-
-
-class ContextTooLong(ValueError):
-    """Prompt plus requested tokens do not fit the model's context."""
 
 
 class InvalidRequest(ValueError):
@@ -84,6 +81,7 @@ class Engine:
         checkpoint_stride: int = 2048,
         checkpoint_stride_max: int = 4,
         max_context: int | None = None,
+        max_prompt_tokens: int | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -95,6 +93,8 @@ class Engine:
         self.checkpoint_stride_max = checkpoint_stride_max
         # Prompt plus generation must fit; None reads the model's own limit.
         self.max_context = max_context or model_context_length(model)
+        # A prompt above this is refused; a request may only lower it.
+        self.max_prompt_tokens = max_prompt_tokens
         self.vocab_size = model_vocab_size(model)
         self._prompt_cache_bytes = prompt_cache_bytes
         self._dead = False
@@ -130,6 +130,7 @@ class Engine:
         # uid -> positions of the stride checkpoints (boundaries are never thinned)
         self._stride: dict[int, list[int]] = {}
         self._samplers = SamplerPool()
+        self._budgets: dict[int, ThinkingBudget] = {}
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
@@ -183,6 +184,7 @@ class Engine:
     def submit(self, request: GenerationRequest) -> ResultStream:
         self._validate(request)
         stream = ResultStream(request, self._request_cancel)
+        stream.completion_cap, stream.reasoning_cap = self.admit(request)
         with self._lock:
             # The worker drains the inbox when it dies; a stream queued after
             # that would never be answered.
@@ -191,15 +193,35 @@ class Engine:
             self._inbox.put(stream)
         return stream
 
-    def _validate(self, request: GenerationRequest) -> None:
-        if (
-            self.max_context
-            and len(request.tokens) + request.max_tokens > self.max_context
-        ):
+    def admit(self, request: GenerationRequest) -> tuple[int, int | None]:
+        """(tokens this request may generate, reasoning tokens within that)
+        under the context and prompt caps; raises when it cannot fit."""
+        prompt = len(request.tokens)
+        cap = self.max_prompt_tokens
+        if request.max_prompt_tokens is not None:
+            if cap is not None and request.max_prompt_tokens > cap:
+                raise InvalidRequest(
+                    f"max_prompt_tokens ({request.max_prompt_tokens}) is above "
+                    f"the server's {cap}; a request may only lower it"
+                )
+            cap = request.max_prompt_tokens
+        if cap is not None and prompt > cap:
             raise ContextTooLong(
-                f"prompt ({len(request.tokens)} tokens) plus max_tokens "
-                f"({request.max_tokens}) exceeds the context length {self.max_context}"
+                f"prompt ({prompt} tokens) exceeds max_prompt_tokens ({cap})"
             )
+        completion_cap, reasoning_cap = budget(
+            self.max_context, prompt, request.max_tokens, request.min_response_tokens
+        )
+        limits = request.reasoning
+        if limits is not None and limits.max_tokens is not None:
+            reasoning_cap = (
+                limits.max_tokens
+                if reasoning_cap is None
+                else min(limits.max_tokens, reasoning_cap)
+            )
+        return completion_cap, reasoning_cap
+
+    def _validate(self, request: GenerationRequest) -> None:
         p = request.sampling
         # These raise inside the sampler, i.e. inside the worker.
         if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:
@@ -303,6 +325,7 @@ class Engine:
         self._live.clear()
         self._bookkeeping.clear()
         self._stride.clear()
+        self._budgets.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -334,13 +357,20 @@ class Engine:
                 start = c
             segments.append(rest[start:])
             stop = StopSequences(req.stop_sequences or None)
+            processors = _logits_processors(req.sampling)
+            thinking = None
+            if req.reasoning is not None and stream.reasoning_cap is not None:
+                thinking = ThinkingBudget(
+                    replace(req.reasoning, max_tokens=stream.reasoning_cap)
+                )
+                processors = [*processors, thinking]
             (uid,) = gen.insert_segments(
                 segments=[segments],
-                max_tokens=[req.max_tokens],
+                max_tokens=[stream.completion_cap],
                 caches=[cache],
                 all_tokens=[list(req.tokens[:covered])],
                 samplers=[self._samplers.get(req.sampling)],
-                logits_processors=[_logits_processors(req.sampling)],
+                logits_processors=[processors],
                 stop_sequences=[stop],
             )
         except Exception as e:  # noqa: BLE001 - one bad request, not the worker
@@ -351,6 +381,8 @@ class Engine:
         self._live[uid] = stream
         self._bookkeeping[uid] = (covered, dict(carried))
         self._stride[uid] = []
+        if thinking is not None:
+            self._budgets[uid] = thinking
         if self._prompt_cache_bytes:
             # Stored prefixes yield to the caches of running requests.
             self.prefix_store.trim_to_bytes(
@@ -424,6 +456,7 @@ class Engine:
             self._live.pop(u).put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
+            self._budgets.pop(u, None)
             got = partial.get(u)
             if got is None:
                 continue
@@ -536,6 +569,10 @@ class Engine:
                                 checkpoints,
                                 s.request.system_end,
                             )
+                    thinking = self._budgets.get(r.uid)
+                    if thinking is not None:
+                        thinking.observe(r.token, r.finish_reason)
+                    cut = r.finish_reason == "length"
                     s.put(
                         TokenEvent(
                             token=r.token,
@@ -546,10 +583,16 @@ class Engine:
                                 if s.request.top_logprobs
                                 else None
                             ),
+                            thinking_truncated=(
+                                thinking is not None and thinking.thinking_truncated
+                            ),
+                            response_truncated=cut
+                            and (thinking is None or not thinking.in_reasoning),
                         )
                     )
                     if r.finish_reason is not None:
                         del self._live[r.uid]
+                        self._budgets.pop(r.uid, None)
         finally:
             gen.close()
             self._gen = None
