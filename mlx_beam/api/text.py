@@ -13,10 +13,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from mlx_beam._vendor.mlx_lm.generate import (
-    TextStateMachine,
-    make_text_state_machine,
-)
+from mlx_beam._vendor.mlx_lm.generate import TextStateMachine
 from mlx_beam.engine.request import TokenEvent
 
 logger = logging.getLogger(__name__)
@@ -53,6 +50,38 @@ def stop_sequence_ids(tokenizer, stop_words: list[str] | None) -> list[tuple]:
         if ids:
             seqs.append(ids)
     return seqs
+
+
+def make_state_machine(
+    tokenizer, stop_words, route_thinking: bool = True
+) -> TextStateMachine:
+    """Think and tool markers switch state; a stop word ends the stream.
+
+    With ``route_thinking`` off the think markers stay in the text (the
+    client parses them itself). The engine matches stop words on token ids,
+    which misses a word whose tokenization differs in context; the text
+    match catches those and the stream ends (state None) instead of merely
+    hiding the word."""
+    transitions: dict = {}
+    thinking = route_thinking and getattr(tokenizer, "has_thinking", False)
+    if thinking:
+        transitions.setdefault("normal", []).append(
+            (tokenizer.think_start, "reasoning")
+        )
+        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+    if getattr(tokenizer, "has_tool_calling", False):
+        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
+        if thinking:
+            transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+        transitions["tool"] = (
+            [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
+        )
+    for w in getattr(tokenizer, "structural_markers", None) or ():
+        transitions.setdefault("normal", []).append((w, "normal"))
+    for state in set(transitions) | {"normal"}:
+        for w in stop_words or []:
+            transitions.setdefault(state, []).append((w, None))
+    return TextStateMachine(transitions or None)
 
 
 class ToolCallParser:
@@ -93,10 +122,12 @@ class TextAssembler:
         stop_words: list[str] | None = None,
         tools: list[dict] | None = None,
         streaming: bool = False,
+        route_thinking: bool = True,
     ):
         self._detok = tokenizer.detokenizer
-        self._sm = make_text_state_machine(tokenizer, stop_words)
-        self._state = self._sm.make_state(initial_state(tokenizer, prompt_tokens))
+        self._sm = make_state_machine(tokenizer, stop_words, route_thinking)
+        start = initial_state(tokenizer, prompt_tokens) if route_thinking else "normal"
+        self._state = self._sm.make_state(start)
         self._prev = self._state[0]
         self._tool_text = ""
         self._pending_tools: list[str] = []
@@ -107,9 +138,14 @@ class TextAssembler:
         self.tokens = 0
         self.token_ids: list[int] = []
         self.logprobs: list[float] = []
+        # True once a text-level stop word ended the stream early.
+        self.stopped = False
+        self.reasoning_tokens = 0
 
     def feed(self, event: TokenEvent) -> TextDelta:
         """One token in, the text it releases out."""
+        if self.stopped:
+            return TextDelta()
         self.tokens += 1
         self.token_ids.append(event.token)
         self.logprobs.append(event.logprob)
@@ -126,12 +162,33 @@ class TextAssembler:
             self._state, clean, current = TextStateMachine.step(
                 self._state, self._detok.last_segment
             )
-            if event.finish_reason == "length":
+            if event.finish_reason == "length" and current is not None:
+                # A stop word already matched leaves its tail in the buffer;
+                # that tail is not output.
                 self._state, flushed, current = TextStateMachine.flush(self._state)
                 clean += flushed
 
+        if current is None:
+            # A stop word matched in the text: what came before it is the
+            # last of the output, whatever state we were in.
+            if self._prev == "reasoning":
+                delta.reasoning = clean
+            elif self._prev != "tool":
+                delta.content = clean
+            self.stopped = True
+            self._prev = "normal"
+            delta.finish_reason = "stop"
+            if self._made_tool_call or self._tool_text or self._pending_tools:
+                if self._tool_text:
+                    self._pending_tools.append(self._tool_text)
+                    self._tool_text = ""
+                delta.tool_calls = self._parse_tools(self._pending_tools)
+                self._pending_tools = []
+                delta.finish_reason = "tool_calls"
+            return delta
         if current == "reasoning":
             delta.reasoning = clean
+            self.reasoning_tokens += 1
         elif current == "tool":
             self._tool_text += clean
         else:

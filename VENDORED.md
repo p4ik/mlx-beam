@@ -105,10 +105,22 @@ from any cache that carries them - fresh prompts hold no keys, and taking the
 defaults from the first populated cache silently turned a 4-bit configuration
 into 8-bit batches (measured: greedy output under 4, 8 and mixed bits
 byte-identical); `MergeableQuantizedKVCache.keys_and_values` tolerates an
-empty cache. Dropped: `quantize_batch_cache_layer`, `install_batch_kv_quant`
-(the monkeypatch installer). Tests: `test_vendor_optiq_kv.py`.
+empty cache; `merge` refuses caches quantized differently instead of
+writing packed rows of one width into another. Dropped: the per-layer
+`mx.eval` in `update_and_fetch` (the generator evaluates every cache's
+full state after each prefill call, before it clears the buffer pool - the
+corruption that eval guarded against cannot arise there),
+`quantize_batch_cache_layer`, `install_batch_kv_quant` (the monkeypatch
+installer). Tests: `test_vendor_optiq_kv.py`.
 
 `fused_quant_sdpa.py`: the tiled attention as a plain function with the
 support check next to it; `install`/`uninstall` and the module-level
 original dropped. The chunk width is an argument (`n_chunk`, default 512).
-Test: `test_tiled_sdpa_matches_stock`.
+Three changes to the kernel itself: it accepts the bool masks the batch
+caches build (per-row left padding; the original only knew "causal", so it
+never ran on the batch path), it is used for prefill only (one query token
+is one matmul on the stock path), and the running max, sum and output
+accumulate in float32 across tiles - fp16 stops resolving the sum past a
+few thousand tokens. Tests: `test_tiled_sdpa_matches_stock`,
+`test_tiled_sdpa_matches_stock_with_a_batch_mask`,
+`test_prefill_takes_the_tiled_path`.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from collections.abc import Iterator
@@ -34,8 +35,12 @@ def _number(body, key, default, lo=None, hi=None, kind=float):
     value = body.get(key, default)
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ApiError(f"{key} must be a number", param=key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ApiError(f"{key} must be a finite number", param=key)
     value = kind(value)
     if (lo is not None and value < lo) or (hi is not None and value > hi):
         raise ApiError(f"{key} must be between {lo} and {hi}", param=key)
@@ -170,9 +175,14 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    tokens = tokenizer.apply_chat_template(
-        req.messages, add_generation_prompt=True, tokenize=True, **kwargs
-    )
+    try:
+        tokens = tokenizer.apply_chat_template(
+            req.messages, add_generation_prompt=True, tokenize=True, **kwargs
+        )
+    except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
+        raise ApiError(
+            f"the chat template rejected the messages: {e}", param="messages"
+        ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
     return list(tokens)
@@ -258,30 +268,53 @@ def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
     )
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached: int) -> dict:
+def _usage(
+    prompt_tokens: int, completion_tokens: int, cached: int, reasoning: int = 0
+) -> dict:
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
     }
+
+
+# Where the thinking goes in a chat completion: the field name(s), or
+# "none" to leave the think markers in the content for the client to parse.
+REASONING_FIELDS = {
+    "reasoning": ("reasoning",),
+    "reasoning_content": ("reasoning_content",),
+    "both": ("reasoning", "reasoning_content"),
+    "none": (),
+}
 
 
 class ChatResponder:
     """Builds chat.completion objects (one, or a stream of chunks)."""
 
-    def __init__(self, tokenizer, req: ChatRequest, prompt_tokens: list[int]):
+    def __init__(
+        self,
+        tokenizer,
+        req: ChatRequest,
+        prompt_tokens: list[int],
+        reasoning_field: str = "reasoning",
+    ):
+        if reasoning_field not in REASONING_FIELDS:
+            raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self._sent_role = False
+        self._reasoning_keys = REASONING_FIELDS[reasoning_field]
         self.assembler = TextAssembler(
             tokenizer,
             prompt_tokens=prompt_tokens,
             stop_words=req.stop,
             tools=req.tools,
             streaming=req.stream,
+            route_thinking=reasoning_field != "none",
         )
 
     def _envelope(self, kind: str) -> dict:
@@ -295,7 +328,8 @@ class ChatResponder:
     def _message(self, d: TextDelta) -> dict:
         msg: dict[str, Any] = {"role": "assistant", "content": d.content or None}
         if d.reasoning:
-            msg["reasoning_content"] = d.reasoning
+            for key in self._reasoning_keys:
+                msg[key] = d.reasoning
         if d.tool_calls:
             msg["tool_calls"] = d.tool_calls
         return msg
@@ -305,7 +339,8 @@ class ChatResponder:
         if d.content:
             delta["content"] = d.content
         if d.reasoning:
-            delta["reasoning_content"] = d.reasoning
+            for key in self._reasoning_keys:
+                delta[key] = d.reasoning
         if d.tool_calls:
             delta["tool_calls"] = d.tool_calls
         if not self._sent_role:
@@ -315,8 +350,6 @@ class ChatResponder:
         out["choices"] = [
             {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
         ]
-        if final and self.req.stream_usage:
-            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
         return out
 
     def stream(self, events, cached: int) -> Iterator[dict]:
@@ -326,10 +359,17 @@ class ChatResponder:
             if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
                 continue
             yield self.chunk(d, cached, final=d.finish_reason is not None)
+            if d.finish_reason is not None:
+                break  # a text-level stop ends before the engine does
         if self.req.stream_usage:
             out = self._envelope("chat.completion.chunk")
             out["choices"] = []
-            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+            out["usage"] = _usage(
+                self.prompt_len,
+                self.assembler.tokens,
+                cached,
+                self.assembler.reasoning_tokens,
+            )
             yield out
 
     def complete(self, events, cached: int) -> dict:
@@ -342,6 +382,7 @@ class ChatResponder:
             total.tool_calls += d.tool_calls
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
+                break
         out = self._envelope("chat.completion")
         choice: dict[str, Any] = {
             "index": 0,
@@ -358,5 +399,10 @@ class ChatResponder:
                 ]
             }
         out["choices"] = [choice]
-        out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+        out["usage"] = _usage(
+            self.prompt_len,
+            self.assembler.tokens,
+            cached,
+            self.assembler.reasoning_tokens,
+        )
         return out

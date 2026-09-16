@@ -18,8 +18,8 @@ uv run pre-commit install
 uv run pytest
 ```
 
-MLX only runs on Apple silicon. On other machines the tests that need it are
-skipped and `beam doctor` reports MLX as missing.
+MLX only runs on Apple silicon. On Linux, `uv sync --extra dev` installs the
+CPU build so the tests run there too; `beam doctor` reports the device.
 
 ## Pull requests
 
@@ -35,7 +35,10 @@ skipped and `beam doctor` reports MLX as missing.
 
 `mlx_beam/_vendor/` holds copies of upstream code (see `VENDORED.md`). Do not
 monkeypatch it from elsewhere; change the file and record the change. Updating
-a vendored part is its own pull request.
+a vendored part is its own pull request: move the pin in `tools/vendor.toml`,
+replace the files, re-apply the local changes, describe them in `VENDORED.md`,
+and run `tools/vendor_diff.py` - it fails on any difference the file does not
+list. CI runs the same check.
 
 ## Issues
 

@@ -124,6 +124,8 @@ class CompletionResponder:
             if d.finish_reason and self.req.stream_usage:
                 out["usage"] = self._usage(cached)
             yield out
+            if d.finish_reason:
+                break
 
     def complete(self, events, cached: int) -> dict:
         text = self.echo_text
@@ -133,6 +135,7 @@ class CompletionResponder:
             text += d.content + d.reasoning
             if d.finish_reason:
                 finish = d.finish_reason
+                break
         out = self._envelope()
         out["choices"] = [self._choice(text, finish)]
         out["usage"] = self._usage(cached)

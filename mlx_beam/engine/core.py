@@ -32,6 +32,28 @@ class EngineDead(RuntimeError):
     """The worker thread has ended; the engine answers nothing any more."""
 
 
+class ContextTooLong(ValueError):
+    """Prompt plus requested tokens do not fit the model's context."""
+
+
+class InvalidRequest(ValueError):
+    """A request the worker would choke on; refused before it is queued."""
+
+
+def model_vocab_size(model: Any) -> int | None:
+    value = getattr(getattr(model, "args", None), "vocab_size", None)
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def model_context_length(model: Any) -> int | None:
+    args = getattr(model, "args", None)
+    for name in ("max_position_embeddings", "max_seq_len", "n_positions"):
+        value = getattr(args, name, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 def _sampler(p: SamplingParams):
     return make_sampler(temp=p.temperature, top_p=p.top_p, min_p=p.min_p, top_k=p.top_k)
 
@@ -62,6 +84,7 @@ class Engine:
         prompt_cache_bytes: int | None = None,
         checkpoint_stride: int = 2048,
         checkpoint_stride_max: int = 4,
+        max_context: int | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -71,6 +94,11 @@ class Engine:
         # deep in a turn does not throw the whole turn away.
         self.checkpoint_stride = checkpoint_stride
         self.checkpoint_stride_max = checkpoint_stride_max
+        # Prompt plus generation must fit; None reads the model's own limit.
+        self.max_context = max_context or model_context_length(model)
+        self.vocab_size = model_vocab_size(model)
+        self._prompt_cache_bytes = prompt_cache_bytes
+        self._dead = False
         self._gen_args = dict(
             completion_batch_size=completion_batch_size,
             prefill_batch_size=prefill_batch_size,
@@ -144,11 +172,40 @@ class Engine:
     # -- submission -------------------------------------------------------
 
     def submit(self, request: GenerationRequest) -> ResultStream:
-        if not self.alive:
-            raise EngineDead(self._death_message())
+        self._validate(request)
         stream = ResultStream(request, self._request_cancel)
-        self._inbox.put(stream)
+        with self._lock:
+            # The worker drains the inbox when it dies; a stream queued after
+            # that would never be answered.
+            if self._dead or not self.alive:
+                raise EngineDead(self._death_message())
+            self._inbox.put(stream)
         return stream
+
+    def _validate(self, request: GenerationRequest) -> None:
+        if (
+            self.max_context
+            and len(request.tokens) + request.max_tokens > self.max_context
+        ):
+            raise ContextTooLong(
+                f"prompt ({len(request.tokens)} tokens) plus max_tokens "
+                f"({request.max_tokens}) exceeds the context length {self.max_context}"
+            )
+        vocab = self.vocab_size
+        if vocab is None:
+            return
+        # Out-of-range ids reach an unchecked gather on the GPU; a top_k at or
+        # above the vocabulary raises inside the sampler and kills the worker.
+        if any(not (0 <= t < vocab) for t in request.tokens):
+            raise InvalidRequest(f"token ids must be in [0, {vocab})")
+        if request.sampling.top_k >= vocab:
+            raise InvalidRequest(f"top_k must be below the vocabulary size {vocab}")
+        bias = request.sampling.logit_bias or {}
+        if any(not (0 <= t < vocab) for t in bias):
+            raise InvalidRequest(f"logit_bias token ids must be in [0, {vocab})")
+        for seq in request.stop_sequences:
+            if any(not (0 <= t < vocab) for t in seq):
+                raise InvalidRequest(f"stop sequence token ids must be in [0, {vocab})")
 
     def _request_cancel(self, request_id: str) -> None:
         with self._lock:
@@ -183,6 +240,7 @@ class Engine:
             ),
             "counters": counters,
             "batching": dict(self._gen_args),
+            "max_context": self.max_context,
             "kv": {
                 "policy": self.kv_policy.describe(),
                 # What the last batch was built from, layer by layer.
@@ -200,8 +258,12 @@ class Engine:
             self._error = e
             traceback.print_exc()
             self._fail_everything(e)
+        else:
+            self._fail_everything(RuntimeError("engine stopped"))
 
     def _fail_everything(self, error: BaseException) -> None:
+        with self._lock:
+            self._dead = True
         dead = EngineDead(f"engine worker died: {error!r}")
         if self._admitting is not None:
             self._admitting.put(dead)
@@ -210,6 +272,7 @@ class Engine:
             stream.put(dead)
         self._live.clear()
         self._bookkeeping.clear()
+        self._stride.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -258,6 +321,11 @@ class Engine:
         self._live[uid] = stream
         self._bookkeeping[uid] = (covered, dict(carried))
         self._stride[uid] = []
+        if self._prompt_cache_bytes:
+            # Stored prefixes yield to the caches of running requests.
+            self.prefix_store.trim_to_bytes(
+                self._prompt_cache_bytes - gen.prompt_cache_nbytes
+            )
 
     def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
         """Snapshot the recurrent layers of one sequence at a boundary."""
@@ -272,7 +340,15 @@ class Engine:
         rec = recurrent_layers(caches)
         if not rec:
             return
-        snap = {i: caches[i].extract(idx).cache for i in rec}
+        # extract() slices the batch buffers; own the bytes, or every
+        # snapshot pins a whole batch array per layer.
+        snap = {
+            i: [
+                None if a is None else mx.contiguous(a)
+                for a in caches[i].extract(idx).cache
+            ]
+            for i in rec
+        }
         for arrays in snap.values():
             mx.eval(*[a for a in arrays if a is not None])
         self._bookkeeping[uid][1][position] = snap
@@ -399,6 +475,37 @@ class Engine:
                     s = self._live.get(r.uid)
                     if s is None:
                         continue
+                    if r.finish_reason is not None:
+                        # Store first: when the caller sees the last token,
+                        # the next request can already find the entry. The
+                        # stream stays in _live until it has the token, so a
+                        # failing store still reaches it as EngineDead.
+                        _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
+                        self._stride.pop(r.uid, None)
+                        for i in recurrent_layers(r.prompt_cache):
+                            r.prompt_cache[i].cache = [
+                                None if a is None else mx.contiguous(a)
+                                for a in r.prompt_cache[i].cache
+                            ]
+                        tokens = list(r.all_tokens)
+                        self.prefix_store.insert(
+                            self.model_key,
+                            tokens,
+                            r.prompt_cache,
+                            checkpoints=checkpoints,
+                            cache_type="assistant",
+                        )
+                        if s.request.system_end:
+                            # The system block as its own entry: evicted after
+                            # every conversation, so the expensive prefix
+                            # survives a full turnover of the store.
+                            self.prefix_store.insert_prefix(
+                                self.model_key,
+                                tokens,
+                                r.prompt_cache,
+                                checkpoints,
+                                s.request.system_end,
+                            )
                     s.put(
                         TokenEvent(
                             token=r.token,
@@ -408,28 +515,6 @@ class Engine:
                     )
                     if r.finish_reason is not None:
                         del self._live[r.uid]
-                        _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
-                        self._stride.pop(r.uid, None)
-                        tokens = list(r.all_tokens)
-                        system_end = s.request.system_end
-                        self.prefix_store.insert(
-                            self.model_key,
-                            tokens,
-                            r.prompt_cache,
-                            checkpoints=checkpoints,
-                            cache_type="assistant",
-                        )
-                        if system_end:
-                            # The system block as its own entry: evicted after
-                            # every conversation, so the expensive prefix
-                            # survives a full turnover of the store.
-                            self.prefix_store.insert_prefix(
-                                self.model_key,
-                                tokens,
-                                r.prompt_cache,
-                                checkpoints,
-                                system_end,
-                            )
         finally:
             gen.close()
             self._gen = None

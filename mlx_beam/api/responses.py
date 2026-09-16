@@ -217,7 +217,13 @@ def to_generation_request(tokenizer, req: ResponsesRequest) -> GenerationRequest
 
 
 class ResponsesResponder:
-    def __init__(self, tokenizer, req: ResponsesRequest, prompt_tokens: list[int]):
+    def __init__(
+        self,
+        tokenizer,
+        req: ResponsesRequest,
+        prompt_tokens: list[int],
+        route_thinking: bool = True,
+    ):
         self.req = req
         self.id = f"resp_{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
@@ -227,6 +233,7 @@ class ResponsesResponder:
             prompt_tokens=prompt_tokens,
             tools=req.chat.tools,
             streaming=False,
+            route_thinking=route_thinking,
         )
         self.msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -256,7 +263,9 @@ class ResponsesResponder:
                 "output_tokens": self.assembler.tokens,
                 "total_tokens": self.prompt_len + self.assembler.tokens,
                 "input_tokens_details": {"cached_tokens": cached},
-                "output_tokens_details": {"reasoning_tokens": 0},
+                "output_tokens_details": {
+                    "reasoning_tokens": self.assembler.reasoning_tokens
+                },
             },
         }
         return out
@@ -310,6 +319,7 @@ class ResponsesResponder:
             total.tool_calls += d.tool_calls
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
+                break
         incomplete = (
             {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
         )
@@ -317,8 +327,9 @@ class ResponsesResponder:
         return self._response(status, self._output_items(total), cached, incomplete)
 
     def stream(self, events, cached: int) -> Iterator[dict]:
-        """Server-sent events of the Responses stream: created, text deltas,
-        the finished items, completed."""
+        """Server-sent events of the Responses stream: created, in_progress,
+        one item at a time (reasoning, message, function calls) with their
+        part and text events, then completed or incomplete."""
         seq = 0
 
         def ev(kind: str, **data):
@@ -327,18 +338,93 @@ class ResponsesResponder:
             return {"type": kind, "sequence_number": seq, **data}
 
         yield ev("response.created", response=self._response("in_progress", [], cached))
+        yield ev(
+            "response.in_progress", response=self._response("in_progress", [], cached)
+        )
         total = TextDelta()
-        started = False
+        output: list[dict] = []
+        index = -1
+        current: str | None = None  # "reasoning" or "message" while open
+        rs_id = f"rs_{uuid.uuid4().hex[:24]}"
+
+        def close_current():
+            nonlocal current
+            if current == "reasoning":
+                item = {
+                    "id": rs_id,
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": total.reasoning}],
+                }
+                yield ev(
+                    "response.reasoning_text.done",
+                    item_id=rs_id,
+                    output_index=index,
+                    content_index=0,
+                    text=total.reasoning,
+                )
+                yield ev("response.output_item.done", output_index=index, item=item)
+                output.append(item)
+            elif current == "message":
+                part = {"type": "output_text", "text": total.content, "annotations": []}
+                item = {
+                    "id": self.msg_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [part],
+                }
+                yield ev(
+                    "response.output_text.done",
+                    item_id=self.msg_id,
+                    output_index=index,
+                    content_index=0,
+                    text=total.content,
+                )
+                yield ev(
+                    "response.content_part.done",
+                    item_id=self.msg_id,
+                    output_index=index,
+                    content_index=0,
+                    part=part,
+                )
+                yield ev("response.output_item.done", output_index=index, item=item)
+                output.append(item)
+            current = None
+
         for event in events:
             d = self.assembler.feed(event)
-            total.reasoning += d.reasoning
-            total.tool_calls += d.tool_calls
-            if d.content:
-                if not started:
-                    started = True
+            if d.reasoning:
+                if current != "reasoning":
+                    yield from close_current()
+                    index += 1
+                    current = "reasoning"
                     yield ev(
                         "response.output_item.added",
-                        output_index=0,
+                        output_index=index,
+                        item={
+                            "id": rs_id,
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": [],
+                        },
+                    )
+                total.reasoning += d.reasoning
+                yield ev(
+                    "response.reasoning_text.delta",
+                    item_id=rs_id,
+                    output_index=index,
+                    content_index=0,
+                    delta=d.reasoning,
+                )
+            if d.content:
+                if current != "message":
+                    yield from close_current()
+                    index += 1
+                    current = "message"
+                    yield ev(
+                        "response.output_item.added",
+                        output_index=index,
                         item={
                             "id": self.msg_id,
                             "type": "message",
@@ -347,29 +433,55 @@ class ResponsesResponder:
                             "content": [],
                         },
                     )
+                    yield ev(
+                        "response.content_part.added",
+                        item_id=self.msg_id,
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "output_text", "text": "", "annotations": []},
+                    )
                 total.content += d.content
                 yield ev(
                     "response.output_text.delta",
                     item_id=self.msg_id,
-                    output_index=0,
+                    output_index=index,
                     content_index=0,
                     delta=d.content,
                 )
+            for tc in d.tool_calls:
+                yield from close_current()
+                index += 1
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                }
+                yield ev(
+                    "response.output_item.added",
+                    output_index=index,
+                    item={**item, "status": "in_progress", "arguments": ""},
+                )
+                yield ev(
+                    "response.function_call_arguments.done",
+                    item_id=item["id"],
+                    output_index=index,
+                    arguments=item["arguments"],
+                )
+                yield ev("response.output_item.done", output_index=index, item=item)
+                output.append(item)
+                total.tool_calls.append(tc)
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
-        if started:
-            yield ev(
-                "response.output_text.done",
-                item_id=self.msg_id,
-                output_index=0,
-                content_index=0,
-                text=total.content,
-            )
+                break
+        yield from close_current()
         incomplete = (
             {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
         )
         status = "incomplete" if incomplete else "completed"
-        final = self._response(status, self._output_items(total), cached, incomplete)
+        final = self._response(status, output, cached, incomplete)
         yield ev(
             "response.completed" if not incomplete else "response.incomplete",
             response=final,

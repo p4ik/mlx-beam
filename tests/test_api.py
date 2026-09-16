@@ -238,3 +238,170 @@ def test_responses_stream_events():
     assert types[0] == "response.created" and types[-1] == "response.completed"
     assert types.count("response.output_text.delta") == 2
     assert evs[-1]["response"]["output"][0]["content"][0]["text"] == "w10 w11 "
+
+
+def test_text_level_stop_word_ends_the_stream():
+    # The engine matches stop words on token ids; the text match catches a
+    # word whose tokenization differs and ends the stream instead of hiding it.
+    tok = StubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=["w11"])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (10, 11, 12)]
+    assert deltas[0].content == "w10 "
+    assert deltas[1].finish_reason == "stop" and deltas[1].content == ""
+    assert asm.stopped and deltas[2].empty() and deltas[2].finish_reason is None
+
+
+def test_non_finite_numbers_are_rejected():
+    with pytest.raises(ApiError) as exc:
+        chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "temperature": float("nan"),
+            },
+            "m",
+        )
+    assert exc.value.param == "temperature"
+
+
+def test_responses_stream_has_the_item_and_part_events():
+    tok = StubTokenizer()
+    req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
+    gen = responses.to_generation_request(tok, req)
+    evs = list(
+        responses.ResponsesResponder(tok, req, gen.tokens).stream(
+            events([THINK_START, 10, THINK_END, 11, TOOL_START, 20, 21, TOOL_END]), 0
+        )
+    )
+    types = [e["type"] for e in evs]
+    for needed in (
+        "response.in_progress",
+        "response.reasoning_text.delta",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.content_part.done",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ):
+        assert needed in types, needed
+    final = evs[-1]["response"]
+    assert [i["type"] for i in final["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert [e["sequence_number"] for e in evs] == list(range(1, len(evs) + 1))
+
+
+def test_reasoning_tokens_are_counted():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(
+        events([THINK_START, 10, 11, THINK_END, 12]), cached=0
+    )
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
+    assert out["choices"][0]["message"]["reasoning"] == "w10 w11 "
+
+
+def test_stop_word_inside_the_last_token_keeps_nothing_behind_it():
+    # finish_reason "length" flushes the buffer - but not the tail behind a
+    # stop word that already matched.
+    tok = StubTokenizer()
+    tok._words[1] = "hello STOPtail"
+    asm = TextAssembler(tok, prompt_tokens=[2], stop_words=["STOP"])
+    d = asm.feed(TokenEvent(1, -0.1, "length"))
+    assert d.content == "hello " and d.finish_reason == "stop"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("kind", ["chat", "completions", "responses"])
+def test_responders_stop_reading_after_a_text_level_stop(kind, streaming):
+    tok = StubTokenizer()
+    tok._words[1] = "hello STOPtail"
+    seen = []
+
+    def engine_events():
+        for i in range(4):
+            seen.append(i)
+            yield TokenEvent(1 if i == 0 else 3, -0.1, "length" if i == 3 else None)
+
+    if kind == "chat":
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w2"}],
+                "stop": "STOP",
+                "stream": streaming,
+            },
+            "m",
+        )
+        responder = chat.ChatResponder(tok, req, [2])
+    elif kind == "completions":
+        req = completions.parse_completion_request(
+            {"prompt": [2], "stop": "STOP", "stream": streaming}, "m"
+        )
+        responder = completions.CompletionResponder(tok, req, [2])
+    else:
+        req = responses.parse_responses_request(
+            {"input": "w2", "stream": streaming}, "m"
+        )
+        responder = responses.ResponsesResponder(tok, req, [2])
+        # Responses has no stop words; end the stream with the assembler's own
+        # stop instead so the loop behaviour is what is tested.
+        responder.assembler = TextAssembler(tok, prompt_tokens=[2], stop_words=["STOP"])
+    if streaming:
+        list(responder.stream(engine_events(), 0))
+    else:
+        responder.complete(engine_events(), 0)
+    assert seen == [0], seen
+
+
+@pytest.mark.parametrize(
+    "field, keys",
+    [
+        ("reasoning", ["reasoning"]),
+        ("reasoning_content", ["reasoning_content"]),
+        ("both", ["reasoning", "reasoning_content"]),
+    ],
+)
+def test_reasoning_field_names_the_thinking(field, keys):
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field=field).complete(
+        events([THINK_START, 10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "w11 "
+    assert {k: v for k, v in msg.items() if k.startswith("reasoning")} == {
+        k: "w10 " for k in keys
+    }
+    req.stream = True
+    chunks = list(
+        chat.ChatResponder(tok, req, gen.tokens, reasoning_field=field).stream(
+            events([THINK_START, 10, THINK_END, 11]), cached=0
+        )
+    )
+    first = chunks[0]["choices"][0]["delta"]
+    assert all(first[k] == "w10 " for k in keys) and "content" not in first
+
+
+def test_reasoning_field_none_leaves_the_markers_in_the_content():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        events([THINK_START, 10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "<think>w10 </think>w11 "
+    assert not any(k.startswith("reasoning") for k in msg)
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
+    with pytest.raises(ValueError):
+        chat.ChatResponder(tok, req, gen.tokens, reasoning_field="thoughts")

@@ -52,6 +52,7 @@ def test_health_and_models(server):
     models = json.loads(raw)
     assert status == 200 and models["data"][0]["id"] == "tiny"
     assert models["data"][0]["capabilities"]["tools"] is True
+    assert h["api"]["reasoning_field"] == "reasoning"
 
 
 def test_chat_completion(server):
@@ -147,3 +148,83 @@ def test_concurrent_clients(server):
     for t in threads:
         t.join(60)
     assert results == {i: 200 for i in range(5)}
+
+
+def test_context_cap_is_a_400(server):
+    body = {"prompt": [1, 2, 3], "max_tokens": 100000}
+    status, _, raw = call(server, "POST", "/v1/completions", body)
+    err = json.loads(raw)["error"]
+    assert status == 400 and err["code"] == "context_length_exceeded"
+
+
+def test_client_disconnect_cancels_the_request(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=30)
+    body = json.dumps({"prompt": [1, 2, 3], "max_tokens": 400, "stream": True}).encode()
+    conn.request(
+        "POST",
+        "/v1/completions",
+        body=body,
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    assert resp.status == 200
+    resp.read(200)
+    conn.close()  # walk away mid-stream
+    import time
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        status, _, raw = call(server, "GET", "/health")
+        if json.loads(raw)["in_flight"] == 0:
+            break
+        time.sleep(0.2)
+    assert json.loads(raw)["in_flight"] == 0
+
+
+def test_keepalive_comments_while_the_prompt_prefills(server, monkeypatch):
+    import mlx_beam.server as srv
+
+    monkeypatch.setattr(srv, "KEEPALIVE_S", 0.001)
+    body = {"prompt": list(range(1, 60)) * 6, "max_tokens": 2, "stream": True}
+    status, _, raw = call(server, "POST", "/v1/completions", body)
+    assert status == 200
+    text = raw.decode()
+    assert ": prefill " in text or ": waiting" in text
+    assert text.rstrip().endswith("data: [DONE]")
+
+
+def test_bad_token_ids_and_top_k_are_400s(server):
+    status, _, raw = call(
+        server, "POST", "/v1/completions", {"prompt": [1, 9999], "max_tokens": 1}
+    )
+    assert status == 400 and "token ids" in json.loads(raw)["error"]["message"]
+    status, _, raw = call(
+        server,
+        "POST",
+        "/v1/completions",
+        {"prompt": [1, 2], "max_tokens": 1, "top_k": 500, "temperature": 0.5},
+    )
+    assert status == 400 and "top_k" in json.loads(raw)["error"]["message"]
+    status, _, _ = call(server, "GET", "/health")
+    assert status == 200
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/completions", {"prompt": [1, 2], "max_tokens": 1}),
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "w1"}], "max_tokens": 1},
+        ),
+        ("/v1/responses", {"input": "w1", "max_output_tokens": 1}),
+    ],
+)
+def test_unknown_model_is_a_404(server, path, body):
+    status, _, raw = call(server, "POST", path, {**body, "model": "somewhere-else"})
+    err = json.loads(raw)["error"]
+    assert (
+        status == 404 and err["code"] == "model_not_found" and err["param"] == "model"
+    )
+    status, _, raw = call(server, "POST", path, {**body, "model": "tiny"})
+    assert status == 200 and json.loads(raw)["model"] == "tiny"

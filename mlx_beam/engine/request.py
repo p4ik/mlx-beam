@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ class ResultStream:
         self._cancelled = threading.Event()
         self.progress: PromptProgress | None = None
         self.prompt_cached = 0
+        self._done = False
 
     def put(self, item) -> None:
         self._queue.put(item)
@@ -90,16 +92,32 @@ class ResultStream:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def __iter__(self) -> Iterator[TokenEvent]:
+    def next_event(self, timeout: float | None = None) -> TokenEvent | None:
+        """The next token event; None once the stream has ended. Raises
+        ``queue.Empty`` when ``timeout`` passes without one (progress updates
+        are folded into ``self.progress`` while waiting)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            item = self._queue.get()
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            item = self._queue.get(timeout=remaining)
             if item is None:
-                return
+                self._done = True
+                return None
             if isinstance(item, PromptProgress):
                 self.progress = item
                 continue
             if isinstance(item, BaseException):
+                self._done = True
                 raise item
-            yield item
             if item.finish_reason is not None:
+                self._done = True
+            return item
+
+    def __iter__(self) -> Iterator[TokenEvent]:
+        while not self._done:
+            item = self.next_event()
+            if item is None:
                 return
+            yield item

@@ -21,9 +21,11 @@ const built = [
 const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
 
 const status = [
-  { piece: "CLI, packaging, CI", state: "skeleton", built: true },
+  { piece: "CLI, packaging, CI", state: "built", built: true },
   { piece: "Vendored mlx-lm base", state: "built", built: true },
-  { piece: "Prefix cache with recurrent-state checkpoints", state: "planned", built: false },
+  { piece: "OpenAI server with continuous batching", state: "built", built: true },
+  { piece: "Prefix cache with recurrent-state checkpoints, RAM tier", state: "built", built: true },
+  { piece: "Prefix cache SSD tier", state: "planned", built: false },
   { piece: "Multi-token prediction in the batch", state: "planned", built: false },
   { piece: "Expert streaming from SSD", state: "planned", built: false },
 ];

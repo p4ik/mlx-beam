@@ -17,6 +17,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+import mlx.core as mx
+from mlx.utils import tree_flatten
+
 from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, PromptTrie
 
 # Bytes of a recurrent snapshot are counted like cache bytes.
@@ -42,6 +45,22 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
             break
         n += 1
     return n
+
+
+def cache_arrays(cache: list[Any]) -> list:
+    """Every array a cache list holds, read as storage."""
+    out = []
+    for c in cache:
+        for leaf in getattr(c, "caches", None) or (c,):
+            if leaf is None:
+                continue
+            for v in vars(leaf).values():
+                if v is None or isinstance(v, (int, float, str, bool)):
+                    continue
+                for _, a in tree_flatten(v):
+                    if isinstance(a, mx.array):
+                        out.append(a)
+    return out
 
 
 def _snapshot_bytes(snap: dict[int, list]) -> int:
@@ -179,6 +198,9 @@ class PrefixStore:
         checkpoints: dict[int, dict[int, list]] | None = None,
         cache_type: str = "assistant",
     ) -> None:
+        # extract() hands out lazy slices of the batch buffers; evaluated
+        # here they own their bytes and the batch can be released.
+        mx.eval(*cache_arrays(cache))
         entry = Entry(cache, len(tokens), dict(checkpoints or {}), cache_type)
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:
@@ -187,9 +209,13 @@ class PrefixStore:
         self._lru[cache_type].append((model, tokens))
         # Prefixes this entry can be cut back to are redundant copies - except
         # a system entry, which exists to outlive the conversations above it.
+        rec = recurrent_layers(cache)
+        cuttable = all(c.is_trimmable() for i, c in enumerate(cache) if i not in rec)
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
-            if old.cache_type == "system" or (
-                recurrent_layers(cache) and prefix_len not in entry.checkpoints
+            if (
+                old.cache_type == "system"
+                or not cuttable
+                or (rec and prefix_len not in entry.checkpoints)
             ):
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue

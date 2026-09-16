@@ -71,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
 def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="local path or Hugging Face repo id")
     p.add_argument("--served-name", help="model id shown to clients (default: --model)")
+    p.add_argument(
+        "--reasoning-field",
+        default="reasoning",
+        choices=("reasoning", "reasoning_content", "both", "none"),
+        help="where a chat completion carries the model's thinking: the field "
+        "name(s), or none to leave the think markers in the content",
+    )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument(
@@ -89,6 +96,11 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--prompt-cache-size", type=int, default=16)
     p.add_argument(
         "--prompt-cache-gb", type=float, help="RAM budget for stored prefixes"
+    )
+    p.add_argument(
+        "--max-context",
+        type=int,
+        help="prompt plus generation cap in tokens (default: the model's own)",
     )
     p.add_argument(
         "--trust-remote-code",
@@ -139,23 +151,31 @@ def serve(args) -> int:
         prompt_cache_bytes=(
             int(args.prompt_cache_gb * 2**30) if args.prompt_cache_gb else None
         ),
+        max_context=args.max_context,
     )
     try:
         engine.start()
     except EngineDead as e:
         log.error("%s", e)
         return 3
-    served = Served(engine, tokenizer, args.served_name or args.model)
+    served = Served(
+        engine,
+        tokenizer,
+        args.served_name or args.model,
+        reasoning_field=args.reasoning_field,
+    )
     health = served.health()
     applied = health["kv"]["applied"] or []
     quantized = sum(1 for c in applied if "bits" in c)
     log.info(
-        "ready: %d layers, %d with quantized KV (%s), batching %s, capabilities %s",
+        "ready: %d layers, %d with quantized KV (%s), batching %s, capabilities %s, "
+        "reasoning field %s",
         len(applied),
         quantized,
         policy.describe(),
         health["batching"],
         health["capabilities"],
+        args.reasoning_field,
     )
     try:
         run_server(served, args.host, args.port)

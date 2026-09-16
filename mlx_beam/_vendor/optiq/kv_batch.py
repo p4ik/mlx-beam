@@ -92,13 +92,6 @@ class BatchQuantizedKVCache(BatchKVCache):
             self.keys[i][..., prev : self._idx, :] = qk[i]
             self.values[i][..., prev : self._idx, :] = qv[i]
 
-        # Evaluate the whole state, bookkeeping included: with only the
-        # tensors evaluated, offset and left_padding once came back corrupted
-        # (0x3F800000, float32 1.0) after the buffer pool was released under
-        # them, and the mask built from them had zero width.
-        if num_steps > 1:
-            mx.eval(self.keys, self.values, self.offset, self.left_padding)
-
         return self.keys_and_values()
 
     def keys_and_values(self):
@@ -201,10 +194,10 @@ class BatchQuantizedKVCache(BatchKVCache):
         # Bits and group size come from any cache that carries them, keys or
         # not: fresh prompts hold no keys yet, and taking the defaults here
         # silently turned a 4-bit configuration into 8-bit batches.
-        spec = next(
-            ((c.bits, c.group_size) for c in caches if hasattr(c, "bits")), (8, 64)
-        )
-        bits, group_size = spec
+        specs = {(c.bits, c.group_size) for c in caches if hasattr(c, "bits")}
+        if len(specs) > 1:
+            raise ValueError(f"cannot merge caches quantized differently: {sorted(specs)}")
+        bits, group_size = specs.pop() if specs else (8, 64)
 
         if max_length == 0:
             return cls([0] * len(caches), group_size=group_size, bits=bits)
