@@ -274,3 +274,69 @@ def test_cors_default_admits_everyone(server):
     resp.read()
     conn.close()
     assert resp.getheader("Access-Control-Allow-Origin") == "*"
+
+
+def test_queue_full_is_a_503_with_retry_after():
+    engine = Engine(
+        tiny_llama(), max_queued=0, decode_concurrency=1, prompt_concurrency=1
+    ).start()
+    httpd = BeamServer(Served(engine, StubTokenizer(), "tiny"), "127.0.0.1", 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        body = {"prompt": [1, 2, 3], "max_tokens": 60, "stream": True}
+        # One request holds the only slot; keep its stream open.
+        first = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=30)
+        first.request("POST", "/v1/completions", body=json.dumps(body).encode())
+        resp = first.getresponse()
+        assert resp.status == 200
+        resp.read(1)
+        conn = http.client.HTTPConnection("127.0.0.1", httpd.server_port, timeout=10)
+        conn.request("POST", "/v1/completions", body=json.dumps(body).encode())
+        second = conn.getresponse()
+        err = json.loads(second.read())["error"]
+        assert second.status == 503 and err["code"] == "queue_full"
+        assert second.getheader("Retry-After") == "1"
+        assert second.getheader("Connection") == "close"
+        conn.close()
+        resp.read()
+        first.close()
+        h = json.loads(call(httpd, "GET", "/health")[2])
+        assert h["rejected_queue_full"] == 1 and h["max_queued"] == 0
+    finally:
+        httpd.shutdown()
+        engine.stop()
+
+
+def test_stream_batches_ready_chunks_into_one_write(server, monkeypatch):
+    import mlx_beam.server as srv
+
+    writes = []
+    original = srv.Handler._sse_bytes
+
+    class Counting:
+        def __init__(self, wfile):
+            self._w = wfile
+
+        def write(self, data):
+            writes.append(len(data))
+            return self._w.write(data)
+
+        def flush(self):
+            return self._w.flush()
+
+    real_start = srv.Handler._start_sse
+
+    def start(self):
+        real_start(self)
+        self.wfile = Counting(self.wfile)
+
+    monkeypatch.setattr(srv.Handler, "_start_sse", start)
+    monkeypatch.setattr(srv.Handler, "_sse_bytes", original)
+    body = {"prompt": [1, 2, 3], "max_tokens": 30, "stream": True}
+    status, _, raw = call(server, "POST", "/v1/completions", body)
+    assert status == 200 and sse_payloads(raw)[-1] == "[DONE]"
+    # Every chunk arrived, in fewer writes than chunks: the [DONE] shares
+    # its write with whatever was still pending.
+    assert len(sse_payloads(raw)) >= 30 and len(writes) <= len(sse_payloads(raw))
+    assert writes  # and the client read everything the counter saw

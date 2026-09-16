@@ -247,3 +247,25 @@ def test_a_failing_store_reaches_the_finishing_stream():
             for _ in stream:
                 pass
         assert not engine.alive
+
+
+def test_max_queued_refuses_the_overflow_with_a_count():
+    from mlx_beam.engine import QueueFull
+
+    model = tiny_hybrid()
+    # One sequence decodes at a time, so the rest wait in the backlog.
+    with Engine(
+        model, max_queued=2, decode_concurrency=1, prompt_concurrency=1
+    ) as engine:
+        streams = [
+            engine.submit(GenerationRequest([3, 7, 11], max_tokens=40))
+            for _ in range(3)
+        ]
+        with pytest.raises(QueueFull) as exc:
+            engine.submit(GenerationRequest([5, 9], max_tokens=40))
+        assert "limit is 2" in str(exc.value)
+        assert engine.health()["rejected_queue_full"] == 1
+        for s in streams:
+            assert len(collect(s)) == 40
+        # The backlog drained: the next one is admitted again.
+        assert len(collect(engine.submit(GenerationRequest([5, 9], max_tokens=2)))) == 2

@@ -24,13 +24,25 @@ from mlx_beam.api import chat, completions, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import renderer_reasoning_keys
-from mlx_beam.engine import ContextTooLong, Engine, EngineDead, InvalidRequest
+from mlx_beam.engine import (
+    ContextTooLong,
+    Engine,
+    EngineDead,
+    InvalidRequest,
+    QueueFull,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 64 << 20
 # Seconds between SSE comments while a client waits for its first token.
 KEEPALIVE_S = 5.0
+# A socket that neither delivers the body nor takes the stream for this long
+# is given up: the request is cancelled instead of holding a batch slot.
+SOCKET_TIMEOUT_S = 30.0
+# Tokens ready at once go out in one write; a slow socket blocks once per
+# batch of chunks instead of once per token.
+SSE_WRITE_BATCH_BYTES = 64 << 10
 
 
 class Served:
@@ -101,6 +113,7 @@ class Served:
 class Handler(BaseHTTPRequestHandler):
     served: Served  # set by make_handler
     server_version = f"mlx-beam/{__version__}"
+    timeout = SOCKET_TIMEOUT_S
     _streaming = False
     _sse_events = False
 
@@ -109,17 +122,26 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- plumbing ---------------------------------------------------------
 
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(
+        self, status: int, payload: dict, extra_headers: dict | None = None
+    ) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        if status >= 400:
+            # Nothing more is coming on a failed request.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self._cors()
         self.end_headers()
         self.wfile.write(body)
 
     def _send_error(self, err: ApiError) -> None:
-        self._send_json(err.status, err.body())
+        headers = {"Retry-After": "1"} if err.status == 503 else None
+        self._send_json(err.status, err.body(), headers)
 
     def _cors(self) -> None:
         allowed = self.served.allowed_origins
@@ -143,10 +165,13 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
-    def _sse(self, payload: Any, event: str | None = None) -> None:
+    def _sse_bytes(self, payload: Any, event: str | None = None) -> bytes:
         data = payload if isinstance(payload, str) else json.dumps(payload)
         head = f"event: {event}\n" if event else ""
-        self.wfile.write(f"{head}data: {data}\n\n".encode())
+        return f"{head}data: {data}\n\n".encode()
+
+    def _sse(self, payload: Any, event: str | None = None) -> None:
+        self.wfile.write(self._sse_bytes(payload, event))
         self.wfile.flush()
 
     def _read_json(self) -> dict:
@@ -201,8 +226,15 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(
                 ApiError(str(e), status=503, type="server_error", code="engine_dead")
             )
+        except QueueFull as e:
+            self._fail(
+                ApiError(str(e), status=503, type="server_error", code="queue_full")
+            )
         except (BrokenPipeError, ConnectionResetError):
             logger.info("client went away")
+        except TimeoutError:
+            logger.info("client stalled for %.0fs", SOCKET_TIMEOUT_S)
+            self.close_connection = True
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
             logger.exception("request failed")
             self._fail(ApiError(repr(e), status=500, type="server_error"))
@@ -236,10 +268,22 @@ class Handler(BaseHTTPRequestHandler):
                 if first is None:
                     raise ApiError("the engine produced nothing", status=500)
                 events = _chain(first, result)
+                pending = bytearray()
                 for payload in responder.stream(events, result.prompt_cached):
-                    self._sse(payload, payload.get("type") if sse_events else None)
+                    pending += self._sse_bytes(
+                        payload, payload.get("type") if sse_events else None
+                    )
+                    # Flush when the engine has nothing more ready, or the
+                    # batch is large enough as it is.
+                    if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
+                        self.wfile.write(pending)
+                        self.wfile.flush()
+                        pending = bytearray()
                 if not sse_events:
-                    self._sse("[DONE]")
+                    pending += self._sse_bytes("[DONE]")
+                if pending:
+                    self.wfile.write(pending)
+                    self.wfile.flush()
             else:
                 first = self._await_first(result, keepalive=False)
                 if first is None:

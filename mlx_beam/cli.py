@@ -172,6 +172,12 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "--kv-config",
         help='JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": {"3": 8}}',
     )
+    p.add_argument(
+        "--max-queued",
+        type=int,
+        help="requests allowed to wait for a batch slot; one more is a 503 with "
+        "Retry-After (default: unlimited)",
+    )
     batching = p.add_argument_group("batching")
     batching.add_argument(
         "--decode-concurrency",
@@ -324,6 +330,7 @@ def serve(args) -> int:
         prompt_cache_bytes=args.prompt_cache_bytes or None,
         max_context=args.max_context,
         max_prompt_tokens=args.max_prompt_tokens,
+        max_queued=args.max_queued,
     )
     try:
         engine.start()

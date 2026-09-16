@@ -6,6 +6,7 @@ per-request stream. Nothing here knows about text, HTTP or chat formats.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -29,6 +30,8 @@ from mlx_beam.engine.request import (
 from mlx_beam.engine.sampling import SamplerPool, top_logprobs
 from mlx_beam.engine.thinking import ContextTooLong, ThinkingBudget, budget
 
+logger = logging.getLogger(__name__)
+
 
 class EngineDead(RuntimeError):
     """The worker thread has ended; the engine answers nothing any more."""
@@ -36,6 +39,10 @@ class EngineDead(RuntimeError):
 
 class InvalidRequest(ValueError):
     """A request the worker would choke on; refused before it is queued."""
+
+
+class QueueFull(RuntimeError):
+    """More requests are waiting than --max-queued allows; try again later."""
 
 
 def model_vocab_size(model: Any) -> int | None:
@@ -82,6 +89,7 @@ class Engine:
         checkpoint_stride_max: int = 4,
         max_context: int | None = None,
         max_prompt_tokens: int | None = None,
+        max_queued: int | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -95,6 +103,10 @@ class Engine:
         self.max_context = max_context or model_context_length(model)
         # A prompt above this is refused; a request may only lower it.
         self.max_prompt_tokens = max_prompt_tokens
+        # Waiting requests beyond this are refused at once instead of queued.
+        self.max_queued = max_queued
+        self._rejected_queue_full = 0
+        self._budget_warned_at = 0.0
         self.vocab_size = model_vocab_size(model)
         self._prompt_cache_bytes = prompt_cache_bytes
         self._dead = False
@@ -190,8 +202,29 @@ class Engine:
             # that would never be answered.
             if self._dead or not self.alive:
                 raise EngineDead(self._death_message())
+            waiting = self.waiting
+            would_wait = (
+                len(self._live) + self._inbox.qsize()
+                >= self.batching["decode_concurrency"]
+            )
+            if (
+                self.max_queued is not None
+                and would_wait
+                and waiting >= self.max_queued
+            ):
+                self._rejected_queue_full += 1
+                raise QueueFull(
+                    f"{waiting} requests are waiting, the limit is {self.max_queued}"
+                )
             self._inbox.put(stream)
         return stream
+
+    @property
+    def waiting(self) -> int:
+        """Requests beyond what the batch decodes at once: they wait for a
+        slot, in our inbox or in the generator's backlog."""
+        admitted = len(self._live) + self._inbox.qsize()
+        return max(0, admitted - self.batching["decode_concurrency"])
 
     def admit(self, request: GenerationRequest) -> tuple[int, int | None]:
         """(tokens this request may generate, reasoning tokens within that)
@@ -277,7 +310,9 @@ class Engine:
                 else 0.0
             ),
             "in_flight": len(self._live),
-            "queued": self._inbox.qsize(),
+            "queued": self.waiting,
+            "max_queued": self.max_queued,
+            "rejected_queue_full": self._rejected_queue_full,
             "last_step_age_s": (
                 round(time.monotonic() - self._last_step, 3)
                 if self._last_step
@@ -385,9 +420,17 @@ class Engine:
             self._budgets[uid] = thinking
         if self._prompt_cache_bytes:
             # Stored prefixes yield to the caches of running requests.
-            self.prefix_store.trim_to_bytes(
-                self._prompt_cache_bytes - gen.prompt_cache_nbytes
-            )
+            room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
+            self.prefix_store.trim_to_bytes(room)
+            if room < 0 and time.monotonic() - self._budget_warned_at > 60:
+                self._budget_warned_at = time.monotonic()
+                logger.warning(
+                    "prompt cache budget %d bytes is below the caches of the "
+                    "running requests (%d bytes): nothing can be stored until "
+                    "they finish",
+                    self._prompt_cache_bytes,
+                    gen.prompt_cache_nbytes,
+                )
 
     def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
         """Snapshot the recurrent layers of one sequence at a boundary."""

@@ -128,6 +128,11 @@ class ResultStream:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
+    @property
+    def ready(self) -> bool:
+        """Something is queued: a consumer need not block for the next item."""
+        return not self._queue.empty()
+
     def next_event(self, timeout: float | None = None) -> TokenEvent | None:
         """The next token event; None once the stream has ended. Raises
         ``queue.Empty`` when ``timeout`` passes without one (progress updates
