@@ -4,6 +4,7 @@ import argparse
 import json
 import platform
 import sys
+from pathlib import Path
 
 from mlx_beam import __version__
 
@@ -80,6 +81,32 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument(
+        "--allowed-origins",
+        nargs="+",
+        default=["*"],
+        metavar="ORIGIN",
+        help="origins CORS admits (default: any)",
+    )
+    template = p.add_argument_group("chat template")
+    template.add_argument(
+        "--chat-template",
+        help="Jinja text, or the path of a .jinja file, used instead of the "
+        "model's own template",
+    )
+    template.add_argument(
+        "--use-default-chat-template",
+        action="store_true",
+        help="give a model that ships no chat template a plain ChatML one",
+    )
+    template.add_argument(
+        "--chat-template-args",
+        type=_json_object,
+        default={},
+        metavar="JSON",
+        help="handed to every template render, e.g. '{\"enable_thinking\": false}'; "
+        "a request's chat_template_kwargs override it",
+    )
     limits = p.add_argument_group(
         "token limits", "every value counts tokens; each one counts a different set"
     )
@@ -176,6 +203,35 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log-level", default="INFO")
 
 
+def _json_object(text: str) -> dict:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"not JSON: {e.msg}") from None
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return value
+
+
+# transformers' former default: ChatML, for models that ship no template.
+DEFAULT_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+)
+
+
+def chat_template_from_args(args) -> str | None:
+    """The --chat-template text: read from the file when the value names one."""
+    if not args.chat_template:
+        return None
+    path = Path(args.chat_template)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    return args.chat_template
+
+
 def kv_policy_from_args(args):
     from mlx_beam.engine import KVPolicy
 
@@ -191,7 +247,6 @@ def kv_policy_from_args(args):
 
 def serve(args) -> int:
     import logging
-    from pathlib import Path
 
     from mlx_beam._vendor.mlx_lm.utils import hf_repo_to_path, load
     from mlx_beam.api.defaults import RequestDefaults
@@ -204,7 +259,20 @@ def serve(args) -> int:
     )
     log = logging.getLogger("beam")
     log.info("loading %s", args.model)
-    model, tokenizer = load(args.model, trust_remote_code=args.trust_remote_code)
+    # Handed to the tokenizer at load, so the think and tool markers are
+    # inferred from the template that will actually render.
+    template = chat_template_from_args(args)
+    tokenizer_config = {"chat_template": template} if template else {}
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config=tokenizer_config,
+        trust_remote_code=args.trust_remote_code,
+    )
+    template_source = "flag" if template else "model"
+    if args.use_default_chat_template and not tokenizer.has_chat_template:
+        tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+        tokenizer.has_chat_template = True
+        template_source = "default"
     model_path = (
         Path(args.model) if Path(args.model).exists() else hf_repo_to_path(args.model)
     )
@@ -216,6 +284,7 @@ def serve(args) -> int:
             "top_p": args.top_p,
             "top_k": args.top_k,
             "min_p": args.min_p,
+            "chat_template_args": args.chat_template_args or None,
         },
     )
     policy = kv_policy_from_args(args)
@@ -243,6 +312,8 @@ def serve(args) -> int:
         args.model_alias or args.model,
         reasoning_field=args.reasoning_field,
         defaults=defaults,
+        allowed_origins=args.allowed_origins,
+        chat_template_source=template_source,
     )
     health = served.health()
     applied = health["kv"]["applied"] or []

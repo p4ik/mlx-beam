@@ -93,27 +93,26 @@ class SeededSampler:
     def __init__(self, p: SamplingParams):
         self._key = mx.random.key(p.seed)
         self._temp = p.temperature
-        self._filters = []
+        # Same order as make_sampler: top_p, min_p, xtc, top_k.
+        self._steps = []
         if 0 < p.top_p < 1.0:
-            self._filters.append(lambda x: apply_top_p(x, p.top_p))
+            self._steps.append(lambda x, key: apply_top_p(x, p.top_p))
         if p.min_p != 0.0:
-            self._filters.append(
-                lambda x: apply_min_p(x, p.min_p, p.min_tokens_to_keep)
+            self._steps.append(
+                lambda x, key: apply_min_p(x, p.min_p, p.min_tokens_to_keep)
             )
-        self._xtc = (
-            (p.xtc_probability, p.xtc_threshold, list(p.xtc_special_tokens or ()))
-            if p.xtc_probability > 0.0
-            else None
-        )
+        if p.xtc_probability > 0.0:
+            special = list(p.xtc_special_tokens or ())
+            self._steps.append(
+                lambda x, key: _xtc(x, p.xtc_probability, p.xtc_threshold, special, key)
+            )
         if p.top_k > 0:
-            self._filters.append(lambda x: apply_top_k(x, p.top_k))
+            self._steps.append(lambda x, key: apply_top_k(x, p.top_k))
 
     def __call__(self, logprobs: mx.array) -> mx.array:
         self._key, k_xtc, k_draw = mx.random.split(self._key, 3)
-        for f in self._filters:
-            logprobs = f(logprobs)
-        if self._xtc is not None:
-            logprobs = _xtc(logprobs, *self._xtc, k_xtc)
+        for step in self._steps:
+            logprobs = step(logprobs, k_xtc)
         return mx.random.categorical(logprobs * (1.0 / self._temp), key=k_draw)
 
 
@@ -122,9 +121,7 @@ def top_logprobs(logprobs: mx.array, n: int) -> tuple[tuple[int, float], ...]:
     n = min(n, logprobs.shape[-1])
     idx = mx.argpartition(-logprobs, kth=n - 1, axis=-1)[..., :n]
     vals = mx.take_along_axis(logprobs, idx, axis=-1)
-    pairs = sorted(
-        zip(idx.tolist(), vals.tolist(), strict=True), key=lambda x: -x[1]
-    )
+    pairs = sorted(zip(idx.tolist(), vals.tolist(), strict=True), key=lambda x: -x[1])
     return tuple((int(i), float(v)) for i, v in pairs)
 
 

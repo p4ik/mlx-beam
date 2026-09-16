@@ -228,3 +228,39 @@ def test_unknown_model_is_a_404(server, path, body):
     )
     status, _, raw = call(server, "POST", path, {**body, "model": "tiny"})
     assert status == 200 and json.loads(raw)["model"] == "tiny"
+
+
+def test_cors_echoes_only_listed_origins():
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://ok.test"])
+    httpd = BeamServer(served, "127.0.0.1", 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+
+        def preflight(origin):
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", httpd.server_port, timeout=10
+            )
+            conn.request("OPTIONS", "/v1/models", headers={"Origin": origin})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            return resp.status, resp.getheader("Access-Control-Allow-Origin")
+
+        assert preflight("http://ok.test") == (204, "http://ok.test")
+        assert preflight("http://evil.test") == (204, None)
+        status, _, raw = call(httpd, "GET", "/health")
+        assert json.loads(raw)["api"]["allowed_origins"] == ["http://ok.test"]
+    finally:
+        httpd.shutdown()
+        engine.stop()
+
+
+def test_cors_default_admits_everyone(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+    conn.request("OPTIONS", "/v1/models", headers={"Origin": "http://any.test"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.getheader("Access-Control-Allow-Origin") == "*"

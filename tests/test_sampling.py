@@ -41,11 +41,15 @@ def test_seeded_sampler_ignores_the_global_state():
     first = draws(SeededSampler(p))
     mx.random.seed(123)
     assert draws(SeededSampler(p)) == first
-    assert draws(SeededSampler(SamplingParams(temperature=1.0, top_k=4, seed=8))) != first
+    assert (
+        draws(SeededSampler(SamplingParams(temperature=1.0, top_k=4, seed=8))) != first
+    )
     # The filters still apply: top_k 2 never draws the tail.
     narrow = SamplingParams(temperature=1.0, top_k=2, seed=7)
     assert set(draws(SeededSampler(narrow))) <= {0, 1}
-    xtc = SamplingParams(temperature=1.0, xtc_probability=1.0, xtc_threshold=0.12, seed=3)
+    xtc = SamplingParams(
+        temperature=1.0, xtc_probability=1.0, xtc_threshold=0.12, seed=3
+    )
     # XTC with probability 1 removes every candidate above the threshold but
     # the least likely of them: index 3 (0.15) and the tail below stay.
     assert set(draws(SeededSampler(xtc))) == {3, 4}
@@ -76,8 +80,12 @@ def test_seeded_requests_repeat_and_batch_with_shared_samplers():
     model = tiny_hybrid()
     p = SamplingParams(temperature=1.0, top_k=8, seed=11)
     with Engine(model) as engine:
-        a = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, sampling=p)))
-        b = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, sampling=p)))
+        a = collect(
+            engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, sampling=p))
+        )
+        b = collect(
+            engine.submit(GenerationRequest([3, 7, 11], max_tokens=6, sampling=p))
+        )
         assert a == b
         shared = SamplingParams(temperature=1.0, top_k=8)
         streams = [

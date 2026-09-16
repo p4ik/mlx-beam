@@ -177,7 +177,10 @@ def parse_chat_request(
             raise ApiError("tools must be a list of function tools", param="tools")
         if body.get("tool_choice") == "none":
             tools = None
-    template_kwargs = dict(body.get("chat_template_kwargs") or {})
+    template_kwargs = {
+        **defaults.chat_template_args,
+        **(body.get("chat_template_kwargs") or {}),
+    }
     effort = body.get("reasoning_effort")
     if effort == "none":
         template_kwargs.setdefault("enable_thinking", False)

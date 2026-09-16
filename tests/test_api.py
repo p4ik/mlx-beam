@@ -516,3 +516,20 @@ def test_completions_logprobs_use_the_legacy_columns():
     assert lp["text_offset"] == [0, 4]
     with pytest.raises(ApiError):
         completions.parse_completion_request({"prompt": "w1", "logprobs": 21}, "m")
+
+
+def test_server_template_args_are_overridden_by_the_request():
+    from mlx_beam.api.defaults import RequestDefaults
+
+    d = RequestDefaults.resolve(
+        flags={"chat_template_args": {"enable_thinking": False, "lang": "de"}}
+    )
+    msgs = [{"role": "user", "content": "w1"}]
+    req = chat.parse_chat_request({"messages": msgs}, "m", d)
+    assert req.template_kwargs == {"enable_thinking": False, "lang": "de"}
+    req = chat.parse_chat_request(
+        {"messages": msgs, "chat_template_kwargs": {"enable_thinking": True}}, "m", d
+    )
+    assert req.template_kwargs == {"enable_thinking": True, "lang": "de"}
+    # A plain server keeps sending nothing extra.
+    assert chat.parse_chat_request({"messages": msgs}, "m").template_kwargs == {}

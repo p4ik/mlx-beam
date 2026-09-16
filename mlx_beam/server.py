@@ -14,7 +14,7 @@ import signal
 import socket
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -42,6 +42,8 @@ class Served:
         model_name: str,
         reasoning_field: str = "reasoning",
         defaults: RequestDefaults | None = None,
+        allowed_origins: Sequence[str] = ("*",),
+        chat_template_source: str = "model",
     ):
         if reasoning_field not in chat.REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
@@ -50,6 +52,9 @@ class Served:
         self.model_name = model_name
         self.reasoning_field = reasoning_field
         self.defaults = defaults or RequestDefaults()
+        self.allowed_origins = tuple(allowed_origins)
+        # "model", "flag" or "default": where the chat template came from.
+        self.chat_template_source = chat_template_source
         self.started_at = time.time()
 
     def capabilities(self) -> dict:
@@ -83,6 +88,8 @@ class Served:
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
+            "allowed_origins": list(self.allowed_origins),
+            "chat_template": self.chat_template_source,
         }
         h["version"] = __version__
         return h
@@ -112,7 +119,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(err.status, err.body())
 
     def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed = self.served.allowed_origins
+        if "*" in allowed:
+            origin = "*"
+        else:
+            # Echo the caller's origin only when it is on the list.
+            self.send_header("Vary", "Origin")
+            origin = self.headers.get("Origin")
+            if origin not in allowed:
+                return
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 

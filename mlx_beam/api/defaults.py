@@ -21,6 +21,7 @@ MLX_LM_DEFAULTS = {
     "repetition_penalty": None,
     "presence_penalty": None,
     "frequency_penalty": None,
+    "chat_template_args": {},
 }
 
 # The generation_config.json keys we read, and what they map to.
@@ -45,6 +46,9 @@ class RequestDefaults:
     repetition_penalty: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    # Handed to every chat template render; a request's chat_template_kwargs
+    # override it key by key.
+    chat_template_args: dict = field(default_factory=dict)
     sources: dict[str, str] = field(default_factory=dict)
 
     @classmethod
@@ -52,7 +56,10 @@ class RequestDefaults:
         cls, model_path: str | Path | None = None, flags: dict | None = None
     ) -> RequestDefaults:
         """Flags beat the model's generation_config.json, which beats mlx-lm."""
-        values = dict(MLX_LM_DEFAULTS)
+        values = {
+            k: (dict(v) if isinstance(v, dict) else v)
+            for k, v in MLX_LM_DEFAULTS.items()
+        }
         sources = {k: "mlx-lm" for k in values}
         cfg = read_generation_config(model_path) if model_path else {}
         for key, ours in GENERATION_CONFIG_KEYS.items():
