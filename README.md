@@ -13,7 +13,21 @@ beam doctor
 
 Inside a uv project: `uv add mlx-beam`, then `uv run beam doctor`.
 
-`beam doctor` reports the Python, MLX, device and memory it sees (`--json` for scripts) and exits non-zero when MLX is missing or fails to load. It is the only command so far.
+`beam doctor` reports the Python, MLX, device and memory it sees (`--json` for scripts) and exits non-zero when MLX is missing or fails to load.
+
+## Serve
+
+```bash
+beam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --port 8000 \
+  --max-completion-tokens 4096 --min-response-tokens 512 --max-reasoning-tokens 8192 \
+  --kv-bits 8
+```
+
+That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) plus `/health`, which reports what was actually built: the KV layout per layer, the batching and cache settings, and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own).
+
+Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`, `--prompt-cache-size`, `--chat-template`, …). Token limits say what they count: `--max-context` (prompt plus generated, a hard cap), `--max-prompt-tokens` (prompt, a hard cap), `--max-completion-tokens` (generated, the default a request may override), `--max-reasoning-tokens` (the think block; closed by force at the budget) and `--min-response-tokens` (what the answer keeps after the block). `beam serve --help` lists them all with their units.
+
+Requests may use the names other servers taught clients: `max_tokens`, `thinking_token_budget`, `reasoning: {effort, max_tokens}`, `enable_thinking`, `reasoning_effort`. The model's thinking is returned in `reasoning` (`--reasoning-field` switches to `reasoning_content`, both, or none), counted in `usage.completion_tokens_details.reasoning_tokens`, and flagged there when a limit cut it (`thinking_truncated`, `response_truncated`).
 
 ## What sets it apart
 
@@ -37,10 +51,13 @@ Existing MLX servers either stop at the basics or grow things that have no place
 
 | Piece | State |
 |---|---|
-| CLI, packaging, CI | skeleton |
-| Vendored mlx-lm base | planned |
-| Prefix cache with recurrent-state checkpoints | planned |
+| CLI, packaging, CI | done |
+| Vendored mlx-lm base (pinned, four local changes) | done |
+| OpenAI-compatible server, continuous batching, quantized KV cache | done, text only |
+| Prefix cache with recurrent-state checkpoints | done, RAM tier |
+| Reasoning budget, request defaults, sampling controls | done |
 | Multi-token prediction in the batch | planned |
+| Vision, structured output | planned, as extras |
 | Expert streaming from SSD | planned |
 
 Measured numbers are published as they are measured, with machine, model and date.
