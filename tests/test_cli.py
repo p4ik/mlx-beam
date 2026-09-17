@@ -154,3 +154,32 @@ def test_chat_template_flag_takes_text_or_a_file(tmp_path):
         chat_template_from_args(serve_args("--chat-template", "{{ x }}")) == "{{ x }}"
     )
     assert chat_template_from_args(serve_args()) is None
+    # A real template is longer than a file name may be; still text.
+    long_template = "{% for m in messages %}{{ m.content }}{% endfor %}" * 12
+    assert (
+        chat_template_from_args(serve_args("--chat-template", long_template))
+        == long_template
+    )
+
+
+def test_bad_flags_fail_before_the_model_loads(tmp_path):
+    import argparse
+
+    from mlx_beam.cli import kv_policy_from_args, main
+
+    bad = tmp_path / "kv.json"
+    bad.write_text('{"bits": 4, "layers": [1, 2]}')
+    with pytest.raises(SystemExit, match="kv-config"):
+        kv_policy_from_args(
+            argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(bad))
+        )
+    with pytest.raises(SystemExit, match="kv-config"):
+        kv_policy_from_args(
+            argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config="/nowhere")
+        )
+    with pytest.raises(SystemExit):
+        main(["serve", "--model", "x", "--log-level", "LOUD"])
+    with pytest.raises(SystemExit):
+        main(["serve", "--model", "x", "--decode-share", "1.5"])
+    assert serve_args("--log-level", "debug").log_level == "DEBUG"
+    assert serve_args().max_completion_tokens is None

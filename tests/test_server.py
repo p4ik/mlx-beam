@@ -410,3 +410,126 @@ def test_stream_batches_ready_chunks_into_one_write(server, monkeypatch):
     # its write with whatever was still pending.
     assert len(sse_payloads(raw)) >= 30 and len(writes) <= len(sse_payloads(raw))
     assert writes  # and the client read everything the counter saw
+
+
+def test_no_keepalive_while_the_worker_makes_no_progress(monkeypatch):
+    """A stalled worker must leave the stream silent: the silence is what a
+    watchdog in front of the server sees. A stepping worker earns a comment."""
+    import io
+    import queue as q
+
+    import mlx_beam.server as srv
+    from mlx_beam.engine.request import TokenEvent
+
+    class Stalled:
+        def __init__(self):
+            self.calls = 0
+
+        def next_event(self, timeout):
+            self.calls += 1
+            if self.calls <= 3:
+                raise q.Empty
+            return None
+
+    class FakeEngine:
+        last_step = 1.0
+
+    monkeypatch.setattr(srv, "KEEPALIVE_S", 0.001)
+    handler = object.__new__(srv.Handler)
+    handler.wfile = io.BytesIO()
+    handler._pending = bytearray()
+    handler._last_write = 0.0
+    handler._client_gone = lambda: False
+    handler.served = type("S", (), {"engine": FakeEngine()})()
+    first = TokenEvent(1, -0.1)
+    assert list(handler._events(first, Stalled())) == [first]
+    assert handler.wfile.getvalue() == b""
+    # The worker stepped between waits: one comment per observed step.
+    stepping = Stalled()
+    real = stepping.next_event
+
+    def next_event(timeout):
+        FakeEngine.last_step += 1
+        return real(timeout)
+
+    stepping.next_event = next_event
+    handler.wfile = io.BytesIO()
+    list(handler._events(first, stepping))
+    assert handler.wfile.getvalue().count(b": keepalive") == 3
+
+
+def test_a_failed_stream_write_is_not_retried(server, monkeypatch):
+    import mlx_beam.server as srv
+
+    writes = []
+    real_start = srv.Handler._start_sse
+
+    class Failing:
+        def __init__(self, wfile):
+            self._w = wfile
+
+        def write(self, data):
+            writes.append(bytes(data))
+            if len(writes) == 2:
+                raise TimeoutError("timed out")
+            return self._w.write(data)
+
+        def flush(self):
+            return self._w.flush()
+
+    def start(self):
+        real_start(self)
+        self.wfile = Failing(self.wfile)
+
+    monkeypatch.setattr(srv.Handler, "_start_sse", start)
+    body = {"prompt": [1, 2, 3], "max_tokens": 30, "stream": True}
+    call(server, "POST", "/v1/completions", body)
+    # The bytes that failed were not written a second time.
+    assert len(writes) == 2 or writes[1] != writes[2]
+
+
+def test_preflight_allows_the_headers_the_browser_asks_for(server):
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+    conn.request(
+        "OPTIONS",
+        "/v1/chat/completions",
+        headers={
+            "Origin": "http://app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-stainless-os, content-type",
+        },
+    )
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 204
+    assert (
+        resp.getheader("Access-Control-Allow-Headers") == "x-stainless-os, content-type"
+    )
+    assert resp.getheader("Access-Control-Max-Age") == "600"
+
+
+def test_bad_bodies_are_400s_and_methods_405(server):
+    def raw(method, headers, body=b""):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        conn.putrequest(method, "/v1/completions")
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        if body:
+            conn.send(body)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
+    status, data = raw("POST", {"Content-Length": "-1"})
+    assert status == 400 and b"negative" in data
+    body = b'{"prompt": "\xff\xfe", "max_tokens": 1}'
+    status, data = raw("POST", {"Content-Length": str(len(body))}, body)
+    assert status == 400 and b"UTF-8" in data
+    status, data = raw("POST", {"Transfer-Encoding": "chunked"})
+    assert status == 411
+    assert raw("HEAD", {})[0] == 405  # no body on HEAD, by the protocol
+    status, data = raw("PUT", {"Content-Length": "0"})
+    assert status == 405 and json.loads(data)["error"]["message"]

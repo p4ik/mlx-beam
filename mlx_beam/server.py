@@ -143,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, err: ApiError) -> None:
-        headers = {"Retry-After": "1"} if err.status == 503 else None
+        # A full queue clears; a dead engine does not come back on its own.
+        headers = {"Retry-After": "1"} if err.code == "queue_full" else None
         self._send_json(err.status, err.body(), headers)
 
     def _cors(self) -> None:
@@ -158,7 +159,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        # A browser client sends its own header names (the OpenAI SDK adds
+        # x-stainless-*); the preflight must allow what it asked for.
+        asked = self.headers.get("Access-Control-Request-Headers")
+        self.send_header(
+            "Access-Control-Allow-Headers", asked or "Content-Type, Authorization"
+        )
+        self.send_header("Access-Control-Max-Age", "600")
 
     def _start_sse(self) -> None:
         self.send_response(HTTPStatus.OK)
@@ -182,15 +189,28 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise ApiError("Content-Length must be a number") from None
+        if length < 0:
+            raise ApiError("Content-Length must not be negative")
         if length > MAX_BODY_BYTES:
             raise ApiError("request body too large", status=413)
+        if not length and "chunked" in (self.headers.get("Transfer-Encoding") or ""):
+            raise ApiError("chunked request bodies are not supported", status=411)
         raw = self.rfile.read(length) if length else b""
         try:
             return json.loads(raw or b"{}")
+        except UnicodeDecodeError as e:
+            raise ApiError(f"request body is not UTF-8: {e.reason}") from None
         except json.JSONDecodeError as e:
             raise ApiError(f"invalid JSON: {e.msg}") from None
 
     # -- routes -----------------------------------------------------------
+
+    def do_HEAD(self):
+        self._send_error(
+            ApiError("method not allowed", status=405, type="not_found_error")
+        )
+
+    do_PUT = do_DELETE = do_PATCH = do_HEAD
 
     def do_OPTIONS(self):
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -257,10 +277,12 @@ class Handler(BaseHTTPRequestHandler):
     def _run(self, gen_request, responder, stream: bool, sse_events: bool = False):
         """Submit, then either stream chunks as they come or answer once.
 
-        The first event is awaited before any header goes out, so a request
-        the worker rejects still gets a proper error status. While a long
-        prefill runs, a streaming client gets SSE comments with the progress
-        so proxies and clients do not give up on an idle connection."""
+        A plain request waits for the first event before any header goes
+        out, so one the worker rejects gets a proper error status; a stream
+        opens with the 200 at once and reports a rejection as an error event.
+        While a long prefill runs, a streaming client gets SSE comments with
+        the progress so proxies and clients do not give up on an idle
+        connection."""
         result = self.served.engine.submit(gen_request)
         self._sse_events = sse_events
         try:
@@ -287,6 +309,10 @@ class Handler(BaseHTTPRequestHandler):
                             self._flush_pending()
                     if not sse_events:
                         self._pending += self._sse_bytes("[DONE]")
+                except OSError:
+                    # The socket is the problem: nothing more goes out.
+                    self._pending = bytearray()
+                    raise
                 finally:
                     # What was generated goes out before any error does.
                     self._flush_pending()
@@ -323,19 +349,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def _events(self, first, result) -> Iterator:
         """The token events, with an SSE comment whenever nothing went out
-        for KEEPALIVE_S. A tool call is collected until it closes, so a long
-        one is decoded in silence and a client's idle timeout would give the
-        request up in the middle of it."""
+        for KEEPALIVE_S while the worker made progress. A tool call is
+        collected until it closes, so a long one is decoded in silence and a
+        client's idle timeout would give the request up in the middle of
+        it. A worker that stopped stepping gets no comment: the silence is
+        what lets a watchdog see the hang."""
         yield first
         if first.finish_reason is not None:
             return
+        engine = self.served.engine
+        seen_step = engine.last_step
         while True:
             try:
                 event = result.next_event(timeout=KEEPALIVE_S)
             except queue.Empty:
                 if self._client_gone():
                     raise ConnectionResetError("client went away") from None
-                self._comment("keepalive")
+                if engine.last_step != seen_step:
+                    seen_step = engine.last_step
+                    self._comment("keepalive")
                 continue
             if event is None:
                 return
