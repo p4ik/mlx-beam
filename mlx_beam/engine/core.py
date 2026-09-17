@@ -373,6 +373,9 @@ class Engine:
                 else None
             ),
             "counters": counters,
+            # Prefill calls that admitted nobody so a starved long prompt got
+            # its full slice (VENDORED.md, scheduler); 0 means never needed.
+            "prefill_starved_calls": gen.starved_calls if gen is not None else 0,
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
             # recommended working set) and what it found before.

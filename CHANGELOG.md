@@ -77,6 +77,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   entry cut from a longer one owns only its own tokens instead of pinning
   the whole conversation's buffers; a cancelled request's recurrent state is
   stored as its own bytes, not as a view into the batch.
+- Scheduler: a long prefill can no longer be starved by a trickle of short
+  prompts. The prefill width is the shortest row's segment (nobody is
+  padded); after two calls in which newcomers held a row with a whole slice
+  to go under a quarter slice, the next call admits nobody and that row gets
+  its full width. A single short request beside a long prefill is served
+  exactly as before; `/health` counts the guard's calls as
+  `prefill_starved_calls`.
 - A decode burst under a shared prefill ends when a row finishes, so its
   extracted cache is evaluated before the next step instead of forcing a
   copy of the whole batch KV every step meanwhile.

@@ -61,7 +61,15 @@ decode runs for `decode_share` times the last prefill call's wall time and
 hands its tokens back before the next prefill call; a burst also ends when
 a row finishes, because its extracted cache is a lazy slice of the batch
 buffers until the caller evaluates it, and every further step would copy
-the whole batch KV instead of writing in place. Alone, a prompt sees
+the whole batch KV instead of writing in place. (4) The width rule has a
+starvation guard: when a row with a whole slice to go was held under a
+quarter slice by newcomers in two prefill calls in a row, the next call
+admits nobody, so that row gets its full width once; measured on a
+600-token prompt under one 8-token newcomer per call, 91 calls to the first
+token instead of 295, and a newcomer waits at most one call more
+(`test_a_trickle_of_short_prompts_cannot_starve_a_long_prefill`). The
+count of such calls is `starved_calls`, reported by the engine's health as
+`prefill_starved_calls`. Alone, a prompt sees
 upstream's chunking at slice width; greedy output is byte-identical
 (`test_prefill_slice_keeps_output`, and the greedy replay against an unpatched
 worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,

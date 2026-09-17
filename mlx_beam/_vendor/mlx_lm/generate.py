@@ -1591,6 +1591,11 @@ class BatchGenerator:
         self._currently_processing = []
         self._prefill_turn = False
         self._last_prefill_s = 0.0
+        # Prefill calls in a row that newcomers held far below the slice
+        # while a row had a whole slice to go; at two, one call admits
+        # nobody so that row gets its full width. Counted for /health.
+        self._starved = 0
+        self.starved_calls = 0
 
         self._counters = BatchCounters()
 
@@ -1859,6 +1864,10 @@ class BatchGenerator:
             self.completion_batch_size - len(self._generation_batch),
             len(self._unprocessed_sequences),
         )
+        if n > 0 and self._starved >= 2 and self._currently_processing:
+            # Starvation guard: the rows already here get this call alone.
+            self.starved_calls += 1
+            n = 0
         if n > 0:
             self._prompt_batch.extend(self._make_batch(n))
 
@@ -1900,8 +1909,13 @@ class BatchGenerator:
 
         # One model call, as wide as the shortest current segment: nobody is
         # padded, and the width is capped by the step and the slice.
-        width = min(len(seq[0][0]) for seq in self._currently_processing)
-        width = min(width, self.prefill_step_size, self.prefill_slice)
+        remaining = [len(seq[0][0]) for seq in self._currently_processing]
+        width = min(min(remaining), self.prefill_step_size, self.prefill_slice)
+        full = min(self.prefill_step_size, self.prefill_slice)
+        if max(remaining) >= full and width < full // 4:
+            self._starved += 1
+        else:
+            self._starved = 0
 
         prompts = []
         for i, seq in enumerate(self._currently_processing):

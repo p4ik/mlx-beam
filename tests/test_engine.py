@@ -228,6 +228,8 @@ def test_short_request_is_not_stuck_behind_a_long_prefill():
         time.sleep(min(0.15, solo_long / 10))
         short = ttft(engine, [7, 11, 13, 17])
         t.join()
+        # One short request is no starvation: the guard never stepped in.
+        assert engine.health()["prefill_starved_calls"] == 0
     assert short < 0.5 * solo_long, (short, solo_long)
     assert result["long"] < 2.0 * solo_long, (result["long"], solo_long)
 
