@@ -37,6 +37,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - Prefix store: the system block as its own entry (evicted last), a
   checkpoint every 2048 prefill tokens, a cancelled prefill keeps its part.
 
+### Fixed
+- A tool call the parser cannot read is returned as text, markers and all,
+  and `finish_reason` says what really happened (`stop` / `length`) instead
+  of `tool_calls` with no call; calls before a cut-off one are kept.
+- Qwen tool-call parameters end at their last `</parameter>`, so a value
+  containing the tag literally is no longer cut short in silence; the
+  vendored Qwen and Mistral parsers carry upstream's fixes for a parameter
+  name without `>` and for the JSON list form (see `VENDORED.md`).
+
 ### Changed
 - `--reasoning-field none` keeps counting reasoning tokens and shows a think
   block the prompt opened; the text automaton runs in every mode.

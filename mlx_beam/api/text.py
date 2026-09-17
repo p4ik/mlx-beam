@@ -101,31 +101,64 @@ def make_state_machine(tokenizer, stop_words) -> TextStateMachine:
 
 
 class ToolCallParser:
-    """Turns the model's tool-call text into OpenAI tool_call objects."""
+    """Turns the model's tool-call text into OpenAI tool_call objects.
 
-    def __init__(self, tool_parser, tools, streaming: bool):
+    What does not parse is handed back as text, markers and all: the client
+    sees what the model said instead of a call that never existed. A text
+    that holds several calls without an end marker (Mistral) is retried
+    call by call, so the ones before a cut are kept."""
+
+    def __init__(self, tool_parser, tools, streaming: bool, start="", end=""):
         self._parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        self._start = start or ""
+        self._end = end or ""
         self._idx = 0
 
-    def __call__(self, texts: Iterable[str]) -> list[dict]:
-        out = []
-        for text in texts:
-            try:
-                parsed = self._parser(text, self._tools)
-            except (ValueError, json.JSONDecodeError) as e:
-                # Truncated mid-generation, most often; the text is not a call.
-                logger.warning("tool call not parseable (%s): %r", e, text[:200])
+    def __call__(
+        self, blocks: Iterable[tuple[str, bool]]
+    ) -> tuple[list[dict], list[str]]:
+        """``blocks`` are (text, closed) pairs; an unclosed block was cut off
+        and gets no end marker back."""
+        calls: list[dict] = []
+        unparsed: list[str] = []
+        for text, closed in blocks:
+            parsed = self._parse(text)
+            if parsed is None and self._start and self._start in text:
+                pieces = [p for p in text.split(self._start) if p.strip()]
+                for i, piece in enumerate(pieces):
+                    part = self._parse(piece)
+                    if part is None:
+                        last = i == len(pieces) - 1
+                        unparsed.append(self._raw(piece, closed or not last))
+                    else:
+                        calls.extend(part)
                 continue
-            for tc in parsed if isinstance(parsed, list) else [parsed]:
-                tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
-                tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-                item = {"id": tc_id, "type": "function", "function": tc}
-                if self._streaming:
-                    item["index"] = self._idx
-                    self._idx += 1
-                out.append(item)
+            if parsed is None:
+                unparsed.append(self._raw(text, closed))
+            else:
+                calls.extend(parsed)
+        return calls, unparsed
+
+    def _raw(self, text: str, closed: bool) -> str:
+        return self._start + text + (self._end if closed else "")
+
+    def _parse(self, text: str) -> list[dict] | None:
+        try:
+            parsed = self._parser(text, self._tools)
+        except (ValueError, json.JSONDecodeError) as e:
+            logger.warning("tool call not parseable (%s): %r", e, text[:200])
+            return None
+        out = []
+        for tc in parsed if isinstance(parsed, list) else [parsed]:
+            tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
+            tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
+            item = {"id": tc_id, "type": "function", "function": tc}
+            if self._streaming:
+                item["index"] = self._idx
+                self._idx += 1
+            out.append(item)
         return out
 
 
@@ -153,10 +186,15 @@ class TextAssembler:
         # A think block the prompt opened: the client sees it once, up front.
         self._lead = seeded if not route_thinking else ""
         self._tool_text = ""
-        self._pending_tools: list[str] = []
+        # (text, closed): a block still open when the stream ended was cut.
+        self._pending_tools: list[tuple[str, bool]] = []
         self._made_tool_call = False
         self._parse_tools = ToolCallParser(
-            getattr(tokenizer, "tool_parser", None), tools, streaming
+            getattr(tokenizer, "tool_parser", None),
+            tools,
+            streaming,
+            start=getattr(tokenizer, "tool_call_start", None),
+            end=getattr(tokenizer, "tool_call_end", None),
         )
         self.tokens = 0
         self.token_ids: list[int] = []
@@ -214,12 +252,11 @@ class TextAssembler:
             self.stopped = True
             self._prev = "normal"
             delta.finish_reason = "stop"
-            if self._made_tool_call or self._tool_text or self._pending_tools:
-                if self._tool_text:
-                    self._pending_tools.append(self._tool_text)
-                    self._tool_text = ""
-                delta.tool_calls = self._parse_tools(self._pending_tools)
-                self._pending_tools = []
+            if self._tool_text:
+                self._pending_tools.append((self._tool_text, False))
+                self._tool_text = ""
+            self._flush_tools(delta)
+            if self._made_tool_call:
                 delta.finish_reason = "tool_calls"
             return delta
         if current == "reasoning":
@@ -233,9 +270,8 @@ class TextAssembler:
             self._tool_text += clean
         else:
             if self._prev == "tool":
-                self._pending_tools.append(self._tool_text)
+                self._pending_tools.append((self._tool_text, True))
                 self._tool_text = ""
-                self._made_tool_call = True
             closed = ""
             if self._prev == "reasoning" and not self._route:
                 # A block the prompt opened may close on the first token.
@@ -245,17 +281,25 @@ class TextAssembler:
 
         if event.finish_reason is not None:
             if current == "tool" and self._tool_text:
-                self._pending_tools.append(self._tool_text)
+                self._pending_tools.append((self._tool_text, False))
                 self._tool_text = ""
-                self._made_tool_call = True
             delta.finish_reason = event.finish_reason
-            if event.finish_reason == "stop" and self._made_tool_call:
-                delta.finish_reason = "tool_calls"
 
         if self._pending_tools and (current != "tool" or delta.finish_reason):
-            delta.tool_calls = self._parse_tools(self._pending_tools)
-            self._pending_tools = []
+            self._flush_tools(delta)
+        if event.finish_reason == "stop" and self._made_tool_call:
+            # Only calls that really parsed make this a tool-call turn; a
+            # cut-off one keeps the engine's reason and its text.
+            delta.finish_reason = "tool_calls"
         return delta
+
+    def _flush_tools(self, delta: TextDelta) -> None:
+        calls, unparsed = self._parse_tools(self._pending_tools)
+        self._pending_tools = []
+        delta.tool_calls += calls
+        self._made_tool_call |= bool(calls)
+        if unparsed:
+            delta.content += "".join(unparsed)
 
     def _take_lead(self) -> str:
         lead, self._lead = self._lead, ""

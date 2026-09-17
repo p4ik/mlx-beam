@@ -603,3 +603,140 @@ def test_forced_close_drops_the_half_character_the_cut_left():
     evs[2] = TokenEvent(40, -0.1)
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
     assert out["choices"][0]["message"]["reasoning"] == "w10 �\n"
+
+
+class PickyTokenizer(StubTokenizer):
+    """A tool parser that rejects calls whose name starts with 'bad'."""
+
+    @staticmethod
+    def tool_parser(text: str, tools):
+        name, _, rest = text.strip().partition(" ")
+        if name.startswith("bad") or not name:
+            raise ValueError(f"no such tool: {name!r}")
+        return {"name": name, "arguments": {"words": rest.strip()}}
+
+
+def _tool_events(*blocks, finish="stop"):
+    """Token events for tool blocks; each block is a list of word ids."""
+    out = []
+    for words in blocks:
+        out += [TokenEvent(TOOL_START, -0.1)]
+        out += [TokenEvent(w, -0.1) for w in words]
+        out += [TokenEvent(TOOL_END, -0.1)]
+    if finish == "stop":
+        out.append(TokenEvent(EOS, -0.1, "stop"))
+    else:
+        out[-1] = TokenEvent(out[-1].token, -0.1, "length")
+    return out
+
+
+def _chat(tok, stream=False):
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "tools": [{"type": "function", "function": {"name": "w10"}}],
+            "stream": stream,
+        },
+        "m",
+    )
+    return req, chat.to_generation_request(tok, req).tokens
+
+
+def test_a_tool_call_that_does_not_parse_comes_back_as_text():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    out = chat.ChatResponder(tok, req, prompt).complete(_tool_events([20, 11]), 0)
+    choice = out["choices"][0]
+    # No call was made, so no call is reported; the client sees the text.
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == "<tool_call>bad w11 </tool_call>"
+
+
+def test_valid_calls_survive_next_to_an_invalid_one():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    out = chat.ChatResponder(tok, req, prompt).complete(
+        _tool_events([10, 11], [20, 12], [10, 13]), 0
+    )
+    choice = out["choices"][0]
+    names = [c["function"]["name"] for c in choice["message"]["tool_calls"]]
+    assert names == ["w10", "w10"] and choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "<tool_call>bad w12 </tool_call>"
+
+
+def test_a_call_cut_by_the_length_limit_keeps_its_text_and_reason():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    evs = _tool_events([20, 11], finish="length")[:-1]
+    evs[-1] = TokenEvent(11, -0.1, "length")
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert choice["finish_reason"] == "length" and "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == "<tool_call>bad w11 "
+    # Streamed: the same text arrives as a content chunk, no tool-call chunk.
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, prompt).stream(iter(evs), 0))
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert (
+        content == "<tool_call>bad w11 "
+        and chunks[-1]["choices"][0]["finish_reason"] == "length"
+    )
+    assert not any("tool_calls" in c["choices"][0]["delta"] for c in chunks)
+
+
+class MistralLike(StubTokenizer):
+    """Mistral's shape: a start marker, no end marker, several calls in a row."""
+
+    tool_call_start = "[TOOL_CALLS]"
+    tool_call_end = ""
+
+    def __init__(self):
+        super().__init__()
+        self._words[TOOL_START] = "[TOOL_CALLS]"
+        self._words[30] = 'good[ARGS]{"x": 1}'
+        self._words[31] = 'bad[ARGS]{"x":'
+        self._words[32] = 'other[ARGS]{"y": 2}'
+
+    @staticmethod
+    def tool_parser(text, tools):
+        from mlx_beam._vendor.mlx_lm.tool_parsers import mistral
+
+        return mistral.parse_tool_call(text, tools)
+
+
+def test_mistral_calls_before_a_cut_are_kept_and_the_cut_one_is_text():
+    tok = MistralLike()
+    req, prompt = _chat(tok)
+    # good, then a second call cut by the length limit.
+    evs = [
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(30, -0.1),
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(31, -0.1, "length"),
+    ]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert [c["function"]["name"] for c in choice["message"]["tool_calls"]] == ["good"]
+    assert choice["message"]["content"] == '[TOOL_CALLS]bad[ARGS]{"x":'
+    assert choice["finish_reason"] == "length"
+    # Two complete calls, ended by the eos: both parsed, a tool-call turn.
+    evs = [
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(30, -0.1),
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(32, -0.1),
+        TokenEvent(EOS, -0.1, "stop"),
+    ]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert [c["function"]["name"] for c in choice["message"]["tool_calls"]] == [
+        "good",
+        "other",
+    ]
+    assert (
+        choice["finish_reason"] == "tool_calls" and choice["message"]["content"] is None
+    )
