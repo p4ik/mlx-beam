@@ -40,15 +40,74 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ### Fixed
 - A tool call the parser cannot read is returned as text, markers and all,
   and `finish_reason` says what really happened (`stop` / `length`) instead
-  of `tool_calls` with no call; calls before a cut-off one are kept.
-- Qwen tool-call parameters end at their last `</parameter>`, so a value
-  containing the tag literally is no longer cut short in silence; the
+  of `tool_calls` with no call. Calls before a cut-off one are kept by
+  parsing the longest prefix that parses, so a `[TOOL_CALLS]` quoted inside
+  a JSON argument never becomes a call of its own. A parser result JSON
+  cannot carry (a set from a literal) is an unreadable call, not a 500.
+- Qwen tool-call parameters end at their last `</parameter>`, so a single
+  literal end tag in a value survives; a parameter name seen twice, or one a
+  schema with `additionalProperties: false` rules out, is an error the
+  caller sees instead of one argument silently overwriting another. The
   vendored Qwen and Mistral parsers carry upstream's fixes for a parameter
   name without `>` and for the JSON list form (see `VENDORED.md`).
-- A stream sends an SSE comment whenever nothing went out for five seconds,
-  not only during the prefill: a tool call is collected until it closes, so
-  a long one used to be decoded in silence and clients with an idle timeout
-  gave the request up in the middle of it.
+- A stream sends an SSE comment whenever nothing went out for five seconds
+  while the worker made progress, not only during the prefill: a tool call
+  is collected until it closes, so a long one used to be decoded in silence
+  and clients with an idle timeout gave the request up in the middle of it.
+  A worker that stopped stepping gets no comment, so a watchdog in front of
+  the server still sees the hang.
+- `/v1/completions` returns what the model wrote: think markers and
+  tool-call blocks stay in the text; they were parsed away. Chat parses a
+  tool-call block only when the request offered tools.
+- Cancelling a request that was admitted with a one-token prompt in the
+  same round, before its own prefill began, killed the worker and every
+  other request with it (`extract()` on an empty cache).
+- Text the detokenizer or the marker automaton still held when the stop
+  token came is no longer lost; a real U+FFFD the model wrote before a
+  forced close is kept, only a byte fragment the cut left is dropped.
+- A think-block end marker the model began on the arming token and
+  continued on the next is completed instead of answered with a forced
+  newline in place of the first answer token (multi-token markers). A
+  marker whose prefix repeats is matched.
+- With the block open and no room to think, the close costs its whole
+  length; a `min_response_tokens` that then cannot be kept is a 400, not a
+  shorter answer.
+- Prefix store: system entries are capped at a quarter of the store, so
+  many distinct system prompts cannot crowd every conversation out; an
+  entry cut from a longer one owns only its own tokens instead of pinning
+  the whole conversation's buffers; a cancelled request's recurrent state is
+  stored as its own bytes, not as a view into the batch.
+- A decode burst under a shared prefill ends when a row finishes, so its
+  extracted cache is evaluated before the next step instead of forcing a
+  copy of the whole batch KV every step meanwhile.
+- Responses API: every output item has its own id and text when text and
+  tool calls interleave; `output_text.*` carry `logprobs`,
+  `function_call_arguments.done` carries `name`, a cut-off message item is
+  `incomplete`, `instructions` and `tool_choice` are echoed, and a
+  `reasoning` input item reaches the template as the reasoning of the turn
+  it preceded.
+- Wrongly shaped request fields (`response_format`, `stream_options`,
+  `chat_template_kwargs`, `metadata`, `text`, a content part's `text`,
+  `stream`/`echo`/`logprobs` that are not booleans, `n: true`) are 400s,
+  not 500s; `logit_bias` values must be finite and within -100..100;
+  `suffix` is refused as unsupported; a server default a request could not
+  ask for (`generation_config.json` with `temperature: 3.0`, a flag out of
+  range) fails at start instead of on every request.
+- HTTP: a failed stream write is not retried, so a dead client releases its
+  batch slot after one timeout; the CORS preflight allows the headers the
+  browser asked for (the OpenAI SDK sends `x-stainless-*`); a negative
+  `Content-Length`, a body that is not UTF-8 and a chunked body are 400/411;
+  HEAD, PUT, DELETE and PATCH are 405 with a JSON body; `Retry-After` only
+  on `queue_full`, since a dead engine does not come back.
+- `--chat-template` with the template's text (longer than a file name may
+  be) no longer crashes at start; `--kv-config` and `--log-level` are
+  checked before the model loads; `--decode-share` must be within 0..1;
+  `--max-context` above the model's own window is capped to it with a
+  warning; a temperature below 1e-4 is greedy, since `1/temp` overflowed
+  float32 and the draw turned random.
+- Chat `logprobs.content` covers the message content only, not the think
+  block, the markers or the stop token; completions streaming puts `usage`
+  on a last chunk without choices, as at OpenAI.
 - Tool-call arguments in the conversation reach the chat template as a
   mapping (the wire carries a JSON string; `""` means no arguments), and a
   `null` content is `""` there. The Qwen3.8 template raises on a string, so
