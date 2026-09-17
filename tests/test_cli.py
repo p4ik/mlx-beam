@@ -88,3 +88,18 @@ def test_doctor_reports_missing_package(monkeypatch, capsys):
     rc = doctor(as_json=True)
     report = json.loads(capsys.readouterr().out)
     assert rc == 1 and "not installed" in report["error"]
+
+
+def test_serve_kv_policy_from_arguments(tmp_path):
+    from mlx_beam.cli import kv_policy_from_args, main
+
+    cfg = tmp_path / "kv.json"
+    cfg.write_text('{"bits": 4, "group_size": 32, "layers": {"3": 8}}')
+    import argparse
+
+    args = argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(cfg))
+    policy = kv_policy_from_args(args)
+    assert (policy.bits, policy.group_size, policy.layers) == (4, 32, {3: 8})
+    assert policy.bits_for(3) == 8 and policy.bits_for(0) == 4
+    with pytest.raises(SystemExit):
+        main(["serve", "--kv-bits", "3", "--model", "x"])
