@@ -6,17 +6,18 @@ per-request stream. Nothing here knows about text, HTTP or chat formats.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 import mlx.core as mx
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
-from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
 from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
 from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
 from mlx_beam.engine.request import (
@@ -26,14 +27,41 @@ from mlx_beam.engine.request import (
     SamplingParams,
     TokenEvent,
 )
+from mlx_beam.engine.sampling import SamplerPool, top_logprobs
+from mlx_beam.engine.thinking import (
+    ContextTooLong,
+    ThinkingBudget,
+    budget,
+    close_tail,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class EngineDead(RuntimeError):
     """The worker thread has ended; the engine answers nothing any more."""
 
 
-def _sampler(p: SamplingParams):
-    return make_sampler(temp=p.temperature, top_p=p.top_p, min_p=p.min_p, top_k=p.top_k)
+class InvalidRequest(ValueError):
+    """A request the worker would choke on; refused before it is queued."""
+
+
+class QueueFull(RuntimeError):
+    """More requests are waiting than --max-queued allows; try again later."""
+
+
+def model_vocab_size(model: Any) -> int | None:
+    value = getattr(getattr(model, "args", None), "vocab_size", None)
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def model_context_length(model: Any) -> int | None:
+    args = getattr(model, "args", None)
+    for name in ("max_position_embeddings", "max_seq_len", "n_positions"):
+        value = getattr(args, name, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
 
 
 def _logits_processors(p: SamplingParams):
@@ -42,7 +70,9 @@ def _logits_processors(p: SamplingParams):
         repetition_penalty=p.repetition_penalty,
         repetition_context_size=p.repetition_context_size,
         presence_penalty=p.presence_penalty,
+        presence_context_size=p.presence_context_size,
         frequency_penalty=p.frequency_penalty,
+        frequency_context_size=p.frequency_context_size,
     )
 
 
@@ -53,8 +83,8 @@ class Engine:
         *,
         model_key: str = "model",
         kv_policy: KVPolicy | None = None,
-        completion_batch_size: int = 8,
-        prefill_batch_size: int = 2,
+        decode_concurrency: int = 8,
+        prompt_concurrency: int = 2,
         prefill_step_size: int = 2048,
         prefill_slice: int = 512,
         decode_share: float = 0.5,
@@ -62,6 +92,9 @@ class Engine:
         prompt_cache_bytes: int | None = None,
         checkpoint_stride: int = 2048,
         checkpoint_stride_max: int = 4,
+        max_context: int | None = None,
+        max_prompt_tokens: int | None = None,
+        max_queued: int | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -71,9 +104,29 @@ class Engine:
         # deep in a turn does not throw the whole turn away.
         self.checkpoint_stride = checkpoint_stride
         self.checkpoint_stride_max = checkpoint_stride_max
+        # Prompt plus generation must fit; None reads the model's own limit.
+        self.max_context = max_context or model_context_length(model)
+        # A prompt above this is refused; a request may only lower it.
+        self.max_prompt_tokens = max_prompt_tokens
+        # Waiting requests beyond this are refused at once instead of queued.
+        self.max_queued = max_queued
+        self._rejected_queue_full = 0
+        self._budget_warned_at = 0.0
+        self.vocab_size = model_vocab_size(model)
+        self._prompt_cache_bytes = prompt_cache_bytes
+        self._dead = False
+        # Our names on the outside (mlx-lm's server flags), the generator's
+        # keyword names on the inside.
+        self.batching = dict(
+            decode_concurrency=decode_concurrency,
+            prompt_concurrency=prompt_concurrency,
+            prefill_step_size=prefill_step_size,
+            prefill_slice=prefill_slice,
+            decode_share=decode_share,
+        )
         self._gen_args = dict(
-            completion_batch_size=completion_batch_size,
-            prefill_batch_size=prefill_batch_size,
+            completion_batch_size=decode_concurrency,
+            prefill_batch_size=prompt_concurrency,
             prefill_step_size=prefill_step_size,
             prefill_slice=prefill_slice,
             decode_share=decode_share,
@@ -93,6 +146,8 @@ class Engine:
         self._bookkeeping: dict[int, tuple[int, dict]] = {}
         # uid -> positions of the stride checkpoints (boundaries are never thinned)
         self._stride: dict[int, list[int]] = {}
+        self._samplers = SamplerPool()
+        self._budgets: dict[int, ThinkingBudget] = {}
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
@@ -144,11 +199,106 @@ class Engine:
     # -- submission -------------------------------------------------------
 
     def submit(self, request: GenerationRequest) -> ResultStream:
-        if not self.alive:
-            raise EngineDead(self._death_message())
+        self._validate(request)
         stream = ResultStream(request, self._request_cancel)
-        self._inbox.put(stream)
+        stream.completion_cap, stream.reasoning_cap = self.admit(request)
+        with self._lock:
+            # The worker drains the inbox when it dies; a stream queued after
+            # that would never be answered.
+            if self._dead or not self.alive:
+                raise EngineDead(self._death_message())
+            waiting = self.waiting
+            would_wait = (
+                len(self._live) + self._inbox.qsize()
+                >= self.batching["decode_concurrency"]
+            )
+            if (
+                self.max_queued is not None
+                and would_wait
+                and waiting >= self.max_queued
+            ):
+                self._rejected_queue_full += 1
+                raise QueueFull(
+                    f"{waiting} requests are waiting, the limit is {self.max_queued}"
+                )
+            self._inbox.put(stream)
         return stream
+
+    @property
+    def waiting(self) -> int:
+        """Requests beyond what the batch decodes at once: they wait for a
+        slot, in our inbox or in the generator's backlog."""
+        admitted = len(self._live) + self._inbox.qsize()
+        return max(0, admitted - self.batching["decode_concurrency"])
+
+    def admit(self, request: GenerationRequest) -> tuple[int, int | None]:
+        """(tokens this request may generate, reasoning tokens within that)
+        under the context and prompt caps; raises when it cannot fit."""
+        prompt = len(request.tokens)
+        cap = self.max_prompt_tokens
+        if request.max_prompt_tokens is not None:
+            if cap is not None and request.max_prompt_tokens > cap:
+                raise InvalidRequest(
+                    f"max_prompt_tokens ({request.max_prompt_tokens}) is above "
+                    f"the server's {cap}; a request may only lower it"
+                )
+            cap = request.max_prompt_tokens
+        if cap is not None and prompt > cap:
+            raise ContextTooLong(
+                f"prompt ({prompt} tokens) exceeds max_prompt_tokens ({cap})"
+            )
+        completion_cap, reasoning_cap = budget(
+            self.max_context, prompt, request.max_tokens, request.min_response_tokens
+        )
+        limits = request.reasoning
+        if limits is not None and reasoning_cap is not None:
+            # The reserve starts after the close's tail, which is neither
+            # reasoning nor answer.
+            reasoning_cap = max(0, reasoning_cap - close_tail(limits))
+        if limits is not None and limits.max_tokens is not None:
+            reasoning_cap = (
+                limits.max_tokens
+                if reasoning_cap is None
+                else min(limits.max_tokens, reasoning_cap)
+            )
+        return completion_cap, reasoning_cap
+
+    def _validate(self, request: GenerationRequest) -> None:
+        p = request.sampling
+        # These raise inside the sampler, i.e. inside the worker.
+        if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:
+            raise InvalidRequest(
+                "xtc_probability must be in [0, 1], xtc_threshold in [0, 0.5]"
+            )
+        if p.min_tokens_to_keep < 1:
+            raise InvalidRequest("min_tokens_to_keep must be at least 1")
+        if p.temperature < 0:
+            raise InvalidRequest("temperature must not be negative")
+        vocab = self.vocab_size
+        if vocab is None:
+            return
+        # Out-of-range ids reach an unchecked gather on the GPU; a top_k at or
+        # above the vocabulary raises inside the sampler and kills the worker.
+        if any(not (0 <= t < vocab) for t in request.tokens):
+            raise InvalidRequest(f"token ids must be in [0, {vocab})")
+        if request.sampling.top_k >= vocab:
+            raise InvalidRequest(f"top_k must be below the vocabulary size {vocab}")
+        if request.sampling.min_tokens_to_keep > vocab:
+            # min_p keeps that many by argpartition, which rejects more than
+            # the vocabulary holds - inside the worker.
+            raise InvalidRequest(
+                f"min_tokens_to_keep must not exceed the vocabulary size {vocab}"
+            )
+        if request.top_logprobs > vocab:
+            raise InvalidRequest(f"top_logprobs must not exceed the vocabulary {vocab}")
+        if any(not (0 <= t < vocab) for t in request.sampling.xtc_special_tokens):
+            raise InvalidRequest(f"xtc_special_tokens must be in [0, {vocab})")
+        bias = request.sampling.logit_bias or {}
+        if any(not (0 <= t < vocab) for t in bias):
+            raise InvalidRequest(f"logit_bias token ids must be in [0, {vocab})")
+        for seq in request.stop_sequences:
+            if any(not (0 <= t < vocab) for t in seq):
+                raise InvalidRequest(f"stop sequence token ids must be in [0, {vocab})")
 
     def _request_cancel(self, request_id: str) -> None:
         with self._lock:
@@ -175,20 +325,30 @@ class Engine:
                 else 0.0
             ),
             "in_flight": len(self._live),
-            "queued": self._inbox.qsize(),
+            "queued": self.waiting,
+            "max_queued": self.max_queued,
+            "rejected_queue_full": self._rejected_queue_full,
             "last_step_age_s": (
                 round(time.monotonic() - self._last_step, 3)
                 if self._last_step
                 else None
             ),
             "counters": counters,
-            "batching": dict(self._gen_args),
+            "batching": dict(self.batching),
+            # What the generator wired at start (None on a device without a
+            # recommended working set) and what it found before.
+            "wired_limit": {
+                "recommended": mx.device_info().get("max_recommended_working_set_size"),
+                "before": getattr(gen, "_old_wired_limit", None),
+            },
+            "max_context": self.max_context,
             "kv": {
                 "policy": self.kv_policy.describe(),
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
             },
-            "prefix_store": self.prefix_store.describe(),
+            "prompt_cache": self.prefix_store.describe(),
+            "sampling": self._samplers.describe(),
         }
 
     # -- the worker -------------------------------------------------------
@@ -200,8 +360,12 @@ class Engine:
             self._error = e
             traceback.print_exc()
             self._fail_everything(e)
+        else:
+            self._fail_everything(RuntimeError("engine stopped"))
 
     def _fail_everything(self, error: BaseException) -> None:
+        with self._lock:
+            self._dead = True
         dead = EngineDead(f"engine worker died: {error!r}")
         if self._admitting is not None:
             self._admitting.put(dead)
@@ -210,6 +374,8 @@ class Engine:
             stream.put(dead)
         self._live.clear()
         self._bookkeeping.clear()
+        self._stride.clear()
+        self._budgets.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -241,13 +407,23 @@ class Engine:
                 start = c
             segments.append(rest[start:])
             stop = StopSequences(req.stop_sequences or None)
+            processors = _logits_processors(req.sampling)
+            thinking = None
+            if req.reasoning is not None:
+                # The tracker always runs, for the flags; it touches the
+                # logits only when there is a budget to enforce.
+                thinking = ThinkingBudget(
+                    replace(req.reasoning, max_tokens=stream.reasoning_cap)
+                )
+                if stream.reasoning_cap is not None:
+                    processors = [*processors, thinking]
             (uid,) = gen.insert_segments(
                 segments=[segments],
-                max_tokens=[req.max_tokens],
+                max_tokens=[stream.completion_cap],
                 caches=[cache],
                 all_tokens=[list(req.tokens[:covered])],
-                samplers=[_sampler(req.sampling)],
-                logits_processors=[_logits_processors(req.sampling)],
+                samplers=[self._samplers.get(req.sampling)],
+                logits_processors=[processors],
                 stop_sequences=[stop],
             )
         except Exception as e:  # noqa: BLE001 - one bad request, not the worker
@@ -258,6 +434,21 @@ class Engine:
         self._live[uid] = stream
         self._bookkeeping[uid] = (covered, dict(carried))
         self._stride[uid] = []
+        if thinking is not None:
+            self._budgets[uid] = thinking
+        if self._prompt_cache_bytes:
+            # Stored prefixes yield to the caches of running requests.
+            room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
+            self.prefix_store.trim_to_bytes(room)
+            if room < 0 and time.monotonic() - self._budget_warned_at > 60:
+                self._budget_warned_at = time.monotonic()
+                logger.warning(
+                    "prompt cache budget %d bytes is below the caches of the "
+                    "running requests (%d bytes): nothing can be stored until "
+                    "they finish",
+                    self._prompt_cache_bytes,
+                    gen.prompt_cache_nbytes,
+                )
 
     def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
         """Snapshot the recurrent layers of one sequence at a boundary."""
@@ -272,7 +463,15 @@ class Engine:
         rec = recurrent_layers(caches)
         if not rec:
             return
-        snap = {i: caches[i].extract(idx).cache for i in rec}
+        # extract() slices the batch buffers; own the bytes, or every
+        # snapshot pins a whole batch array per layer.
+        snap = {
+            i: [
+                None if a is None else mx.contiguous(a)
+                for a in caches[i].extract(idx).cache
+            ]
+            for i in rec
+        }
         for arrays in snap.values():
             mx.eval(*[a for a in arrays if a is not None])
         self._bookkeeping[uid][1][position] = snap
@@ -318,6 +517,7 @@ class Engine:
             self._live.pop(u).put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
+            self._budgets.pop(u, None)
             got = partial.get(u)
             if got is None:
                 continue
@@ -399,19 +599,19 @@ class Engine:
                     s = self._live.get(r.uid)
                     if s is None:
                         continue
-                    s.put(
-                        TokenEvent(
-                            token=r.token,
-                            logprob=float(r.logprobs[r.token].item()),
-                            finish_reason=r.finish_reason,
-                        )
-                    )
                     if r.finish_reason is not None:
-                        del self._live[r.uid]
+                        # Store first: when the caller sees the last token,
+                        # the next request can already find the entry. The
+                        # stream stays in _live until it has the token, so a
+                        # failing store still reaches it as EngineDead.
                         _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
                         self._stride.pop(r.uid, None)
+                        for i in recurrent_layers(r.prompt_cache):
+                            r.prompt_cache[i].cache = [
+                                None if a is None else mx.contiguous(a)
+                                for a in r.prompt_cache[i].cache
+                            ]
                         tokens = list(r.all_tokens)
-                        system_end = s.request.system_end
                         self.prefix_store.insert(
                             self.model_key,
                             tokens,
@@ -419,7 +619,7 @@ class Engine:
                             checkpoints=checkpoints,
                             cache_type="assistant",
                         )
-                        if system_end:
+                        if s.request.system_end:
                             # The system block as its own entry: evicted after
                             # every conversation, so the expensive prefix
                             # survives a full turnover of the store.
@@ -428,8 +628,33 @@ class Engine:
                                 tokens,
                                 r.prompt_cache,
                                 checkpoints,
-                                system_end,
+                                s.request.system_end,
                             )
+                    thinking = self._budgets.get(r.uid)
+                    if thinking is not None:
+                        thinking.observe(r.token, r.finish_reason)
+                    cut = r.finish_reason == "length"
+                    s.put(
+                        TokenEvent(
+                            token=r.token,
+                            logprob=float(r.logprobs[r.token].item()),
+                            finish_reason=r.finish_reason,
+                            top_logprobs=(
+                                top_logprobs(r.logprobs, s.request.top_logprobs)
+                                if s.request.top_logprobs
+                                else None
+                            ),
+                            thinking_truncated=(
+                                thinking is not None and thinking.thinking_truncated
+                            ),
+                            response_truncated=cut
+                            and (thinking is None or not thinking.in_reasoning),
+                            forced=thinking is not None and thinking.last_forced,
+                        )
+                    )
+                    if r.finish_reason is not None:
+                        del self._live[r.uid]
+                        self._budgets.pop(r.uid, None)
         finally:
             gen.close()
             self._gen = None

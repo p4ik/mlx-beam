@@ -31,8 +31,9 @@ def test_chat_request_defaults_and_limits():
     req = chat.parse_chat_request(
         {"messages": [{"role": "user", "content": "w1"}]}, "m"
     )
-    assert req.max_tokens == chat.DEFAULT_MAX_TOKENS and req.model == "m"
-    assert req.sampling.temperature == 1.0 and req.sampling.top_p == 1.0
+    assert req.max_tokens == chat.DEFAULTS.max_completion_tokens and req.model == "m"
+    # mlx-lm's defaults: greedy unless the client or a flag says otherwise.
+    assert req.sampling.temperature == 0.0 and req.sampling.top_p == 1.0
     req = chat.parse_chat_request(
         {
             "messages": [{"role": "user", "content": "w1"}],
@@ -58,7 +59,14 @@ def test_chat_request_defaults_and_limits():
             "temperature",
         ),
         ({"messages": [{"role": "user", "content": "x"}], "n": 2}, "n"),
-        ({"messages": [{"role": "user", "content": "x"}], "seed": 1}, "seed"),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "top_logprobs": 2},
+            "top_logprobs",
+        ),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "xtc_threshold": 0.7},
+            "xtc_threshold",
+        ),
         ({"messages": [{"role": "user", "content": "x"}], "stop": 3}, "stop"),
     ],
 )
@@ -238,3 +246,360 @@ def test_responses_stream_events():
     assert types[0] == "response.created" and types[-1] == "response.completed"
     assert types.count("response.output_text.delta") == 2
     assert evs[-1]["response"]["output"][0]["content"][0]["text"] == "w10 w11 "
+
+
+def test_text_level_stop_word_ends_the_stream():
+    # The engine matches stop words on token ids; the text match catches a
+    # word whose tokenization differs and ends the stream instead of hiding it.
+    tok = StubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=["w11"])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (10, 11, 12)]
+    assert deltas[0].content == "w10 "
+    assert deltas[1].finish_reason == "stop" and deltas[1].content == ""
+    assert asm.stopped and deltas[2].empty() and deltas[2].finish_reason is None
+
+
+def test_non_finite_numbers_are_rejected():
+    with pytest.raises(ApiError) as exc:
+        chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "temperature": float("nan"),
+            },
+            "m",
+        )
+    assert exc.value.param == "temperature"
+
+
+def test_responses_stream_has_the_item_and_part_events():
+    tok = StubTokenizer()
+    req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
+    gen = responses.to_generation_request(tok, req)
+    evs = list(
+        responses.ResponsesResponder(tok, req, gen.tokens).stream(
+            events([THINK_START, 10, THINK_END, 11, TOOL_START, 20, 21, TOOL_END]), 0
+        )
+    )
+    types = [e["type"] for e in evs]
+    for needed in (
+        "response.in_progress",
+        "response.reasoning_text.delta",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.content_part.done",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ):
+        assert needed in types, needed
+    final = evs[-1]["response"]
+    assert [i["type"] for i in final["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert [e["sequence_number"] for e in evs] == list(range(1, len(evs) + 1))
+
+
+def test_reasoning_tokens_are_counted():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(
+        events([THINK_START, 10, 11, THINK_END, 12]), cached=0
+    )
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
+    assert out["choices"][0]["message"]["reasoning"] == "w10 w11 "
+
+
+def test_stop_word_inside_the_last_token_keeps_nothing_behind_it():
+    # finish_reason "length" flushes the buffer - but not the tail behind a
+    # stop word that already matched.
+    tok = StubTokenizer()
+    tok._words[1] = "hello STOPtail"
+    asm = TextAssembler(tok, prompt_tokens=[2], stop_words=["STOP"])
+    d = asm.feed(TokenEvent(1, -0.1, "length"))
+    assert d.content == "hello " and d.finish_reason == "stop"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("kind", ["chat", "completions", "responses"])
+def test_responders_stop_reading_after_a_text_level_stop(kind, streaming):
+    tok = StubTokenizer()
+    tok._words[1] = "hello STOPtail"
+    seen = []
+
+    def engine_events():
+        for i in range(4):
+            seen.append(i)
+            yield TokenEvent(1 if i == 0 else 3, -0.1, "length" if i == 3 else None)
+
+    if kind == "chat":
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w2"}],
+                "stop": "STOP",
+                "stream": streaming,
+            },
+            "m",
+        )
+        responder = chat.ChatResponder(tok, req, [2])
+    elif kind == "completions":
+        req = completions.parse_completion_request(
+            {"prompt": [2], "stop": "STOP", "stream": streaming}, "m"
+        )
+        responder = completions.CompletionResponder(tok, req, [2])
+    else:
+        req = responses.parse_responses_request(
+            {"input": "w2", "stream": streaming}, "m"
+        )
+        responder = responses.ResponsesResponder(tok, req, [2])
+        # Responses has no stop words; end the stream with the assembler's own
+        # stop instead so the loop behaviour is what is tested.
+        responder.assembler = TextAssembler(tok, prompt_tokens=[2], stop_words=["STOP"])
+    if streaming:
+        list(responder.stream(engine_events(), 0))
+    else:
+        responder.complete(engine_events(), 0)
+    assert seen == [0], seen
+
+
+@pytest.mark.parametrize(
+    "field, keys",
+    [
+        ("reasoning", ["reasoning"]),
+        ("reasoning_content", ["reasoning_content"]),
+        ("both", ["reasoning", "reasoning_content"]),
+    ],
+)
+def test_reasoning_field_names_the_thinking(field, keys):
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field=field).complete(
+        events([THINK_START, 10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "w11 "
+    assert {k: v for k, v in msg.items() if k.startswith("reasoning")} == {
+        k: "w10 " for k in keys
+    }
+    req.stream = True
+    chunks = list(
+        chat.ChatResponder(tok, req, gen.tokens, reasoning_field=field).stream(
+            events([THINK_START, 10, THINK_END, 11]), cached=0
+        )
+    )
+    first = chunks[0]["choices"][0]["delta"]
+    assert all(first[k] == "w10 " for k in keys) and "content" not in first
+
+
+def test_reasoning_field_none_leaves_the_markers_in_the_content():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        events([THINK_START, 10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "<think>w10 </think>w11 "
+    assert not any(k.startswith("reasoning") for k in msg)
+    # The automaton runs in every mode; only the routing follows the switch.
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 2
+    with pytest.raises(ValueError):
+        chat.ChatResponder(tok, req, gen.tokens, reasoning_field="thoughts")
+
+
+def test_reasoning_field_none_shows_a_think_block_the_prompt_opened():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    # Qwen-style: the template ends the prompt with the open marker, the
+    # model never emits it, so a client parsing the text would miss it.
+    prompt = chat.to_generation_request(tok, req).tokens + [THINK_START]
+    out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
+        events([10, THINK_END, 11]), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think>w10 </think>w11 "
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 1
+    req.stream = True
+    chunks = list(
+        chat.ChatResponder(tok, req, prompt, reasoning_field="none").stream(
+            events([10, THINK_END, 11]), cached=0
+        )
+    )
+    assert chunks[0]["choices"][0]["delta"]["content"] == "<think>w10 "
+    # The block closes on the very first token: the opener still goes first.
+    out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
+        events([THINK_END, 11]), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think></think>w11 "
+    # Routed, the same prompt yields the reasoning field, no marker anywhere.
+    out = chat.ChatResponder(tok, req, prompt).complete(
+        events([10, THINK_END, 11]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["reasoning"] == "w10 " and msg["content"] == "w11 "
+
+
+def test_request_defaults_precedence(tmp_path):
+    from mlx_beam.api.defaults import RequestDefaults
+
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "do_sample": true}'
+    )
+    d = RequestDefaults.resolve(tmp_path, flags={"top_p": 0.95, "temp": None})
+    assert (d.temperature, d.top_p, d.top_k, d.min_p) == (0.7, 0.95, 20, 0.0)
+    assert d.sources["temperature"] == "generation_config.json"
+    assert d.sources["top_p"] == "flag" and d.sources["min_p"] == "mlx-lm"
+    # A request still wins over every server-side default.
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "temperature": 0.1},
+        "m",
+        d,
+    )
+    assert req.sampling.temperature == 0.1 and req.sampling.top_p == 0.95
+    # do_sample false is the author saying greedy, whatever temperature says.
+    (tmp_path / "generation_config.json").write_text(
+        '{"temperature": 0.7, "do_sample": false}'
+    )
+    assert RequestDefaults.resolve(tmp_path).temperature == 0.0
+    # No file, no flags: mlx-lm's numbers.
+    assert RequestDefaults.resolve(tmp_path / "missing").describe()["top_k"] == {
+        "value": 0,
+        "source": "mlx-lm",
+    }
+
+
+def test_seed_and_xtc_reach_the_engine_request():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "seed": 42,
+            "xtc_probability": 0.5,
+            "presence_penalty": 0.5,
+            "presence_context_size": 7,
+        },
+        "m",
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert gen.sampling.seed == 42 and gen.sampling.presence_context_size == 7
+    # XTC may not cut the eos or the newline; the tokenizer says which ids.
+    assert EOS in gen.sampling.xtc_special_tokens
+    plain = chat.to_generation_request(
+        tok, chat.parse_chat_request({"messages": req.messages}, "m")
+    )
+    assert plain.sampling.xtc_special_tokens == () and plain.sampling.seed is None
+
+
+def test_chat_logprobs_carry_text_bytes_and_alternatives():
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "top_logprobs": 2,
+        },
+        "m",
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert gen.top_logprobs == 2
+    evs = [
+        TokenEvent(10, -0.1, None, ((10, -0.1), (11, -2.5))),
+        TokenEvent(11, -0.3, None, ((11, -0.3), (10, -1.0))),
+        TokenEvent(EOS, -0.1, "stop", ((EOS, -0.1), (10, -3.0))),
+    ]
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    content = out["choices"][0]["logprobs"]["content"]
+    assert [c["token"] for c in content] == ["w10 ", "w11 ", tok.decode([EOS])]
+    assert content[0]["bytes"] == list(b"w10 ")
+    assert [t["token"] for t in content[0]["top_logprobs"]] == ["w10 ", "w11 "]
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
+    streamed = [c for ch in chunks for c in ch["choices"][0]["logprobs"]["content"]]
+    assert [c["token"] for c in streamed] == [c["token"] for c in content]
+    # Without the flag the field stays away entirely.
+    req.logprobs = False
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    assert "logprobs" not in out["choices"][0]
+
+
+def test_completions_logprobs_use_the_legacy_columns():
+    tok = StubTokenizer()
+    req = completions.parse_completion_request(
+        {"prompt": "w1", "logprobs": 1, "max_tokens": 2}, "m"
+    )
+    gen = completions.to_generation_request(tok, req)
+    assert gen.top_logprobs == 1
+    evs = [
+        TokenEvent(10, -0.1, None, ((10, -0.1),)),
+        TokenEvent(11, -0.3, "length", ((12, -0.2),)),
+    ]
+    out = completions.CompletionResponder(tok, req, gen.tokens).complete(iter(evs), 0)
+    lp = out["choices"][0]["logprobs"]
+    assert lp["tokens"] == ["w10 ", "w11 "] and lp["token_logprobs"] == [-0.1, -0.3]
+    assert lp["top_logprobs"] == [{"w10 ": -0.1}, {"w12 ": -0.2}]
+    assert lp["text_offset"] == [0, 4]
+    with pytest.raises(ApiError):
+        completions.parse_completion_request({"prompt": "w1", "logprobs": 21}, "m")
+
+
+def test_server_template_args_are_overridden_by_the_request():
+    from mlx_beam.api.defaults import RequestDefaults
+
+    d = RequestDefaults.resolve(
+        flags={"chat_template_args": {"enable_thinking": False, "lang": "de"}}
+    )
+    msgs = [{"role": "user", "content": "w1"}]
+    req = chat.parse_chat_request({"messages": msgs}, "m", d)
+    assert req.template_kwargs == {"enable_thinking": False, "lang": "de"}
+    req = chat.parse_chat_request(
+        {"messages": msgs, "chat_template_kwargs": {"enable_thinking": True}}, "m", d
+    )
+    assert req.template_kwargs == {"enable_thinking": True, "lang": "de"}
+    # A plain server keeps sending nothing extra.
+    assert chat.parse_chat_request({"messages": msgs}, "m").template_kwargs == {}
+
+
+def test_forced_close_drops_the_half_character_the_cut_left():
+    # A byte-level tokenizer cut mid-character flushes the fragment as U+FFFD
+    # together with the first forced token; the stub plays that token.
+    tok = StubTokenizer()
+    tok._words[40] = "�\n"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    evs = [
+        TokenEvent(THINK_START, -0.1),
+        TokenEvent(10, -0.1),
+        TokenEvent(40, 0.0, forced=True),
+        TokenEvent(THINK_END, 0.0, forced=True),
+        TokenEvent(11, -0.1),
+        TokenEvent(EOS, -0.1, "stop"),
+    ]
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    msg = out["choices"][0]["message"]
+    assert msg["reasoning"] == "w10 \n" and msg["content"] == "w11 "
+    # Streamed, the fragment never reaches the wire either.
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
+    joined = "".join(c["choices"][0]["delta"].get("reasoning", "") for c in chunks)
+    assert joined == "w10 \n"
+    # In none mode the same text sits in the content, markers and all.
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        iter(evs), cached=0
+    )
+    assert out["choices"][0]["message"]["content"] == "<think>w10 \n</think>w11 "
+    # The model's own U+FFFD, not forced, is left alone.
+    evs[2] = TokenEvent(40, -0.1)
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
+    assert out["choices"][0]["message"]["reasoning"] == "w10 �\n"

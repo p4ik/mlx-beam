@@ -66,7 +66,7 @@ def test_prompt_cache_is_reused():
     prompt = list(range(1, 20))
     with Engine(model) as engine:
         first = collect(engine.submit(GenerationRequest(prompt, max_tokens=4)))
-        assert engine.health()["prefix_store"]["entries"] == 1
+        assert engine.health()["prompt_cache"]["entries"] == 1
         again = engine.submit(GenerationRequest(prompt, max_tokens=4))
         assert collect(again) == first
         assert again.prompt_cached >= len(prompt) - 1
@@ -148,7 +148,7 @@ def test_sampling_with_temperature_runs():
 
 def test_submissions_from_many_threads():
     model = tiny_hybrid()
-    with Engine(model, completion_batch_size=8, prefill_batch_size=4) as engine:
+    with Engine(model, decode_concurrency=8, prompt_concurrency=4) as engine:
         results = {}
 
         def run(i):
@@ -161,3 +161,111 @@ def test_submissions_from_many_threads():
             t.join(30)
         assert sorted(results) == list(range(6))
         assert all(len(v) == 4 for v in results.values())
+
+
+def test_stored_prefixes_yield_to_running_requests():
+    from mlx_beam.engine import ContextTooLong
+
+    model = tiny_llama()
+    with Engine(model, prompt_cache_bytes=1) as engine:
+        collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
+        # One byte of budget: the store cannot keep anything once a request runs.
+        collect(engine.submit(GenerationRequest([4, 5, 6], max_tokens=2)))
+        assert engine.health()["prompt_cache"]["entries"] <= 1
+    with Engine(model, max_context=8) as engine:
+        # A large client limit is served and capped at what the context holds.
+        out = collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=6)))
+        assert len(out) == 5
+        # Only a reserve the context cannot hold is refused.
+        with pytest.raises(ContextTooLong):
+            engine.submit(
+                GenerationRequest([1, 2, 3], max_tokens=6, min_response_tokens=6)
+            )
+        with pytest.raises(ContextTooLong):
+            engine.submit(GenerationRequest([1, 2, 3, 4, 5, 6, 7, 8], max_tokens=1))
+        assert engine.health()["max_context"] == 8
+
+
+def test_short_request_is_not_stuck_behind_a_long_prefill():
+    # The claim on the site: a short request beside a long prefill answers in
+    # a fraction of that prefill. Rule 2 of the scheduler (slice width).
+    import random
+
+    from mlx_beam._vendor.mlx_lm.models import llama
+
+    mx.random.seed(0)
+    cfg = dict(
+        model_type="llama",
+        hidden_size=256,
+        num_hidden_layers=4,
+        intermediate_size=512,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+        head_dim=64,
+        max_position_embeddings=4096,
+    )
+    model = llama.Model(llama.ModelArgs(**cfg))
+    mx.eval(model.parameters())
+    rng = random.Random(1)
+
+    def long_prompt():
+        return [rng.randint(1, 60) for _ in range(1500)]
+
+    def ttft(engine, toks):
+        t0 = time.monotonic()
+        stream = engine.submit(GenerationRequest(toks, max_tokens=1))
+        next(iter(stream))
+        return time.monotonic() - t0
+
+    with Engine(model, prefill_slice=64, prompt_cache_size=0) as engine:
+        solo_long = ttft(engine, long_prompt())
+        result = {}
+        prompt = long_prompt()
+        t = threading.Thread(target=lambda: result.update(long=ttft(engine, prompt)))
+        t.start()
+        time.sleep(min(0.15, solo_long / 10))
+        short = ttft(engine, [7, 11, 13, 17])
+        t.join()
+    assert short < 0.5 * solo_long, (short, solo_long)
+    assert result["long"] < 2.0 * solo_long, (result["long"], solo_long)
+
+
+def test_a_failing_store_reaches_the_finishing_stream():
+    # The store runs before the last token is delivered; if it raises, the
+    # worker dies and that stream must hear about it, not wait forever.
+    model = tiny_llama()
+    with Engine(model) as engine:
+
+        def boom(*args, **kwargs):
+            raise MemoryError("no room for the entry")
+
+        engine.prefix_store.insert = boom
+        stream = engine.submit(GenerationRequest([1, 2, 3], max_tokens=1))
+        with pytest.raises(EngineDead, match="no room"):
+            for _ in stream:
+                pass
+        assert not engine.alive
+
+
+def test_max_queued_refuses_the_overflow_with_a_count():
+    from mlx_beam.engine import QueueFull
+
+    model = tiny_hybrid()
+    # One sequence decodes at a time, so the rest wait in the backlog.
+    with Engine(
+        model, max_queued=2, decode_concurrency=1, prompt_concurrency=1
+    ) as engine:
+        streams = [
+            engine.submit(GenerationRequest([3, 7, 11], max_tokens=40))
+            for _ in range(3)
+        ]
+        with pytest.raises(QueueFull) as exc:
+            engine.submit(GenerationRequest([5, 9], max_tokens=40))
+        assert "limit is 2" in str(exc.value)
+        assert engine.health()["rejected_queue_full"] == 1
+        for s in streams:
+            assert len(collect(s)) == 40
+        # The backlog drained: the next one is admitted again.
+        assert len(collect(engine.submit(GenerationRequest([5, 9], max_tokens=2)))) == 2

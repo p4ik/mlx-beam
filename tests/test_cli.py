@@ -103,3 +103,54 @@ def test_serve_kv_policy_from_arguments(tmp_path):
     assert policy.bits_for(3) == 8 and policy.bits_for(0) == 4
     with pytest.raises(SystemExit):
         main(["serve", "--kv-bits", "3", "--model", "x"])
+
+
+def serve_args(*argv):
+    import argparse
+
+    from mlx_beam.cli import add_serve_arguments
+
+    p = argparse.ArgumentParser()
+    add_serve_arguments(p)
+    return p.parse_args(["--model", "m", *argv])
+
+
+def test_serve_flags_carry_mlx_lm_names_and_units():
+    args = serve_args(
+        "--model-alias",
+        "alias",
+        "--prompt-cache-bytes",
+        "1073741824",
+        "--max-completion-tokens",
+        "64",
+        "--decode-concurrency",
+        "4",
+        "--allowed-origins",
+        "http://a",
+        "http://b",
+        "--chat-template-args",
+        '{"enable_thinking": false}',
+    )
+    assert args.model_alias == "alias" and args.prompt_cache_bytes == 2**30
+    assert args.max_completion_tokens == 64 and args.decode_concurrency == 4
+    assert args.allowed_origins == ["http://a", "http://b"]
+    assert args.chat_template_args == {"enable_thinking": False}
+    assert serve_args().allowed_origins == ["*"] and serve_args().temp is None
+    with pytest.raises(SystemExit):
+        serve_args("--chat-template-args", "[1]")
+    with pytest.raises(SystemExit):
+        serve_args("--served-name", "x")
+
+
+def test_chat_template_flag_takes_text_or_a_file(tmp_path):
+    from mlx_beam.cli import chat_template_from_args
+
+    path = tmp_path / "t.jinja"
+    path.write_text("{{ messages }}")
+    assert chat_template_from_args(serve_args("--chat-template", str(path))) == (
+        "{{ messages }}"
+    )
+    assert (
+        chat_template_from_args(serve_args("--chat-template", "{{ x }}")) == "{{ x }}"
+    )
+    assert chat_template_from_args(serve_args()) is None

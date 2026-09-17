@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, missing_extra, unsupported
-from mlx_beam.api.text import TextAssembler, TextDelta, stop_sequence_ids
+from mlx_beam.api.reasoning import (
+    effort_candidates,
+    is_effort_rejection,
+    map_effort,
+    mirror_reasoning,
+    read_aliases,
+    renderer_reasoning_keys,
+)
+from mlx_beam.api.text import (
+    TextAssembler,
+    TextDelta,
+    initial_state,
+    logprob_entry,
+    stop_sequence_ids,
+    xtc_special_ids,
+)
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
+from mlx_beam.engine.thinking import ReasoningLimits, budget, close_tail
 
-DEFAULT_MAX_TOKENS = 512
+# What a parser falls back to when no server defaults are handed in (tests).
+DEFAULTS = RequestDefaults()
 
 
 @dataclass
@@ -25,8 +44,14 @@ class ChatRequest:
     stop: list[str] = field(default_factory=list)
     tools: list[dict] | None = None
     logprobs: bool = False
+    top_logprobs: int = 0
     stream_usage: bool = False
+    # The template level (low, medium, xhigh) or None: off or not asked.
     reasoning_effort: str | None = None
+    # Decoder limits the request set; None means the server's value.
+    max_reasoning_tokens: int | None = None
+    min_response_tokens: int | None = None
+    max_prompt_tokens: int | None = None
     template_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
@@ -34,15 +59,19 @@ def _number(body, key, default, lo=None, hi=None, kind=float):
     value = body.get(key, default)
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ApiError(f"{key} must be a number", param=key)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ApiError(f"{key} must be a finite number", param=key)
     value = kind(value)
     if (lo is not None and value < lo) or (hi is not None and value > hi):
         raise ApiError(f"{key} must be between {lo} and {hi}", param=key)
     return value
 
 
-def parse_sampling(body: dict) -> SamplingParams:
+def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> SamplingParams:
     logit_bias = body.get("logit_bias")
     if logit_bias:
         try:
@@ -51,23 +80,42 @@ def parse_sampling(body: dict) -> SamplingParams:
             raise ApiError(
                 "logit_bias must map token ids to numbers", param="logit_bias"
             ) from None
-    penalty = _number(body, "repetition_penalty", None, 0.0)
-    presence = _number(body, "presence_penalty", 0.0, -2.0, 2.0)
-    frequency = _number(body, "frequency_penalty", 0.0, -2.0, 2.0)
+    d = defaults
+    penalty = _number(body, "repetition_penalty", d.repetition_penalty, 0.0)
+    presence = _number(body, "presence_penalty", d.presence_penalty or 0.0, -2.0, 2.0)
+    frequency = _number(
+        body, "frequency_penalty", d.frequency_penalty or 0.0, -2.0, 2.0
+    )
     return SamplingParams(
-        temperature=_number(body, "temperature", 1.0, 0.0, 2.0),
-        top_p=_number(body, "top_p", 1.0, 0.0, 1.0),
+        temperature=_number(body, "temperature", d.temperature, 0.0, 2.0),
+        top_p=_number(body, "top_p", d.top_p, 0.0, 1.0),
         # -1 and 0 both mean "off" (the vLLM and HF convention).
-        top_k=max(0, _number(body, "top_k", 0, -1, None, int)),
-        min_p=_number(body, "min_p", 0.0, 0.0, 1.0),
+        top_k=max(0, _number(body, "top_k", d.top_k, -1, None, int)),
+        min_p=_number(body, "min_p", d.min_p, 0.0, 1.0),
+        min_tokens_to_keep=_number(body, "min_tokens_to_keep", 1, 1, None, int),
+        xtc_probability=_number(body, "xtc_probability", 0.0, 0.0, 1.0),
+        xtc_threshold=_number(body, "xtc_threshold", 0.1, 0.0, 0.5),
         repetition_penalty=penalty if penalty not in (None, 1.0) else None,
         repetition_context_size=_number(
             body, "repetition_context_size", 20, 1, None, int
         ),
         presence_penalty=presence or None,
+        presence_context_size=_number(body, "presence_context_size", 20, 1, None, int),
         frequency_penalty=frequency or None,
+        frequency_context_size=_number(
+            body, "frequency_context_size", 20, 1, None, int
+        ),
         logit_bias=logit_bias or None,
+        seed=_number(body, "seed", None, 0, 2**63 - 1, int),
     )
+
+
+def parse_top_logprobs(body: dict) -> int:
+    """OpenAI's shape: ``logprobs: true`` plus ``top_logprobs: 0..20``."""
+    n = _number(body, "top_logprobs", 0, 0, 20, int)
+    if n and not body.get("logprobs"):
+        raise ApiError("top_logprobs needs logprobs: true", param="top_logprobs")
+    return n
 
 
 def parse_stop(body: dict) -> list[str]:
@@ -85,9 +133,6 @@ def _reject_unsupported(body: dict) -> None:
     n = body.get("n", 1)
     if n not in (None, 1):
         raise unsupported("n > 1", "n")
-    if body.get("seed") is not None:
-        # Sequences share a batch; a per-request seed cannot be honoured.
-        raise unsupported("seed", "seed")
     rf = body.get("response_format")
     if rf and rf.get("type") not in (None, "text"):
         raise missing_extra("response_format", "structured")
@@ -126,13 +171,16 @@ def _normalise_messages(messages: Any) -> list[dict]:
     return out
 
 
-def parse_chat_request(body: dict, default_model: str) -> ChatRequest:
+def parse_chat_request(
+    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+) -> ChatRequest:
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     _reject_unsupported(body)
+    # max_tokens is OpenAI's old name; it is accepted here and nowhere else.
     max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
     max_tokens = (
-        DEFAULT_MAX_TOKENS
+        defaults.max_completion_tokens
         if max_tokens is None
         else _number(body, "max_completion_tokens", max_tokens, 1, None, int)
     )
@@ -144,35 +192,95 @@ def parse_chat_request(body: dict, default_model: str) -> ChatRequest:
             raise ApiError("tools must be a list of function tools", param="tools")
         if body.get("tool_choice") == "none":
             tools = None
-    template_kwargs = dict(body.get("chat_template_kwargs") or {})
-    effort = body.get("reasoning_effort")
-    if effort == "none":
-        template_kwargs.setdefault("enable_thinking", False)
+    # Server defaults, then what the request says through its aliases, then
+    # an explicit chat_template_kwargs on top of everything.
+    template_kwargs = dict(defaults.chat_template_args)
+    aliases = read_aliases(body)
+    level, thinking = parse_thinking(aliases)
+    if thinking is not None:
+        template_kwargs["enable_thinking"] = thinking
+    if level is not None:
+        template_kwargs["reasoning_effort"] = level
+    template_kwargs.update(body.get("chat_template_kwargs") or {})
     stream_opts = body.get("stream_options") or {}
     return ChatRequest(
         messages=_normalise_messages(body.get("messages")),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
-        sampling=parse_sampling(body),
+        sampling=parse_sampling(body, defaults),
         stream=bool(body.get("stream", False)),
         stop=parse_stop(body),
         tools=tools,
         logprobs=bool(body.get("logprobs", False)),
+        top_logprobs=parse_top_logprobs(body),
         stream_usage=bool(stream_opts.get("include_usage", False)),
-        reasoning_effort=effort,
+        reasoning_effort=level,
+        max_reasoning_tokens=_number(
+            aliases, "max_reasoning_tokens", None, 0, None, int
+        ),
+        min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
+        max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
     )
+
+
+def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
+    """(template level, enable_thinking) from the resolved aliases: an effort
+    of none switches thinking off, a level asks for it."""
+    thinking = aliases.get("enable_thinking")
+    if "reasoning_effort" not in aliases:
+        return None, thinking
+    level = map_effort(aliases["reasoning_effort"])
+    if level is None:
+        return None, False if thinking is None else thinking
+    return level, thinking
 
 
 def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     if not getattr(tokenizer, "has_chat_template", True):
         raise ApiError("this model has no chat template; use /v1/completions")
+    mirror_reasoning(req.messages, renderer_reasoning_keys(tokenizer))
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    tokens = tokenizer.apply_chat_template(
-        req.messages, add_generation_prompt=True, tokenize=True, **kwargs
-    )
+
+    def render(**extra):
+        return tokenizer.apply_chat_template(
+            req.messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            **{**kwargs, **extra},
+        )
+
+    level = kwargs.get("reasoning_effort")
+    try:
+        tokens = render()
+    except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
+        if not (level and is_effort_rejection(e)):
+            raise ApiError(
+                f"the chat template rejected the messages: {e}", param="messages"
+            ) from None
+        # The template knows the levels but not this name: climb the ladder
+        # and remember the rung that rendered, so every re-render agrees.
+        tokens = None
+        for candidate in effort_candidates(level)[1:]:
+            try:
+                tokens = render(reasoning_effort=candidate)
+            except Exception as e2:  # noqa: BLE001
+                if not is_effort_rejection(e2):
+                    raise ApiError(
+                        f"the chat template rejected the messages: {e2}",
+                        param="messages",
+                    ) from None
+                continue
+            req.template_kwargs["reasoning_effort"] = candidate
+            break
+        if tokens is None:
+            raise ApiError(
+                f"the chat template accepts none of the reasoning_effort levels "
+                f"{', '.join(effort_candidates(level))}: {e}",
+                param="reasoning_effort",
+            ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
     return list(tokens)
@@ -245,43 +353,147 @@ def boundaries_and_system_end(
     return bounds, system_end
 
 
-def to_generation_request(tokenizer, req: ChatRequest) -> GenerationRequest:
+def to_generation_request(
+    tokenizer,
+    req: ChatRequest,
+    defaults: RequestDefaults = DEFAULTS,
+    max_context: int | None = None,
+) -> GenerationRequest:
     prompt = build_prompt(tokenizer, req)
+    min_response = (
+        defaults.min_response_tokens
+        if req.min_response_tokens is None
+        else req.min_response_tokens
+    )
+    max_reasoning = (
+        defaults.max_reasoning_tokens
+        if req.max_reasoning_tokens is None
+        else req.max_reasoning_tokens
+    )
+    completion_cap, reasoning_cap = budget(
+        max_context, len(prompt), req.max_tokens, min_response
+    )
+    markers = reasoning_limits(tokenizer, prompt, None)
+    if reasoning_cap is not None and markers is not None:
+        reasoning_cap = max(0, reasoning_cap - close_tail(markers))
+    bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
+    limit = min(bounded) if bounded else None
+    if limit == 0 and getattr(tokenizer, "has_thinking", False):
+        # No room to think: ask the template to leave the block out, which
+        # a Qwen template does; then check whether it did.
+        if req.template_kwargs.get("enable_thinking") is not False:
+            req.template_kwargs["enable_thinking"] = False
+            prompt = build_prompt(tokenizer, req)
+            completion_cap, _ = budget(
+                max_context, len(prompt), req.max_tokens, min_response
+            )
+        limits = reasoning_limits(tokenizer, prompt, 0)
+        if limits is not None and limits.seeded and len(limits.close) >= completion_cap:
+            raise ApiError(
+                "the prompt opens a think block the template cannot switch off; "
+                f"closing it takes {len(limits.close)} tokens, the request leaves "
+                f"{completion_cap} for the answer",
+                code="context_length_exceeded",
+            )
     bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
     return GenerationRequest(
         tokens=prompt,
         max_tokens=req.max_tokens,
-        sampling=req.sampling,
+        sampling=with_xtc_specials(tokenizer, req.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
         boundaries=bounds,
         system_end=system_end,
+        top_logprobs=req.top_logprobs if req.logprobs else 0,
+        min_response_tokens=min_response,
+        max_prompt_tokens=req.max_prompt_tokens,
+        reasoning=reasoning_limits(tokenizer, prompt, limit),
     )
 
 
-def _usage(prompt_tokens: int, completion_tokens: int, cached: int) -> dict:
+def reasoning_limits(
+    tokenizer, prompt: list[int], max_tokens: int | None
+) -> ReasoningLimits | None:
+    """The think markers as ids and the budget; None for a model without."""
+    if not getattr(tokenizer, "has_thinking", False):
+        return None
+    start = tuple(getattr(tokenizer, "think_start_tokens", None) or ())
+    end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
+    if not start or not end:
+        return None
+    newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
+    # Closed the way the models were trained to close: a line break, the
+    # marker, a blank line.
+    close = newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+    return ReasoningLimits(
+        start=start,
+        end=end,
+        close=close,
+        seeded=initial_state(tokenizer, prompt)[0] == "reasoning",
+        max_tokens=max_tokens,
+    )
+
+
+def with_xtc_specials(tokenizer, sampling: SamplingParams) -> SamplingParams:
+    if sampling.xtc_probability <= 0.0:
+        return sampling
+    return replace(sampling, xtc_special_tokens=xtc_special_ids(tokenizer))
+
+
+def _usage(prompt_tokens: int, assembler: TextAssembler, cached: int) -> dict:
     return {
         "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
+        "completion_tokens": assembler.tokens,
+        "total_tokens": prompt_tokens + assembler.tokens,
         "prompt_tokens_details": {"cached_tokens": cached},
+        "completion_tokens_details": completion_details(assembler),
     }
+
+
+def completion_details(assembler: TextAssembler) -> dict:
+    """OpenAI's reasoning_tokens plus which limit, if any, cut the output."""
+    return {
+        "reasoning_tokens": assembler.reasoning_tokens,
+        "thinking_truncated": assembler.thinking_truncated,
+        "response_truncated": assembler.response_truncated,
+    }
+
+
+# Where the thinking goes in a chat completion: the field name(s), or
+# "none" to leave the think markers in the content for the client to parse.
+REASONING_FIELDS = {
+    "reasoning": ("reasoning",),
+    "reasoning_content": ("reasoning_content",),
+    "both": ("reasoning", "reasoning_content"),
+    "none": (),
+}
 
 
 class ChatResponder:
     """Builds chat.completion objects (one, or a stream of chunks)."""
 
-    def __init__(self, tokenizer, req: ChatRequest, prompt_tokens: list[int]):
+    def __init__(
+        self,
+        tokenizer,
+        req: ChatRequest,
+        prompt_tokens: list[int],
+        reasoning_field: str = "reasoning",
+    ):
+        if reasoning_field not in REASONING_FIELDS:
+            raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
+        self._tokenizer = tokenizer
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self._sent_role = False
+        self._reasoning_keys = REASONING_FIELDS[reasoning_field]
         self.assembler = TextAssembler(
             tokenizer,
             prompt_tokens=prompt_tokens,
             stop_words=req.stop,
             tools=req.tools,
             streaming=req.stream,
+            route_thinking=reasoning_field != "none",
         )
 
     def _envelope(self, kind: str) -> dict:
@@ -295,7 +507,8 @@ class ChatResponder:
     def _message(self, d: TextDelta) -> dict:
         msg: dict[str, Any] = {"role": "assistant", "content": d.content or None}
         if d.reasoning:
-            msg["reasoning_content"] = d.reasoning
+            for key in self._reasoning_keys:
+                msg[key] = d.reasoning
         if d.tool_calls:
             msg["tool_calls"] = d.tool_calls
         return msg
@@ -305,19 +518,23 @@ class ChatResponder:
         if d.content:
             delta["content"] = d.content
         if d.reasoning:
-            delta["reasoning_content"] = d.reasoning
+            for key in self._reasoning_keys:
+                delta[key] = d.reasoning
         if d.tool_calls:
             delta["tool_calls"] = d.tool_calls
         if not self._sent_role:
             delta = {"role": "assistant", **delta}
             self._sent_role = True
         out = self._envelope("chat.completion.chunk")
-        out["choices"] = [
-            {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
-        ]
-        if final and self.req.stream_usage:
-            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+        choice = {"index": 0, "delta": delta, "finish_reason": d.finish_reason}
+        if self.req.logprobs:
+            choice["logprobs"] = self._logprobs()
+        out["choices"] = [choice]
         return out
+
+    def _logprobs(self) -> dict:
+        events, self.assembler.pending_events = self.assembler.pending_events, []
+        return {"content": [logprob_entry(self._tokenizer, e) for e in events]}
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         """Chunks as the tokens arrive; tool-call text is held until complete."""
@@ -326,10 +543,12 @@ class ChatResponder:
             if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
                 continue
             yield self.chunk(d, cached, final=d.finish_reason is not None)
+            if d.finish_reason is not None:
+                break  # a text-level stop ends before the engine does
         if self.req.stream_usage:
             out = self._envelope("chat.completion.chunk")
             out["choices"] = []
-            out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+            out["usage"] = _usage(self.prompt_len, self.assembler, cached)
             yield out
 
     def complete(self, events, cached: int) -> dict:
@@ -342,6 +561,7 @@ class ChatResponder:
             total.tool_calls += d.tool_calls
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
+                break
         out = self._envelope("chat.completion")
         choice: dict[str, Any] = {
             "index": 0,
@@ -349,14 +569,7 @@ class ChatResponder:
             "finish_reason": total.finish_reason or "stop",
         }
         if self.req.logprobs:
-            choice["logprobs"] = {
-                "content": [
-                    {"token": str(t), "logprob": lp}
-                    for t, lp in zip(
-                        self.assembler.token_ids, self.assembler.logprobs, strict=True
-                    )
-                ]
-            }
+            choice["logprobs"] = self._logprobs()
         out["choices"] = [choice]
-        out["usage"] = _usage(self.prompt_len, self.assembler.tokens, cached)
+        out["usage"] = _usage(self.prompt_len, self.assembler, cached)
         return out

@@ -8,9 +8,17 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from mlx_beam.api.chat import DEFAULT_MAX_TOKENS, _number, parse_sampling, parse_stop
+from mlx_beam.api.chat import (
+    DEFAULTS,
+    _number,
+    completion_details,
+    parse_sampling,
+    parse_stop,
+    with_xtc_specials,
+)
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError, unsupported
-from mlx_beam.api.text import TextAssembler, stop_sequence_ids
+from mlx_beam.api.text import TextAssembler, logprob_entry, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 
 
@@ -23,16 +31,20 @@ class CompletionRequest:
     stream: bool = False
     stop: list[str] = field(default_factory=list)
     echo: bool = False
+    # OpenAI's legacy shape: an integer, the number of alternatives per token.
+    logprobs: int | None = None
     stream_usage: bool = False
+    max_prompt_tokens: int | None = None
+    min_response_tokens: int | None = None
 
 
-def parse_completion_request(body: dict, default_model: str) -> CompletionRequest:
+def parse_completion_request(
+    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+) -> CompletionRequest:
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     if body.get("n", 1) not in (None, 1):
         raise unsupported("n > 1", "n")
-    if body.get("seed") is not None:
-        raise unsupported("seed", "seed")
     if body.get("best_of", 1) not in (None, 1):
         raise unsupported("best_of", "best_of")
     prompt = body.get("prompt")
@@ -45,12 +57,17 @@ def parse_completion_request(body: dict, default_model: str) -> CompletionReques
     return CompletionRequest(
         prompt=prompt,
         model=body.get("model") or default_model,
-        max_tokens=_number(body, "max_tokens", DEFAULT_MAX_TOKENS, 1, None, int),
-        sampling=parse_sampling(body),
+        max_tokens=_number(
+            body, "max_tokens", defaults.max_completion_tokens, 1, None, int
+        ),
+        sampling=parse_sampling(body, defaults),
         stream=bool(body.get("stream", False)),
         stop=parse_stop(body),
         echo=bool(body.get("echo", False)),
+        logprobs=_number(body, "logprobs", None, 0, 20, int),
         stream_usage=bool(stream_opts.get("include_usage", False)),
+        max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
+        min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
     )
 
 
@@ -64,12 +81,23 @@ def build_prompt(tokenizer, req: CompletionRequest) -> list[int]:
     return tokens
 
 
-def to_generation_request(tokenizer, req: CompletionRequest) -> GenerationRequest:
+def to_generation_request(
+    tokenizer, req: CompletionRequest, defaults: RequestDefaults = DEFAULTS
+) -> GenerationRequest:
+    # Raw text: no chat template, no think block to budget; the reserve
+    # still decides whether a prompt near the context end is served.
     return GenerationRequest(
         tokens=build_prompt(tokenizer, req),
         max_tokens=req.max_tokens,
-        sampling=req.sampling,
+        sampling=with_xtc_specials(tokenizer, req.sampling),
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
+        top_logprobs=req.logprobs or 0,
+        max_prompt_tokens=req.max_prompt_tokens,
+        min_response_tokens=(
+            defaults.min_response_tokens
+            if req.min_response_tokens is None
+            else req.min_response_tokens
+        ),
     )
 
 
@@ -79,7 +107,9 @@ class CompletionResponder:
         self.id = f"cmpl-{uuid.uuid4().hex[:24]}"
         self.created = int(time.time())
         self.prompt_tokens = prompt_tokens
+        self._tokenizer = tokenizer
         self.echo_text = tokenizer.decode(prompt_tokens) if req.echo else ""
+        self._offset = len(self.echo_text)
         self.assembler = TextAssembler(
             tokenizer, prompt_tokens=prompt_tokens, stop_words=req.stop
         )
@@ -99,15 +129,36 @@ class CompletionResponder:
             "completion_tokens": c,
             "total_tokens": p + c,
             "prompt_tokens_details": {"cached_tokens": cached},
+            "completion_tokens_details": completion_details(self.assembler),
         }
 
     def _choice(self, text: str, finish_reason) -> dict[str, Any]:
         return {
             "index": 0,
             "text": text,
-            "logprobs": None,
+            "logprobs": self._logprobs() if self.req.logprobs is not None else None,
             "finish_reason": finish_reason,
         }
+
+    def _logprobs(self) -> dict:
+        """The legacy columns; offsets count characters of the text so far."""
+        events, self.assembler.pending_events = self.assembler.pending_events, []
+        out: dict[str, list] = {
+            "tokens": [],
+            "token_logprobs": [],
+            "top_logprobs": [],
+            "text_offset": [],
+        }
+        for e in events:
+            entry = logprob_entry(self._tokenizer, e)
+            out["tokens"].append(entry["token"])
+            out["token_logprobs"].append(entry["logprob"])
+            out["top_logprobs"].append(
+                {t["token"]: t["logprob"] for t in entry.get("top_logprobs", [])}
+            )
+            out["text_offset"].append(self._offset)
+            self._offset += len(entry["token"])
+        return out
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         first = True
@@ -124,6 +175,8 @@ class CompletionResponder:
             if d.finish_reason and self.req.stream_usage:
                 out["usage"] = self._usage(cached)
             yield out
+            if d.finish_reason:
+                break
 
     def complete(self, events, cached: int) -> dict:
         text = self.echo_text
@@ -133,6 +186,7 @@ class CompletionResponder:
             text += d.content + d.reasoning
             if d.finish_reason:
                 finish = d.finish_reason
+                break
         out = self._envelope()
         out["choices"] = [self._choice(text, finish)]
         out["usage"] = self._usage(cached)

@@ -8,29 +8,66 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
+import select
+import signal
+import socket
+import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mlx_beam import __version__
 from mlx_beam.api import chat, completions, responses
+from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
-from mlx_beam.engine import Engine, EngineDead
+from mlx_beam.api.reasoning import renderer_reasoning_keys
+from mlx_beam.engine import (
+    ContextTooLong,
+    Engine,
+    EngineDead,
+    InvalidRequest,
+    QueueFull,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 64 << 20
+# Seconds between SSE comments while a client waits for its first token.
+KEEPALIVE_S = 5.0
+# A socket that neither delivers the body nor takes the stream for this long
+# is given up: the request is cancelled instead of holding a batch slot.
+SOCKET_TIMEOUT_S = 30.0
+# Tokens ready at once go out in one write; a slow socket blocks once per
+# batch of chunks instead of once per token.
+SSE_WRITE_BATCH_BYTES = 64 << 10
 
 
 class Served:
     """What the handler threads share: the engine, the tokenizer, the name."""
 
-    def __init__(self, engine: Engine, tokenizer, model_name: str):
+    def __init__(
+        self,
+        engine: Engine,
+        tokenizer,
+        model_name: str,
+        reasoning_field: str = "reasoning",
+        defaults: RequestDefaults | None = None,
+        allowed_origins: Sequence[str] = ("*",),
+        chat_template_source: str = "model",
+    ):
+        if reasoning_field not in chat.REASONING_FIELDS:
+            raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.engine = engine
         self.tokenizer = tokenizer
         self.model_name = model_name
+        self.reasoning_field = reasoning_field
+        self.defaults = defaults or RequestDefaults()
+        self.allowed_origins = tuple(allowed_origins)
+        # "model", "flag" or "default": where the chat template came from.
+        self.chat_template_source = chat_template_source
         self.started_at = time.time()
 
     def capabilities(self) -> dict:
@@ -61,6 +98,14 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
+        h["api"] = {
+            "reasoning_field": self.reasoning_field,
+            "defaults": self.defaults.describe(),
+            "allowed_origins": list(self.allowed_origins),
+            "chat_template": self.chat_template_source,
+            # Which message keys the template reads earlier reasoning from.
+            "reasoning_keys_read": list(renderer_reasoning_keys(self.tokenizer)),
+        }
         h["version"] = __version__
         return h
 
@@ -68,26 +113,47 @@ class Served:
 class Handler(BaseHTTPRequestHandler):
     served: Served  # set by make_handler
     server_version = f"mlx-beam/{__version__}"
+    timeout = SOCKET_TIMEOUT_S
+    _streaming = False
+    _sse_events = False
 
     def log_message(self, fmt, *args):  # one line per request, via logging
         logger.info("%s %s", self.address_string(), fmt % args)
 
     # -- plumbing ---------------------------------------------------------
 
-    def _send_json(self, status: int, payload: dict) -> None:
+    def _send_json(
+        self, status: int, payload: dict, extra_headers: dict | None = None
+    ) -> None:
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        if status >= 400:
+            # Nothing more is coming on a failed request.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self._cors()
         self.end_headers()
         self.wfile.write(body)
 
     def _send_error(self, err: ApiError) -> None:
-        self._send_json(err.status, err.body())
+        headers = {"Retry-After": "1"} if err.status == 503 else None
+        self._send_json(err.status, err.body(), headers)
 
     def _cors(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
+        allowed = self.served.allowed_origins
+        if "*" in allowed:
+            origin = "*"
+        else:
+            # Echo the caller's origin only when it is on the list.
+            self.send_header("Vary", "Origin")
+            origin = self.headers.get("Origin")
+            if origin not in allowed:
+                return
+        self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
@@ -99,14 +165,20 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
-    def _sse(self, payload: Any, event: str | None = None) -> None:
+    def _sse_bytes(self, payload: Any, event: str | None = None) -> bytes:
         data = payload if isinstance(payload, str) else json.dumps(payload)
         head = f"event: {event}\n" if event else ""
-        self.wfile.write(f"{head}data: {data}\n\n".encode())
+        return f"{head}data: {data}\n\n".encode()
+
+    def _sse(self, payload: Any, event: str | None = None) -> None:
+        self.wfile.write(self._sse_bytes(payload, event))
         self.wfile.flush()
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ApiError("Content-Length must be a number") from None
         if length > MAX_BODY_BYTES:
             raise ApiError("request body too large", status=413)
         raw = self.rfile.read(length) if length else b""
@@ -140,21 +212,42 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/responses": self._responses,
         }
         handler = routes.get(path)
+        self._streaming = False
         try:
             if handler is None:
                 raise ApiError("not found", status=404, type="not_found_error")
             handler(self._read_json())
         except ApiError as e:
-            self._send_error(e)
+            self._fail(e)
+        except (ContextTooLong, InvalidRequest) as e:
+            code = "context_length_exceeded" if isinstance(e, ContextTooLong) else None
+            self._fail(ApiError(str(e), code=code))
         except EngineDead as e:
-            self._send_error(
+            self._fail(
                 ApiError(str(e), status=503, type="server_error", code="engine_dead")
+            )
+        except QueueFull as e:
+            self._fail(
+                ApiError(str(e), status=503, type="server_error", code="queue_full")
             )
         except (BrokenPipeError, ConnectionResetError):
             logger.info("client went away")
+        except TimeoutError:
+            logger.info("client stalled for %.0fs", SOCKET_TIMEOUT_S)
+            self.close_connection = True
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
             logger.exception("request failed")
-            self._send_error(ApiError(repr(e), status=500, type="server_error"))
+            self._fail(ApiError(repr(e), status=500, type="server_error"))
+
+    def _fail(self, err: ApiError) -> None:
+        """An error before the headers is a status; inside a stream it is the
+        last event, since the 200 is already on the wire."""
+        if not self._streaming:
+            self._send_error(err)
+            return
+        self._sse(err.body(), "error" if self._sse_events else None)
+        if not self._sse_events:
+            self._sse("[DONE]")
 
     # -- the three generation endpoints -----------------------------------
 
@@ -162,51 +255,128 @@ class Handler(BaseHTTPRequestHandler):
         """Submit, then either stream chunks as they come or answer once.
 
         The first event is awaited before any header goes out, so a request
-        the worker rejects still gets a proper error status."""
+        the worker rejects still gets a proper error status. While a long
+        prefill runs, a streaming client gets SSE comments with the progress
+        so proxies and clients do not give up on an idle connection."""
         result = self.served.engine.submit(gen_request)
-        events = iter(result)
+        self._sse_events = sse_events
         try:
-            first = next(events, None)
-            if first is None:
-                raise ApiError("the engine produced nothing", status=500)
-            chain = _chain(first, events)
             if stream:
                 self._start_sse()
-                for payload in responder.stream(chain, result.prompt_cached):
-                    self._sse(payload, payload.get("type") if sse_events else None)
-                if not sse_events:
-                    self._sse("[DONE]")
+                self._streaming = True
+                first = self._await_first(result, keepalive=True)
+                if first is None:
+                    raise ApiError("the engine produced nothing", status=500)
+                events = _chain(first, result)
+                pending = bytearray()
+                try:
+                    for payload in responder.stream(events, result.prompt_cached):
+                        pending += self._sse_bytes(
+                            payload, payload.get("type") if sse_events else None
+                        )
+                        # Flush when the engine has nothing more ready, or
+                        # the batch is large enough as it is.
+                        if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
+                            self.wfile.write(pending)
+                            self.wfile.flush()
+                            pending = bytearray()
+                    if not sse_events:
+                        pending += self._sse_bytes("[DONE]")
+                finally:
+                    # What was generated goes out before any error does.
+                    if pending:
+                        self.wfile.write(pending)
+                        self.wfile.flush()
             else:
-                self._send_json(200, responder.complete(chain, result.prompt_cached))
-        except BaseException:
+                first = self._await_first(result, keepalive=False)
+                if first is None:
+                    raise ApiError("the engine produced nothing", status=500)
+                events = _chain(first, result)
+                self._send_json(200, responder.complete(events, result.prompt_cached))
+        finally:
+            # A text-level stop word or an exception may end the response
+            # while the engine is still generating.
             result.cancel()
-            raise
+
+    def _client_gone(self) -> bool:
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def _await_first(self, result, keepalive: bool):
+        while True:
+            try:
+                return result.next_event(timeout=KEEPALIVE_S)
+            except queue.Empty:
+                if self._client_gone():
+                    raise ConnectionResetError("client went away") from None
+                if keepalive:
+                    p = result.progress
+                    note = f"prefill {p.processed}/{p.total}" if p else "waiting"
+                    self.wfile.write(f": {note}\n\n".encode())
+                    self.wfile.flush()
+
+    def _check_model(self, body: dict) -> None:
+        """A model name that is not the served one is a 404, as at OpenAI;
+        a missing name means the served model."""
+        name = body.get("model") if isinstance(body, dict) else None
+        if name and name != self.served.model_name:
+            raise ApiError(
+                f"model {name!r} is not served here; loaded: {self.served.model_name!r}",
+                status=404,
+                type="invalid_request_error",
+                param="model",
+                code="model_not_found",
+            )
 
     def _chat(self, body: dict) -> None:
+        self._check_model(body)
         tok = self.served.tokenizer
-        req = chat.parse_chat_request(body, self.served.model_name)
-        gen_request = chat.to_generation_request(tok, req)
-        responder = chat.ChatResponder(tok, req, gen_request.tokens)
+        req = chat.parse_chat_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        gen_request = chat.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
+        responder = chat.ChatResponder(
+            tok, req, gen_request.tokens, reasoning_field=self.served.reasoning_field
+        )
         self._run(gen_request, responder, req.stream)
 
     def _completions(self, body: dict) -> None:
+        self._check_model(body)
         tok = self.served.tokenizer
-        req = completions.parse_completion_request(body, self.served.model_name)
-        gen_request = completions.to_generation_request(tok, req)
+        req = completions.parse_completion_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        gen_request = completions.to_generation_request(tok, req, self.served.defaults)
         responder = completions.CompletionResponder(tok, req, gen_request.tokens)
         self._run(gen_request, responder, req.stream)
 
     def _responses(self, body: dict) -> None:
+        self._check_model(body)
         tok = self.served.tokenizer
-        req = responses.parse_responses_request(body, self.served.model_name)
-        gen_request = responses.to_generation_request(tok, req)
-        responder = responses.ResponsesResponder(tok, req, gen_request.tokens)
+        req = responses.parse_responses_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        gen_request = responses.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
+        responder = responses.ResponsesResponder(
+            tok,
+            req,
+            gen_request.tokens,
+            route_thinking=self.served.reasoning_field != "none",
+        )
         self._run(gen_request, responder, req.stream, sse_events=True)
 
 
 def _chain(first, rest) -> Iterator:
     yield first
-    yield from rest
+    if first.finish_reason is None:
+        yield from rest
 
 
 def make_handler(served: Served):
@@ -225,7 +395,14 @@ class BeamServer(ThreadingHTTPServer):
 def serve(served: Served, host: str, port: int) -> None:
     with BeamServer(served, host, port) as httpd:
         logger.info("listening on http://%s:%d", host, httpd.server_port)
+
+        def stop(signum, frame):
+            # shutdown() blocks until serve_forever returns; not from its thread.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        signal.signal(signal.SIGTERM, stop)
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             pass
+        logger.info("stopped")

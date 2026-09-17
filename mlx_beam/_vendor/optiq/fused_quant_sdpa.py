@@ -26,11 +26,19 @@ N_CHUNK = 512
 
 
 def supported(queries, bits: int, group_size: int, mask) -> bool:
+    # Prefill only: at one query token the stock path is one matmul, the
+    # tiles would be N/n_chunk launches. Masks: none, "causal", or the bool
+    # arrays the batch caches build (left padding, per row).
     return (
         bits in (4, 8)
         and group_size in (32, 64, 128)
         and queries.dtype in (mx.float16, mx.bfloat16)
-        and (mask is None or (isinstance(mask, str) and mask == "causal"))
+        and queries.shape[2] > 1
+        and (
+            mask is None
+            or (isinstance(mask, str) and mask == "causal")
+            or (isinstance(mask, mx.array) and mask.dtype == mx.bool_)
+        )
     )
 
 
@@ -64,7 +72,12 @@ def fused_quantized_scaled_dot_product_attention(
             mask_arr = q_indices[:, None] >= k_indices[None]
         else:
             mask_arr = mask
+        if n_repeats > 1 and mask_arr.ndim > 3:
+            mask_arr = mx.expand_dims(mask_arr, -3)
 
+    # The running max, sum and output accumulate in float32 across tiles;
+    # fp16 stops resolving the sum past a few thousand tokens.
+    acc_dtype = mx.float32
     o_acc = None
     row_max = None
     row_sum = None
@@ -82,7 +95,7 @@ def fused_quantized_scaled_dot_product_attention(
             transpose=True,
             group_size=group_size,
             bits=bits,
-        )
+        ).astype(acc_dtype)
 
         if mask_arr is not None:
             if mask_arr.ndim == 2:
@@ -100,33 +113,33 @@ def fused_quantized_scaled_dot_product_attention(
             exps = mx.exp(scores - row_max)
             row_sum = mx.sum(exps, axis=-1, keepdims=True)
             o_acc = mx.quantized_matmul(
-                exps,
+                exps.astype(queries.dtype),
                 v_packed,
                 v_scales,
                 v_biases,
                 transpose=False,
                 group_size=group_size,
                 bits=bits,
-            )
+            ).astype(acc_dtype)
         else:
             new_max = mx.maximum(row_max, chunk_max)
             factor = mx.exp(row_max - new_max)
             exps = mx.exp(scores - new_max)
             new_sum = factor * row_sum + mx.sum(exps, axis=-1, keepdims=True)
             delta_out = mx.quantized_matmul(
-                exps,
+                exps.astype(queries.dtype),
                 v_packed,
                 v_scales,
                 v_biases,
                 transpose=False,
                 group_size=group_size,
                 bits=bits,
-            )
+            ).astype(acc_dtype)
             o_acc = o_acc * factor + delta_out
             row_max = new_max
             row_sum = new_sum
 
-    out = o_acc / row_sum
+    out = (o_acc / row_sum).astype(queries.dtype)
 
     if n_repeats > 1:
         out = mx.reshape(out, (B, n_q_heads, L, D))

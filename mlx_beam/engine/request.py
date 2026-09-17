@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from mlx_beam.engine.thinking import ReasoningLimits
 
 
 @dataclass
@@ -15,11 +20,21 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     min_p: float = 0.0
+    # Tokens min_p may never filter away.
+    min_tokens_to_keep: int = 1
+    xtc_probability: float = 0.0
+    xtc_threshold: float = 0.1
+    # Ids XTC leaves alone (eos and newline, so it cannot cut the answer short).
+    xtc_special_tokens: tuple[int, ...] = ()
     repetition_penalty: float | None = None
     repetition_context_size: int = 20
     presence_penalty: float | None = None
+    presence_context_size: int = 20
     frequency_penalty: float | None = None
+    frequency_context_size: int = 20
     logit_bias: dict[int, float] | None = None
+    # A seeded request samples with its own random key.
+    seed: int | None = None
 
 
 @dataclass
@@ -37,6 +52,15 @@ class GenerationRequest:
     # Where the system block ends; the store keeps that prefix as its own
     # entry, evicted after every conversation entry.
     system_end: int | None = None
+    # How many of the most likely tokens each event reports (0: none).
+    top_logprobs: int = 0
+    # Room the answer keeps after the think block; the reasoning budget is
+    # cut to leave it (0: none reserved).
+    min_response_tokens: int = 0
+    # A prompt cap this request asks for; only lower than the engine's.
+    max_prompt_tokens: int | None = None
+    # Think markers and the reasoning budget; None: no budget, no forcing.
+    reasoning: ReasoningLimits | None = None
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
@@ -44,6 +68,10 @@ class GenerationRequest:
             raise ValueError("prompt is empty")
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
+        if self.top_logprobs < 0:
+            raise ValueError("top_logprobs must not be negative")
+        if self.min_response_tokens < 0:
+            raise ValueError("min_response_tokens must not be negative")
 
 
 @dataclass(frozen=True)
@@ -52,6 +80,15 @@ class TokenEvent:
     logprob: float
     # "stop", "length", or None while the sequence keeps going.
     finish_reason: str | None = None
+    # (token id, logprob) pairs, best first; only when the request asked.
+    top_logprobs: tuple[tuple[int, float], ...] | None = None
+    # On the last event: the think block was closed by force or cut by the
+    # length limit; the answer after it was cut by the length limit.
+    thinking_truncated: bool = False
+    response_truncated: bool = False
+    # The budget put this token there, not the model: part of a forced
+    # close, up to and including the end marker.
+    forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,6 +114,10 @@ class ResultStream:
         self._cancelled = threading.Event()
         self.progress: PromptProgress | None = None
         self.prompt_cached = 0
+        # What the engine admitted: generated tokens, reasoning tokens within.
+        self.completion_cap = request.max_tokens
+        self.reasoning_cap: int | None = None
+        self._done = False
 
     def put(self, item) -> None:
         self._queue.put(item)
@@ -90,16 +131,37 @@ class ResultStream:
     def cancelled(self) -> bool:
         return self._cancelled.is_set()
 
-    def __iter__(self) -> Iterator[TokenEvent]:
+    @property
+    def ready(self) -> bool:
+        """Something is queued: a consumer need not block for the next item."""
+        return not self._queue.empty()
+
+    def next_event(self, timeout: float | None = None) -> TokenEvent | None:
+        """The next token event; None once the stream has ended. Raises
+        ``queue.Empty`` when ``timeout`` passes without one (progress updates
+        are folded into ``self.progress`` while waiting)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            item = self._queue.get()
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            item = self._queue.get(timeout=remaining)
             if item is None:
-                return
+                self._done = True
+                return None
             if isinstance(item, PromptProgress):
                 self.progress = item
                 continue
             if isinstance(item, BaseException):
+                self._done = True
                 raise item
-            yield item
             if item.finish_reason is not None:
+                self._done = True
+            return item
+
+    def __iter__(self) -> Iterator[TokenEvent]:
+        while not self._done:
+            item = self.next_event()
+            if item is None:
                 return
+            yield item

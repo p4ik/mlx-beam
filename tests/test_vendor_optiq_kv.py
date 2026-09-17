@@ -2,6 +2,7 @@
 and the rotating-merge guard in the vendored mlx-lm."""
 
 import mlx.core as mx
+import pytest
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator
 from mlx_beam._vendor.mlx_lm.models import llama
@@ -137,3 +138,62 @@ def test_rotating_merge_survives_a_zero_length_cache():
     other.update_and_fetch(k[..., :3, :], k[..., :3, :])
     merged = BatchRotatingKVCache.merge([trimmed, other])
     assert merged.size() == 3
+
+
+def test_tiled_sdpa_matches_stock_with_a_batch_mask():
+    # The batch caches hand attention a bool mask per row (left padding);
+    # that is the mask the tiled path sees in the engine.
+    from mlx_beam._vendor.mlx_lm.models.base import create_causal_mask
+    from mlx_beam._vendor.optiq import fused_quant_sdpa
+
+    mx.random.seed(4)
+    B, Hq, Hkv, L, N, D = 2, 4, 2, 6, 70, 64
+    q = mx.random.normal((B, Hq, L, D)).astype(mx.float16)
+    k = mx.random.normal((B, Hkv, N, D)).astype(mx.float16)
+    v = mx.random.normal((B, Hkv, N, D)).astype(mx.float16)
+    qk = mx.quantize(k, group_size=64, bits=4)
+    qv = mx.quantize(v, group_size=64, bits=4)
+    mask = create_causal_mask(L, offset=N - L, left_padding=mx.array([0, 5]))
+    assert mask.dtype == mx.bool_ and mask.shape == (B, 1, L, N)
+    assert fused_quant_sdpa.supported(q, 4, 64, mask)
+    assert not fused_quant_sdpa.supported(q[:, :, :1], 4, 64, mask[:, :, :1])
+    tiled = fused_quantized_scaled_dot_product_attention(
+        q, qk, qv, scale=D**-0.5, mask=mask, group_size=64, bits=4, n_chunk=16
+    )
+    stock = quantized_scaled_dot_product_attention(
+        q, qk, qv, scale=D**-0.5, mask=mask, group_size=64, bits=4
+    )
+    assert mx.abs(stock.astype(mx.float32) - tiled.astype(mx.float32)).max() < 2e-2
+
+
+def test_prefill_takes_the_tiled_path(monkeypatch):
+    from mlx_beam._vendor.optiq import fused_quant_sdpa
+
+    calls = {"tiled": 0}
+    original = fused_quant_sdpa.fused_quantized_scaled_dot_product_attention
+
+    def counting(*args, **kwargs):
+        calls["tiled"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fused_quant_sdpa, "fused_quantized_scaled_dot_product_attention", counting
+    )
+    model = tiny_llama()
+    model.set_dtype(mx.float16)
+    gen = BatchGenerator(model, max_tokens=2, stop_tokens=[])
+    caches = [[MergeableQuantizedKVCache(group_size=64, bits=4) for _ in model.layers]]
+    gen.insert([[1, 2, 3, 4, 5, 6]], caches=caches)
+    while calls["tiled"] == 0:
+        _, generated = gen.next()
+        if any(r.finish_reason for r in generated):
+            break
+    gen.close()
+    assert calls["tiled"] > 0
+
+
+def test_merge_refuses_mixed_bits():
+    a = MergeableQuantizedKVCache(group_size=64, bits=4)
+    b = MergeableQuantizedKVCache(group_size=64, bits=8)
+    with pytest.raises(ValueError, match="quantized differently"):
+        BatchQuantizedKVCache.merge([a, b])
