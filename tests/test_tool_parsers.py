@@ -49,3 +49,27 @@ def test_mistral_json_list_and_cut_call():
     # A call cut short is an error now, not a silently shorter list.
     with pytest.raises(ValueError):
         mistral.parse_tool_call('write[ARGS]{"path": "a"}[TOOL_CALLS]read[ARGS]{"pa')
+
+
+def test_qwen_literal_end_tag_in_a_value():
+    text = (
+        "<function=write><parameter=path>a.xml</parameter>"
+        "<parameter=content>before </parameter> after</parameter>"
+        "<parameter=lines>2</parameter></function>"
+    )
+    assert qwen3_coder.parse_tool_call(text, WRITE)["arguments"] == {
+        "path": "a.xml",
+        "content": "before </parameter> after",
+        "lines": 2,
+    }
+    # The tag at the very end of a value, and as the whole value.
+    text = "<function=write><parameter=content>x</parameter></parameter></function>"
+    assert qwen3_coder.parse_tool_call(text, WRITE)["arguments"] == {
+        "content": "x</parameter>"
+    }
+    # A parameter cut short is an error, not a missing argument.
+    with pytest.raises(ValueError):
+        qwen3_coder.parse_tool_call(
+            "<function=write><parameter=path>a</parameter><parameter=content>bef</function>",
+            WRITE,
+        )

@@ -12,7 +12,8 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_parameter_start = re.compile(r"<parameter=")
+_parameter_end = "</parameter>"
 _name_regex = re.compile(r"\s*([^\s<>]+)>?")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
@@ -87,6 +88,24 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             return param_value
 
 
+def _parameter_bodies(parameters: str) -> list:
+    """Each parameter's ``name>value``. A parameter ends at the last
+    ``</parameter>`` before the next ``<parameter=`` (or the end), so a value
+    that contains the end tag literally - HTML, XML, a file with this very
+    markup - is kept whole instead of cut at its first occurrence. A
+    parameter without an end tag means the call was cut short."""
+    starts = [m.end() for m in _parameter_start.finditer(parameters)]
+    bodies = []
+    for i, start in enumerate(starts):
+        stop = starts[i + 1] - len("<parameter=") if i + 1 < len(starts) else None
+        chunk = parameters[start:stop]
+        close = chunk.rfind(_parameter_end)
+        if close < 0:
+            raise ValueError("Parameter without a closing tag.")
+        bodies.append(chunk[:close])
+    return bodies
+
+
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     name_match = _name_regex.match(function_call_str)
     if name_match is None:
@@ -95,7 +114,7 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[name_match.end() :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
+    for match_text in _parameter_bodies(parameters):
         param_match = _name_regex.match(match_text)
         if param_match is None:
             continue

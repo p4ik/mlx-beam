@@ -86,6 +86,15 @@ the upstream files at those commits, nothing else; they postdate the pin and
 go away with the next pin bump. Tests: `test_qwen_parameter_without_closing_bracket`,
 `test_mistral_json_list_and_cut_call`.
 
+`parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies`: upstream
+cuts every parameter at the first `</parameter>` (`<parameter=(.*?)</parameter>`),
+so a value that contains the tag literally - a file with this markup, HTML -
+comes back shortened, with no error. A parameter now ends at the last
+`</parameter>` before the next `<parameter=` or the end of the call, and a
+parameter without an end tag is an error (the call was cut short) instead of
+a silently missing argument. Stays after the pin bump unless upstream fixes
+it. Test: `test_qwen_literal_end_tag_in_a_value`.
+
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
 
