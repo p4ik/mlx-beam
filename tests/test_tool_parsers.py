@@ -1,5 +1,7 @@
 """The vendored tool-call parsers on the shapes the models actually emit."""
 
+import copy
+
 import pytest
 
 from mlx_beam._vendor.mlx_lm.tool_parsers import mistral, qwen3_coder
@@ -73,3 +75,32 @@ def test_qwen_literal_end_tag_in_a_value():
             "<function=write><parameter=path>a</parameter><parameter=content>bef</function>",
             WRITE,
         )
+
+
+def test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split():
+    """A literal <parameter=…> in a value cannot be told from a second
+    parameter; a name seen twice makes the call an error the caller shows,
+    never a call with one argument overwritten by the other."""
+    text = (
+        "<function=write><parameter=path>intended.txt</parameter>"
+        "<parameter=content>Use </parameter> before <parameter=path>other.txt"
+        "</parameter> after</parameter></function>"
+    )
+    with pytest.raises(ValueError, match="twice"):
+        qwen3_coder.parse_tool_call(text, WRITE)
+    # A name outside a closed schema is refused the same way; an open
+    # schema (no additionalProperties: false) still lets it through.
+    text = (
+        "<function=write><parameter=path>a</parameter>"
+        "<parameter=extra>b</parameter></function>"
+    )
+    assert qwen3_coder.parse_tool_call(text, WRITE)["arguments"] == {
+        "path": "a",
+        "extra": "b",
+    }
+    closed = copy.deepcopy(WRITE)
+    closed[0]["function"]["parameters"]["additionalProperties"] = False
+    with pytest.raises(ValueError, match="schema"):
+        qwen3_coder.parse_tool_call(text, closed)
+    with pytest.raises(ValueError, match="No function"):
+        qwen3_coder.parse_tool_call("plain text", WRITE)

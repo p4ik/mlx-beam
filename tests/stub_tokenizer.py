@@ -8,17 +8,25 @@ TOOL_START, TOOL_END = 58, 59
 
 
 class StubDetokenizer:
+    """mlx-lm's contract: ``last_segment`` is the text since it was last
+    read; ``finalize`` flushes what was held back (nothing here)."""
+
     def __init__(self, words):
         self._words = words
         self.text = ""
-        self.last_segment = ""
+        self._offset = 0
 
     def add_token(self, token: int) -> None:
-        self.last_segment = self._words[token]
-        self.text += self.last_segment
+        self.text += self._words[token]
 
     def finalize(self) -> None:
         pass
+
+    @property
+    def last_segment(self) -> str:
+        segment = self.text[self._offset :]
+        self._offset = len(self.text)
+        return segment
 
 
 class StubTokenizer:

@@ -58,7 +58,10 @@ current segment, so nobody is padded; (2) every call is at most
 `prefill_slice` tokens wide, so a newcomer waits at most one such call (512 ran
 at 125 tok/s against 114 for 2048); (3) while a prefill shares the worker,
 decode runs for `decode_share` times the last prefill call's wall time and
-hands its tokens back before the next prefill call. Alone, a prompt sees
+hands its tokens back before the next prefill call; a burst also ends when
+a row finishes, because its extracted cache is a lazy slice of the batch
+buffers until the caller evaluates it, and every further step would copy
+the whole batch KV instead of writing in place. Alone, a prompt sees
 upstream's chunking at slice width; greedy output is byte-identical
 (`test_prefill_slice_keeps_output`, and the greedy replay against an unpatched
 worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,
@@ -86,14 +89,19 @@ the upstream files at those commits, nothing else; they postdate the pin and
 go away with the next pin bump. Tests: `test_qwen_parameter_without_closing_bracket`,
 `test_mistral_json_list_and_cut_call`.
 
-`parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies`: upstream
-cuts every parameter at the first `</parameter>` (`<parameter=(.*?)</parameter>`),
-so a value that contains the tag literally - a file with this markup, HTML -
-comes back shortened, with no error. A parameter now ends at the last
-`</parameter>` before the next `<parameter=` or the end of the call, and a
-parameter without an end tag is an error (the call was cut short) instead of
-a silently missing argument. Stays after the pin bump unless upstream fixes
-it. Test: `test_qwen_literal_end_tag_in_a_value`.
+`parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies` and
+`_closed_parameters`: upstream cuts every parameter at the first
+`</parameter>` (`<parameter=(.*?)</parameter>`), so a value that contains the
+tag literally - a file with this markup, HTML - comes back shortened, with no
+error. A parameter now ends at the last `</parameter>` before the next
+`<parameter=` or the end of the call, and a parameter without an end tag is
+an error (the call was cut short) instead of a silently missing argument. A
+literal `<parameter=name>` inside a value cannot be told from a second
+parameter, so a name seen twice, or one a schema with `additionalProperties:
+false` rules out, raises instead of overwriting an argument; the engine then
+returns the call as text. Stays after the pin bump unless upstream fixes it.
+Tests: `test_qwen_literal_end_tag_in_a_value`,
+`test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split`.
 
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).

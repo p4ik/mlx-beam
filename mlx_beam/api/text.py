@@ -59,6 +59,28 @@ def xtc_special_ids(tokenizer) -> tuple[int, ...]:
     return tuple(dict.fromkeys(ids))
 
 
+def holds_incomplete_bytes(detokenizer) -> bool:
+    """Whether the text the detokenizer holds back ends in a cut UTF-8
+    sequence. mlx-lm's BPE and SPM detokenizers keep bytes until they form
+    a character; only those bytes tell a fragment from a real U+FFFD. An
+    unknown detokenizer is taken to hold a fragment, as before."""
+    held = getattr(detokenizer, "_unflushed", None)
+    if isinstance(held, str):  # BPE: byte-level characters
+        try:
+            from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
+
+            held = bytes(_byte_decoder()[c] for c in held)
+        except KeyError:
+            return True
+    if not isinstance(held, bytes):
+        return True
+    try:
+        held.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
 def logprob_entry(tokenizer, event: TokenEvent) -> dict:
     """One OpenAI logprobs item: the token's text, bytes and its alternatives."""
 
@@ -72,12 +94,13 @@ def logprob_entry(tokenizer, event: TokenEvent) -> dict:
     return out
 
 
-def make_state_machine(tokenizer, stop_words) -> TextStateMachine:
+def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMachine:
     """Think and tool markers switch state; a stop word ends the stream.
 
     The engine matches stop words on token ids, which misses a word whose
     tokenization differs in context; the text match catches those and the
-    stream ends (state None) instead of merely hiding the word."""
+    stream ends (state None) instead of merely hiding the word. With
+    ``tools`` off the tool markers are ordinary text."""
     transitions: dict = {}
     thinking = getattr(tokenizer, "has_thinking", False)
     if thinking:
@@ -85,7 +108,7 @@ def make_state_machine(tokenizer, stop_words) -> TextStateMachine:
             (tokenizer.think_start, "reasoning")
         )
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
-    if getattr(tokenizer, "has_tool_calling", False):
+    if tools and getattr(tokenizer, "has_tool_calling", False):
         transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
         if thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
@@ -105,8 +128,8 @@ class ToolCallParser:
 
     What does not parse is handed back as text, markers and all: the client
     sees what the model said instead of a call that never existed. A text
-    that holds several calls without an end marker (Mistral) is retried
-    call by call, so the ones before a cut are kept."""
+    that holds several calls without an end marker (Mistral) is cut at the
+    longest prefix that parses, so the calls before a cut are kept."""
 
     def __init__(self, tool_parser, tools, streaming: bool, start="", end=""):
         self._parser = tool_parser
@@ -125,15 +148,18 @@ class ToolCallParser:
         unparsed: list[str] = []
         for text, closed in blocks:
             parsed = self._parse(text)
-            if parsed is None and self._start and self._start in text:
-                pieces = [p for p in text.split(self._start) if p.strip()]
-                for i, piece in enumerate(pieces):
-                    part = self._parse(piece)
-                    if part is None:
-                        last = i == len(pieces) - 1
-                        unparsed.append(self._raw(piece, closed or not last))
-                    else:
-                        calls.extend(part)
+            if parsed is None and self._start and not self._end:
+                # Try the text up to each later start marker, longest first.
+                # A marker inside a JSON string is never a cut: the prefix
+                # ending inside the string does not parse.
+                for pos in self._marker_positions(text):
+                    head = self._parse(text[:pos])
+                    if head is not None:
+                        calls.extend(head)
+                        unparsed.append(self._raw(text[pos:], closed))
+                        break
+                else:
+                    unparsed.append(self._raw(text, closed))
                 continue
             if parsed is None:
                 unparsed.append(self._raw(text, closed))
@@ -141,24 +167,39 @@ class ToolCallParser:
                 calls.extend(parsed)
         return calls, unparsed
 
+    def _marker_positions(self, text: str) -> list[int]:
+        positions = []
+        pos = text.find(self._start)
+        while pos > 0:
+            positions.append(pos)
+            pos = text.find(self._start, pos + 1)
+        return positions[::-1]
+
     def _raw(self, text: str, closed: bool) -> str:
+        # The block's own marker is what the automaton removed; markers
+        # inside the text are the model's and stay where they are.
+        if text.startswith(self._start):
+            return text + (self._end if closed else "")
         return self._start + text + (self._end if closed else "")
 
     def _parse(self, text: str) -> list[dict] | None:
         try:
             parsed = self._parser(text, self._tools)
-        except (ValueError, json.JSONDecodeError) as e:
+            out = []
+            for tc in parsed if isinstance(parsed, list) else [parsed]:
+                tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
+                tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
+                item = {"id": tc_id, "type": "function", "function": tc}
+                out.append(item)
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+            # TypeError: a literal the parser evaluated (a set, bytes) that
+            # JSON cannot carry; KeyError: a call without arguments.
             logger.warning("tool call not parseable (%s): %r", e, text[:200])
             return None
-        out = []
-        for tc in parsed if isinstance(parsed, list) else [parsed]:
-            tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
-            tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-            item = {"id": tc_id, "type": "function", "function": tc}
-            if self._streaming:
+        if self._streaming:
+            for item in out:
                 item["index"] = self._idx
                 self._idx += 1
-            out.append(item)
         return out
 
 
@@ -172,11 +213,12 @@ class TextAssembler:
         tools: list[dict] | None = None,
         streaming: bool = False,
         route_thinking: bool = True,
+        tools_enabled: bool = True,
     ):
         self._detok = tokenizer.detokenizer
         # The automaton always runs, so reasoning is counted in every mode;
         # routing off puts the markers back into the text where they were cut.
-        self._sm = make_state_machine(tokenizer, stop_words)
+        self._sm = make_state_machine(tokenizer, stop_words, tools=tools_enabled)
         start, seeded = initial_state(tokenizer, prompt_tokens)
         self._state = self._sm.make_state(start)
         self._prev = self._state[0]
@@ -189,6 +231,9 @@ class TextAssembler:
         # (text, closed): a block still open when the stream ended was cut.
         self._pending_tools: list[tuple[str, bool]] = []
         self._made_tool_call = False
+        # A fragment the detokenizer held when the forced close began.
+        self._fragment = False
+        self._fragment_checked = False
         self._parse_tools = ToolCallParser(
             getattr(tokenizer, "tool_parser", None),
             tools,
@@ -199,8 +244,9 @@ class TextAssembler:
         self.tokens = 0
         self.token_ids: list[int] = []
         self.logprobs: list[float] = []
-        # Events since the last chunk went out; the responder drains them.
-        self.pending_events: list[TokenEvent] = []
+        # Events since the last chunk went out, each with whether its text
+        # went to the content; the responder drains them for logprobs.
+        self.pending_events: list[tuple[TokenEvent, bool]] = []
         # True once a text-level stop word ended the stream early.
         self.stopped = False
         self.reasoning_tokens = 0
@@ -215,27 +261,37 @@ class TextAssembler:
         self.tokens += 1
         self.token_ids.append(event.token)
         self.logprobs.append(event.logprob)
-        self.pending_events.append(event)
         self.thinking_truncated |= event.thinking_truncated
         self.response_truncated |= event.response_truncated
         delta = TextDelta(tokens=1)
 
         if event.finish_reason == "stop":
-            # The stop token itself is never shown.
-            self._state, current = TextStateMachine.discard(self._state)
-            clean = ""
+            # The stop token itself is never shown; what the detokenizer and
+            # the automaton still held is text - a marker that never
+            # completed is what the model said.
+            self._detok.finalize()
+            self._state, clean, current = TextStateMachine.step(
+                self._state, self._detok.last_segment
+            )
+            if current is not None:
+                self._state, flushed, current = TextStateMachine.flush(self._state)
+                clean += flushed
         else:
+            if event.forced and not self._fragment_checked:
+                # The budget may cut a byte-level tokenizer mid-character:
+                # the detokenizer then flushes the fragment as U+FFFD with
+                # the first forced token. Only a real fragment is dropped.
+                self._fragment = holds_incomplete_bytes(self._detok)
+            self._fragment_checked = event.forced
             self._detok.add_token(event.token)
             if event.finish_reason == "length":
                 self._detok.finalize()
             self._state, clean, current = TextStateMachine.step(
                 self._state, self._detok.last_segment
             )
-            if event.forced and (self._prev == "reasoning" or current == "reasoning"):
-                # The budget cut a byte-level tokenizer mid-character: the
-                # detokenizer flushes the fragment as U+FFFD together with
-                # the first forced token. That fragment was never a character.
-                clean = clean.replace("\ufffd", "")
+            if event.forced and self._fragment:
+                clean = clean.replace("\ufffd", "", 1)
+                self._fragment = False
             if event.finish_reason == "length" and current is not None:
                 # A stop word already matched leaves its tail in the buffer;
                 # that tail is not output.
@@ -250,6 +306,7 @@ class TextAssembler:
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
             self.stopped = True
+            self.pending_events.append((event, bool(delta.content)))
             self._prev = "normal"
             delta.finish_reason = "stop"
             if self._tool_text:
@@ -277,6 +334,10 @@ class TextAssembler:
                 # A block the prompt opened may close on the first token.
                 closed = self._take_lead() + self._think_end
             delta.content = closed + clean
+        # A marker token releases no text; the stop token none either.
+        self.pending_events.append(
+            (event, bool(clean) and (current == "normal" or not self._route))
+        )
         self._prev = current
 
         if event.finish_reason is not None:

@@ -35,6 +35,20 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
     return {}
 
 
+def _closed_parameters(func_name: str, tools: Optional[Any]) -> Optional[set]:
+    """The parameter names a schema with ``additionalProperties: false``
+    allows, or None when the schema leaves the names open."""
+    for tool in tools or ():
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not function or function.get("name") != func_name:
+            continue
+        params = function.get("parameters")
+        if isinstance(params, dict) and params.get("additionalProperties") is False:
+            return set(params.get("properties") or {})
+        return None
+    return None
+
+
 def _convert_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
     """Convert parameter value based on its type in the schema."""
     if param_value.lower() == "null":
@@ -112,6 +126,7 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
         raise ValueError("No function name provided.")
     function_name = name_match.group(1)
     param_config = _get_arguments_config(function_name, tools)
+    closed = _closed_parameters(function_name, tools)
     parameters = function_call_str[name_match.end() :]
     param_dict = {}
     for match_text in _parameter_bodies(parameters):
@@ -119,6 +134,13 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
         if param_match is None:
             continue
         param_name = param_match.group(1)
+        # A parameter tag inside a value looks like a second parameter; a
+        # name seen twice, or one the schema rules out, is that case or a
+        # broken call - either way not a call to make in silence.
+        if param_name in param_dict:
+            raise ValueError(f"Parameter {param_name!r} given twice.")
+        if closed is not None and param_name not in closed:
+            raise ValueError(f"Parameter {param_name!r} is not in the schema.")
         param_value = str(match_text[param_match.end() :])
         if param_value.startswith("\n"):
             param_value = param_value[1:]

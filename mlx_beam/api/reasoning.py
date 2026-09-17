@@ -91,7 +91,10 @@ def read_aliases(body: dict) -> dict:
         if reasoning.get("max_tokens") is not None:
             out["max_reasoning_tokens"] = reasoning["max_tokens"]
     if body.get("enable_thinking") is not None:
-        out["enable_thinking"] = bool(body["enable_thinking"])
+        value = body["enable_thinking"]
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            value = value.lower() == "true"  # some clients send the word
+        out["enable_thinking"] = bool(value)
     return out
 
 
