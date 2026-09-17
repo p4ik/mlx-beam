@@ -203,6 +203,57 @@ def test_keepalive_comments_while_the_prompt_prefills(server, monkeypatch):
     assert text.rstrip().endswith("data: [DONE]")
 
 
+def test_keepalive_comments_while_a_tool_call_is_decoded(server, monkeypatch):
+    """A tool call is collected until it closes; while the model writes a
+    long one the stream must not fall silent, or a client's idle timeout
+    gives the request up in the middle of it."""
+    import time
+
+    import mlx_beam.server as srv
+    from mlx_beam.engine.request import ResultStream, TokenEvent
+    from tests.stub_tokenizer import EOS, TOOL_END, TOOL_START
+
+    monkeypatch.setattr(srv, "KEEPALIVE_S", 0.01)
+    real_submit = server.served.engine.submit
+
+    def submit(req):
+        result = ResultStream(req, lambda _: None)
+
+        def feed():
+            tokens = [TOOL_START, 10] + [11] * 8 + [TOOL_END]
+            for t in tokens:
+                result.put(TokenEvent(token=t, logprob=0.0))
+                time.sleep(0.03)
+            result.put(TokenEvent(token=EOS, logprob=0.0, finish_reason="stop"))
+            result.put(None)
+
+        threading.Thread(target=feed, daemon=True).start()
+        return result
+
+    monkeypatch.setattr(server.served.engine, "submit", submit)
+    try:
+        body = {
+            "messages": [{"role": "user", "content": "w1"}],
+            "tools": [{"type": "function", "function": {"name": "w10"}}],
+            "max_tokens": 20,
+            "stream": True,
+        }
+        status, _, raw = call(server, "POST", "/v1/chat/completions", body)
+    finally:
+        monkeypatch.setattr(server.served.engine, "submit", real_submit)
+    assert status == 200
+    text = raw.decode()
+    assert text.count(": keepalive") >= 3
+    chunks = [json.loads(p) for p in sse_payloads(raw) if p != "[DONE]"]
+    calls = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+    assert (
+        calls
+        and calls[-1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"]
+        == "w10"
+    )
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
 def test_bad_token_ids_and_top_k_are_400s(server):
     status, _, raw = call(
         server, "POST", "/v1/completions", {"prompt": [1, 9999], "max_tokens": 1}

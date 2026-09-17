@@ -45,6 +45,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   containing the tag literally is no longer cut short in silence; the
   vendored Qwen and Mistral parsers carry upstream's fixes for a parameter
   name without `>` and for the JSON list form (see `VENDORED.md`).
+- A stream sends an SSE comment whenever nothing went out for five seconds,
+  not only during the prefill: a tool call is collected until it closes, so
+  a long one used to be decoded in silence and clients with an idle timeout
+  gave the request up in the middle of it.
 
 ### Changed
 - `--reasoning-field none` keeps counting reasoning tokens and shows a think

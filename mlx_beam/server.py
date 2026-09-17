@@ -35,7 +35,8 @@ from mlx_beam.engine import (
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 64 << 20
-# Seconds between SSE comments while a client waits for its first token.
+# Seconds of silence on a stream before an SSE comment goes out: while the
+# prompt prefills, and while a tool call is decoded without a chunk.
 KEEPALIVE_S = 5.0
 # A socket that neither delivers the body nor takes the stream for this long
 # is given up: the request is cancelled instead of holding a batch slot.
@@ -116,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
     timeout = SOCKET_TIMEOUT_S
     _streaming = False
     _sse_events = False
+    _pending = b""
+    _last_write = 0.0
 
     def log_message(self, fmt, *args):  # one line per request, via logging
         logger.info("%s %s", self.address_string(), fmt % args)
@@ -264,29 +267,29 @@ class Handler(BaseHTTPRequestHandler):
             if stream:
                 self._start_sse()
                 self._streaming = True
+                self._last_write = time.monotonic()
                 first = self._await_first(result, keepalive=True)
                 if first is None:
                     raise ApiError("the engine produced nothing", status=500)
-                events = _chain(first, result)
-                pending = bytearray()
+                events = self._events(first, result)
+                self._pending = bytearray()
                 try:
                     for payload in responder.stream(events, result.prompt_cached):
-                        pending += self._sse_bytes(
+                        self._pending += self._sse_bytes(
                             payload, payload.get("type") if sse_events else None
                         )
                         # Flush when the engine has nothing more ready, or
                         # the batch is large enough as it is.
-                        if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
-                            self.wfile.write(pending)
-                            self.wfile.flush()
-                            pending = bytearray()
+                        if (
+                            not result.ready
+                            or len(self._pending) >= SSE_WRITE_BATCH_BYTES
+                        ):
+                            self._flush_pending()
                     if not sse_events:
-                        pending += self._sse_bytes("[DONE]")
+                        self._pending += self._sse_bytes("[DONE]")
                 finally:
                     # What was generated goes out before any error does.
-                    if pending:
-                        self.wfile.write(pending)
-                        self.wfile.flush()
+                    self._flush_pending()
             else:
                 first = self._await_first(result, keepalive=False)
                 if first is None:
@@ -314,9 +317,46 @@ class Handler(BaseHTTPRequestHandler):
                     raise ConnectionResetError("client went away") from None
                 if keepalive:
                     p = result.progress
-                    note = f"prefill {p.processed}/{p.total}" if p else "waiting"
-                    self.wfile.write(f": {note}\n\n".encode())
-                    self.wfile.flush()
+                    self._comment(
+                        f"prefill {p.processed}/{p.total}" if p else "waiting"
+                    )
+
+    def _events(self, first, result) -> Iterator:
+        """The token events, with an SSE comment whenever nothing went out
+        for KEEPALIVE_S. A tool call is collected until it closes, so a long
+        one is decoded in silence and a client's idle timeout would give the
+        request up in the middle of it."""
+        yield first
+        if first.finish_reason is not None:
+            return
+        while True:
+            try:
+                event = result.next_event(timeout=KEEPALIVE_S)
+            except queue.Empty:
+                if self._client_gone():
+                    raise ConnectionResetError("client went away") from None
+                self._comment("keepalive")
+                continue
+            if event is None:
+                return
+            if time.monotonic() - self._last_write >= KEEPALIVE_S:
+                if self._pending:
+                    self._flush_pending()
+                else:
+                    self._comment("keepalive")
+            yield event
+
+    def _comment(self, note: str) -> None:
+        self.wfile.write(f": {note}\n\n".encode())
+        self.wfile.flush()
+        self._last_write = time.monotonic()
+
+    def _flush_pending(self) -> None:
+        if self._pending:
+            self.wfile.write(self._pending)
+            self.wfile.flush()
+            self._pending = bytearray()
+        self._last_write = time.monotonic()
 
     def _check_model(self, body: dict) -> None:
         """A model name that is not the served one is a 404, as at OpenAI;
