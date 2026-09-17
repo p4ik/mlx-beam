@@ -28,6 +28,8 @@ modified = [
   "utils.py",
   "tokenizer_utils.py",
   "models/plamo2.py",
+  "tool_parsers/qwen3_coder.py",
+  "tool_parsers/mistral.py",
 ]
 
 [parts.optiq]

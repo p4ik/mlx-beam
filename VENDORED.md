@@ -76,6 +76,16 @@ broadcast error and took the generation thread down. Reached by any
 sliding-window model reusing a cached prefix across turns. Guarded with
 `or l == 0`. Test: `test_rotating_merge_survives_a_zero_length_cache`.
 
+`tool parsers, picked from upstream` - `tool_parsers/qwen3_coder.py` at
+mlx-lm `e99e3df` (2026-09-14, #1881): the parameter name survives a missing
+`>` (`_name_regex`) instead of raising `ValueError: substring not found`.
+`tool_parsers/mistral.py` at mlx-lm `5681834` (2026-09-14, #1394): the JSON
+list form `[{"name": ..., "arguments": ...}]` is parsed, and a header-form
+call cut short raises instead of being skipped in silence. Both files are
+the upstream files at those commits, nothing else; they postdate the pin and
+go away with the next pin bump. Tests: `test_qwen_parameter_without_closing_bracket`,
+`test_mistral_json_list_and_cut_call`.
+
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
 
