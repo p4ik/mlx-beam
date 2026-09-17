@@ -63,6 +63,21 @@ def cache_arrays(cache: list[Any]) -> list:
     return out
 
 
+def compact_kv(cache: list[Any]) -> None:
+    """Cut every attention cache's buffers to its offset and own the bytes.
+    trim() only moves the offset, and deepcopy shares buffers: an entry cut
+    from a longer one would otherwise pin the whole longer buffer."""
+    from mlx.utils import tree_map
+
+    for c in cache:
+        keys = getattr(c, "keys", None)
+        if keys is None or isinstance(c, ArraysCache):
+            continue
+        n = c.offset
+        c.keys = tree_map(lambda a, n=n: mx.contiguous(a[..., :n, :]), keys)
+        c.values = tree_map(lambda a, n=n: mx.contiguous(a[..., :n, :]), c.values)
+
+
 def _snapshot_bytes(snap: dict[int, list]) -> int:
     return sum(a.nbytes for arrays in snap.values() for a in arrays if a is not None)
 
@@ -246,6 +261,7 @@ class PrefixStore:
         copy_ = copy.deepcopy(cache)
         if cut_back(copy_, len(tokens), upto, checkpoints) != upto:
             return False
+        compact_kv(copy_)
         kept = {p: s for p, s in checkpoints.items() if p <= upto}
         self.insert(model, tokens[:upto], copy_, kept, cache_type)
         return True
@@ -270,15 +286,26 @@ class PrefixStore:
             except ValueError:
                 pass
 
+    @property
+    def system_cap(self) -> int:
+        """System entries outlive conversations, but only so many: past a
+        quarter of the store they would crowd every conversation out."""
+        return max(1, self.max_entries // 4)
+
     def _pop_victim(self):
         # Assistant entries go first, then user, then system; within a type
-        # the least recently used.
+        # the least recently used. Surplus system entries go before anything.
+        if len(self._lru["system"]) > self.system_cap:
+            return self._lru["system"].popleft()
         for kind in _ORDER:
             if self._lru[kind]:
                 return self._lru[kind].popleft()
         return None
 
     def _evict(self) -> None:
+        while len(self._lru["system"]) > self.system_cap:
+            model, key = self._lru["system"].popleft()
+            self._nbytes -= self._trie.pop(model, key).nbytes
         while len(self) > self.max_entries or self._nbytes > self.max_bytes:
             victim = self._pop_victim()
             if victim is None:

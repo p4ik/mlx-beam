@@ -269,3 +269,56 @@ def test_max_queued_refuses_the_overflow_with_a_count():
             assert len(collect(s)) == 40
         # The backlog drained: the next one is admitted again.
         assert len(collect(engine.submit(GenerationRequest([5, 9], max_tokens=2)))) == 2
+
+
+def test_cancelling_a_row_that_never_prefilled_does_not_kill_the_worker(monkeypatch):
+    """A one-token prompt is handed to generation before the rows admitted
+    with it are prefilled; those rows hold empty caches. Cancelling one of
+    them then must drop it, not the engine."""
+    import importlib
+
+    G = importlib.import_module("mlx_beam._vendor.mlx_lm.generate")
+    fired = threading.Event()
+    target = {}
+    real_next = G.BatchGenerator.next
+
+    def cancel_when_unprefilled(self):
+        out = real_next(self)
+        pb = self._prompt_batch
+        if (
+            not fired.is_set()
+            and target.get("stream") is not None
+            and pb.uids
+            and getattr(pb.prompt_cache[0], "keys", 1) is None
+        ):
+            fired.set()
+            target["stream"].cancel()
+        return out
+
+    monkeypatch.setattr(G.BatchGenerator, "next", cancel_when_unprefilled)
+    with Engine(
+        tiny_llama(), decode_concurrency=4, prompt_concurrency=2, prompt_cache_size=0
+    ) as engine:
+        busy = engine.submit(GenerationRequest([20, 21, 22], max_tokens=300))
+        next(iter(busy))
+        outcome = {}
+        for _ in range(20):
+            one = engine.submit(GenerationRequest([42], max_tokens=3))
+            many = engine.submit(GenerationRequest(list(range(7, 15)), max_tokens=3))
+            target["stream"] = many
+            threads = [
+                threading.Thread(
+                    target=lambda n, s: outcome.setdefault(n, collect(s)), args=a
+                )
+                for a in (("one", one), ("many", many))
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            if fired.is_set():
+                break
+            outcome.clear()
+        assert fired.is_set(), "the window was never hit"
+        assert engine.alive and len(outcome["one"]) == 3
+        assert collect(busy)  # the bystander finishes normally

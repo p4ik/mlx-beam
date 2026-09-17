@@ -105,3 +105,15 @@ def test_ruled_out_tokens_are_no_alternatives():
     out = top_logprobs(lp, 3)
     assert out == ((0, 0.0), (3, -1.5))
     json.dumps(out, allow_nan=False)
+
+
+def test_a_vanishing_temperature_is_greedy_not_random():
+    """1/temp overflows float32 below ~1e-38; such a request means greedy."""
+    from mlx_beam.engine.sampling import SamplerPool, sampler_key
+
+    pool = SamplerPool()
+    tiny = SamplingParams(temperature=1e-40, seed=7)
+    assert sampler_key(tiny) == ("greedy",)
+    sampler = pool.get(tiny)
+    logits = mx.array([[0.0, 0.0, 3.0, 0.0]])
+    assert all(int(sampler(logits).item()) == 2 for _ in range(20))

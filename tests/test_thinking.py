@@ -327,11 +327,13 @@ def test_forced_close_logprobs_serialize_strictly():
         out = chat.ChatResponder(tok, req, gen.tokens).complete(engine.submit(gen), 0)
         json.dumps(out, allow_nan=False)
         content = out["choices"][0]["logprobs"]["content"]
-        # The forced marker has no alternatives at all.
-        forced = next(c for c in content if c["token"] == "</think>")
-        assert forced["top_logprobs"] == [
-            {"token": "</think>", "logprob": 0.0, "bytes": list(b"</think>")}
-        ]
+        # logprobs.content is the message content: the forced marker and the
+        # think block stay out of it, the answer tokens are in.
+        assert content and all(c["token"] != "</think>" for c in content)
+        assert (
+            "".join(c["token"] for c in content)
+            == out["choices"][0]["message"]["content"]
+        )
         req.stream = True
         gen = chat.to_generation_request(tok, req)
         gen.tokens.append(THINK_START)
@@ -354,3 +356,73 @@ def test_forced_close_logprobs_serialize_strictly():
             engine.submit(cgen), 0
         )
         json.dumps(out, allow_nan=False)
+        # The raw endpoint lists every token; the forced marker has no
+        # alternatives at all.
+        lp = out["choices"][0]["logprobs"]
+        i = lp["tokens"].index("</think>")
+        assert lp["top_logprobs"][i] == {"</think>": 0.0}
+
+
+def test_a_marker_the_model_is_inside_of_when_the_force_lands_is_completed():
+    """The marker's first token was observed at arming, the next comes on the
+    free token: the model is closing by itself, the queue must not answer
+    with a newline in place of the first answer token."""
+    E1, E2, E3 = 54, 55, 56
+    # Two-token marker: E1 on the arming token, E2 on the free token.
+    limits = ReasoningLimits((START,), (E1, E2), (NL, E1, E2, NL2), max_tokens=6)
+    tracker = ThinkingBudget(limits)
+    steps = Steps(tracker, [START, 10, E1, E2, 20, 21, 22, 23])
+    out = steps.run(8)
+    assert out == [START, 10, E1, E2, 20, 21, 22, 23]
+    assert not tracker.thinking_truncated and not any(steps.forced)
+    assert tracker.reasoning_tokens == 3 and not tracker.in_reasoning
+    # Three-token marker: E1 and E2 observed, E3 on the free token.
+    limits = ReasoningLimits(
+        (START,), (E1, E2, E3), (NL, E1, E2, E3, NL2), max_tokens=7
+    )
+    tracker = ThinkingBudget(limits)
+    steps = Steps(tracker, [START, 10, E1, E2, E3, 20, 21, 22])
+    out = steps.run(8)
+    assert out == [START, 10, E1, E2, E3, 20, 21, 22]
+    assert not tracker.thinking_truncated and not any(steps.forced)
+    # A marker the model began before arming and continued on the free
+    # token but would then abandon is completed, as a started close is.
+    tracker = ThinkingBudget(limits)
+    steps = Steps(tracker, [START, 10, E1, E2, 30, 31, 32, 33])
+    out = steps.run(8)
+    assert out == [START, 10, E1, E2, E3, 31, 32, 33]
+    assert not tracker.thinking_truncated and not tracker.in_reasoning
+
+
+def test_matcher_survives_a_repeated_prefix():
+    from mlx_beam.engine.thinking import _Matcher
+
+    m = _Matcher((7, 7, 9))
+    assert [m.feed(t) for t in (7, 7, 7, 9)] == [False, False, False, True]
+    m = _Matcher((7, 8, 7, 9))
+    assert [m.feed(t) for t in (7, 8, 7, 8, 7, 9)] == [False] * 5 + [True]
+    m = _Matcher((1, 2))
+    assert [m.feed(t) for t in (1, 1, 2, 1, 2)] == [False, False, True, False, True]
+
+
+def test_seeded_block_below_its_close_keeps_the_answer_reserve_or_refuses():
+    """With the block open and no room to think, the close still costs its
+    whole length; a reserve that then cannot be kept is a refusal, not a
+    shorter answer."""
+    model = tiny_hybrid()
+    with Engine(model) as engine:
+        free = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=8)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end, nl, nl2 = unused[:4]
+        limits = ReasoningLimits((start,), (end,), (nl, end, nl2), seeded=True)
+        ok = GenerationRequest(
+            [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=5
+        )
+        tokens = collect(engine.submit(ok))
+        assert tokens[:3] == [nl, end, nl2] and len(tokens) == 8
+        with pytest.raises(ContextTooLong, match="closing it takes 3"):
+            engine.submit(
+                GenerationRequest(
+                    [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=6
+                )
+            )

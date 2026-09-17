@@ -1836,6 +1836,10 @@ class BatchGenerator:
                 if (
                     len(self._generation_batch) == 0
                     or time.perf_counter() - tic >= budget
+                    # A finished row's cache is a lazy slice of the batch
+                    # buffers until the caller evaluates it; stepping on
+                    # would copy the whole batch KV every step meanwhile.
+                    or any(r.finish_reason is not None for r in step)
                 ):
                     break
             self._counters.decode_time += time.perf_counter() - tic
