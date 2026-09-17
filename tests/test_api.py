@@ -93,6 +93,45 @@ def test_image_parts_name_the_missing_extra():
     assert exc.value.code == "extra_not_installed" and "vision" in exc.value.message
 
 
+def test_tool_call_arguments_reach_the_template_as_a_mapping():
+    """The wire carries arguments as a JSON string and content as null; the
+    Qwen3.8 template raises on a string, others trim the content."""
+
+    def call(args):
+        return {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "f", "arguments": args},
+        }
+
+    body = {
+        "messages": [
+            {"role": "user", "content": "w1"},
+            {"role": "assistant", "content": None, "tool_calls": [call('{"a": 1}')]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w2"},
+            {"role": "assistant", "content": None, "tool_calls": [call("")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w3"},
+            {"role": "assistant", "content": None, "tool_calls": [call({"b": 2})]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w4"},
+        ]
+    }
+    req = chat.parse_chat_request(body, "m")
+    turns = [m for m in req.messages if m.get("tool_calls")]
+    assert [t["content"] for t in turns] == ["", "", ""]
+    assert [t["tool_calls"][0]["function"]["arguments"] for t in turns] == [
+        {"a": 1},
+        {},
+        {"b": 2},
+    ]
+    # The request body is left as the client sent it.
+    assert body["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
+    for bad in ("{not json", "[1, 2]", 3):
+        body["messages"][1]["tool_calls"][0]["function"]["arguments"] = bad
+        with pytest.raises(ApiError) as exc:
+            chat.parse_chat_request(body, "m")
+        assert exc.value.param == "messages" and "arguments" in exc.value.message
+
+
 def test_chat_prompt_goes_through_the_template():
     tok = StubTokenizer()
     req = chat.parse_chat_request(

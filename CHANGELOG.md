@@ -49,6 +49,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   not only during the prefill: a tool call is collected until it closes, so
   a long one used to be decoded in silence and clients with an idle timeout
   gave the request up in the middle of it.
+- Tool-call arguments in the conversation reach the chat template as a
+  mapping (the wire carries a JSON string; `""` means no arguments), and a
+  `null` content is `""` there. The Qwen3.8 template raises on a string, so
+  the second step of every tool loop used to fail; an argument string that
+  is not a JSON object is a 400.
 
 ### Changed
 - `--reasoning-field none` keeps counting reasoning tokens and shows a think

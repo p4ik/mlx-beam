@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
@@ -165,10 +166,52 @@ def _normalise_messages(messages: Any) -> list[dict]:
                         param="messages",
                     )
             m["content"] = "".join(texts)
-        elif content is not None and not isinstance(content, str):
+        elif content is None:
+            # A turn made of tool calls has no content; a template that trims
+            # or concatenates it must see "", not None.
+            m["content"] = ""
+        elif not isinstance(content, str):
             raise ApiError(f"messages[{i}].content must be text", param="messages")
+        if m.get("tool_calls"):
+            m["tool_calls"] = [
+                _normalise_tool_call(tc, f"messages[{i}].tool_calls[{j}]")
+                for j, tc in enumerate(m["tool_calls"])
+            ]
         out.append(m)
     return out
+
+
+def _normalise_tool_call(tc: Any, where: str) -> dict:
+    """Arguments reach the template as a mapping. The wire carries them as a
+    JSON string; templates iterate them (Qwen3.8 raises on a string, Gemma 4
+    on anything that is not a mapping), and a call without arguments comes
+    as "" - which is {}, not an error."""
+    if not isinstance(tc, dict) or not isinstance(tc.get("function"), dict):
+        raise ApiError(f"{where} needs a function", param="messages")
+    tc = dict(tc)
+    fn = dict(tc["function"])
+    args = fn.get("arguments")
+    if args is None or args == "":
+        fn["arguments"] = {}
+    elif isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError as e:
+            raise ApiError(
+                f"{where}.function.arguments is not JSON: {e.msg}", param="messages"
+            ) from None
+        if not isinstance(parsed, dict):
+            raise ApiError(
+                f"{where}.function.arguments must be a JSON object", param="messages"
+            )
+        fn["arguments"] = parsed
+    elif not isinstance(args, dict):
+        raise ApiError(
+            f"{where}.function.arguments must be a JSON object or string",
+            param="messages",
+        )
+    tc["function"] = fn
+    return tc
 
 
 def parse_chat_request(
