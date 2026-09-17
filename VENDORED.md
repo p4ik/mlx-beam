@@ -103,7 +103,7 @@ in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
 | | |
 |---|---|
 | Upstream | `mlx-optiq` on PyPI (https://mlx-optiq.com); no public source repository, the wheel is the upstream |
-| Version | 0.5.6 (wheel sha256 in `tools/vendor.toml`); 0.5.7 checked 2026-09-15, both files unchanged |
+| Version | 0.5.6 (wheel sha256 in `tools/vendor.toml`); 0.5.7 checked 2026-09-15 and 0.5.8-0.5.10 checked 2026-09-17: both files unchanged, nothing taken. New in 0.5.9, noted for later: a GQA decode/verify attention kernel for head dim 256 (`ops/gqa_decode_attention.py`, MLX's own kernel with the template constants for dim 256, up to 16 query positions, enabled per tested model only) and a chunked verify attention for 5-15 positions (`ops/chunked_verify_attention.py`) - both for unquantized KV, so they do not touch the tiled path taken here; candidates for the speculative verify pass once it exists, to be measured on our hardware first |
 | License | MIT, `mlx_beam/_vendor/optiq/LICENSE` |
 | Taken | `runtime/kv/batch.py` as `kv_batch.py`, `runtime/fused_quant_sdpa.py` as `fused_quant_sdpa.py` |
 | Left out | everything else: the package is a server with its own glue, and the only parts the engine needs are the two below |
