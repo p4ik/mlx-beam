@@ -420,6 +420,23 @@ def test_a_stop_word_inside_the_label_leaves_no_label_behind():
         assert assembled(asm, ids) == ("", "")
 
 
+@pytest.mark.parametrize("route", [True, False])
+def test_a_stop_word_after_the_label_end_in_one_segment_keeps_the_text_before_it(
+    route,
+):
+    # Label, line end, reasoning and the stop word in one segment: the label
+    # goes, the reasoning before the stop stays.
+    tok = ChannelStubTokenizer()
+    tok._words[40] = "thought\nhello STOP"
+    asm = TextAssembler(
+        tok, prompt_tokens=[6, 1, 7], stop_words=["STOP"], route_thinking=route
+    )
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (CHANNEL_OPEN, 40)]
+    got = "".join(d.reasoning for d in deltas), "".join(d.content for d in deltas)
+    assert got == (("hello ", "") if route else ("", "<|channel>thought\nhello "))
+    assert asm.stopped and deltas[-1].finish_reason == "stop"
+
+
 @pytest.mark.parametrize(
     "tail, generated",
     [

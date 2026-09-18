@@ -324,7 +324,9 @@ class TextAssembler:
             if self._prev == "reasoning" and self._route:
                 delta.reasoning = clean
             elif self._prev == "label" and self._route:
-                pass
+                # The segment may hold the label's end and reasoning text
+                # before the stop word; only the label is dropped.
+                delta.reasoning = self._after_label(clean) or ""
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
             self.stopped = True
@@ -347,12 +349,10 @@ class TextAssembler:
                 delta.content = (self._take_lead() or opened) + clean
             if self._prev != "label":
                 self._label = ""
-            self._label += clean
-            if self._label_end in self._label:
+            rest = self._after_label(clean)
+            if rest is not None:
                 # The line end may arrive in one segment with the label, or
                 # with the first reasoning text: what follows it is reasoning.
-                rest = self._label.split(self._label_end, 1)[1]
-                self._label = ""
                 self._state = self._enter("reasoning")
                 current = "reasoning"
                 if self._route:
@@ -407,6 +407,16 @@ class TextAssembler:
     def _take_lead(self) -> str:
         lead, self._lead = self._lead, ""
         return lead
+
+    def _after_label(self, clean: str) -> str | None:
+        """Adds ``clean`` to the label; the text behind the label's line end
+        once it is there (the label is dropped), None while it is not."""
+        self._label += clean
+        if self._label_end not in self._label:
+            return None
+        rest = self._label.split(self._label_end, 1)[1]
+        self._label = ""
+        return rest
 
     def _enter(self, state: str):
         """The automaton moved to ``state`` by the assembler's own decision:
