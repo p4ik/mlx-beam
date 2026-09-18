@@ -80,6 +80,18 @@ quantized cache, the tiled attention from the optiq part below runs whenever
 it supports the shape (4/8 bit, group 32/64/128, fp16/bf16 queries, causal or
 no mask); the stock path stays for everything else.
 
+`packed K/V without a cache` - `models/base.py`, `scaled_dot_product_attention`
+and `_packed_layout`: a layer that shares another layer's cache (Gemma 4's
+KV-shared layers) receives that cache's packed `(packed, scales, biases)`
+triple with no cache of its own, and the dispatch keyed on `cache.bits` sent
+it down the stock path, which cannot take a triple. Bits and group size are
+now read off the packed shapes when the cache does not carry them. And
+`models/plamo2.py` calls `base.scaled_dot_product_attention` instead of
+`mx.fast.scaled_dot_product_attention` directly, so its attention layers
+take a quantized cache like every other model's. Tests:
+`test_quantized_kv_on_kv_sharing_and_direct_sdpa_models` (Gemma 4 with and
+without shared layers, PLaMo-2; 8-bit within 0.1 logprob of the plain run).
+
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
 is the whole buffer, so the assignment into a zero-width destination raised a

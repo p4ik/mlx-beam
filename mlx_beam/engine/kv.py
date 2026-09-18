@@ -58,12 +58,27 @@ def make_request_cache(model: Any, policy: KVPolicy) -> list[Any]:
     ``make_cache``) and swaps only plain ``KVCache`` entries.
     """
     caches = make_prompt_cache(model)
-    for idx, c in enumerate(caches):
-        bits = policy.bits_for(idx)
-        if bits is not None and type(c) is KVCache:
-            caches[idx] = MergeableQuantizedKVCache(
-                group_size=policy.group_size, bits=bits
-            )
+    quantized = [
+        i
+        for i, c in enumerate(caches)
+        if policy.bits_for(i) is not None and type(c) is KVCache
+    ]
+    if quantized:
+        # mx.quantize wants the head dim divisible by the group; say so in
+        # terms of the policy instead of a kernel error at warm-up.
+        args = getattr(model, "args", None)
+        for name in ("head_dim", "global_head_dim"):
+            dim = getattr(args, name, None)
+            if isinstance(dim, int) and dim % policy.group_size:
+                raise ValueError(
+                    f"kv group size {policy.group_size} does not divide the "
+                    f"model's {name} {dim}; use one of "
+                    f"{[g for g in VALID_GROUP_SIZES if dim % g == 0]}"
+                )
+    for idx in quantized:
+        caches[idx] = MergeableQuantizedKVCache(
+            group_size=policy.group_size, bits=policy.bits_for(idx)
+        )
     return caches
 
 

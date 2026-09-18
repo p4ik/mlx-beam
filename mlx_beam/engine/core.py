@@ -15,6 +15,7 @@ from dataclasses import asdict, replace
 from typing import Any
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
@@ -184,9 +185,13 @@ class Engine:
         fails here, not on the first client request."""
         if self._thread is not None:
             return self
-        # Lazy parameters carry the loading thread's stream; the worker cannot
+        # Lazy arrays carry the loading thread's stream; the worker cannot
         # evaluate them ("There is no Stream(cpu, 0) in current thread").
-        mx.eval(self.model.parameters())
+        # The state holds more than the parameters: rope frequency tables
+        # (Gemma 4, Llama 3) are lazy arrays outside parameters().
+        mx.eval(
+            [a for _, a in tree_flatten(self.model.state) if isinstance(a, mx.array)]
+        )
         self._started_at = time.monotonic()
         self._thread = threading.Thread(
             target=self._run, name="beam-engine", daemon=True

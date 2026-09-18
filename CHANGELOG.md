@@ -84,6 +84,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   its full width. A single short request beside a long prefill is served
   exactly as before; `/health` counts the guard's calls as
   `prefill_starved_calls`.
+- Quantized KV on models whose layers share a cache (Gemma 4) and on
+  PLaMo-2, which called MLX's attention directly: both died at warm-up with
+  a `TypeError`. A KV group size the model's head dim cannot carry is
+  refused with a message that names the policy and the sizes that fit. The
+  engine's worker thread evaluates every lazy array of the model, not only
+  its parameters: Gemma 4's and Llama 3's rope tables are lazy and killed
+  the worker with "There is no Stream(cpu, 0) in current thread".
 - A decode burst under a shared prefill ends when a row finishes, so its
   extracted cache is evaluated before the next step instead of forcing a
   copy of the whole batch KV every step meanwhile.
