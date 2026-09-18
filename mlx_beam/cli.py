@@ -176,6 +176,17 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "take their bits, unlisted ones follow --kv-bits (optiq leaves them "
         "at full precision and ignores --kv-bits)",
     )
+    kv.add_argument(
+        "--kv-prefill",
+        choices=("exact", "quantized"),
+        help="when a quantized layer becomes quantized: 'exact' (default) keeps "
+        "the prompt at model precision while it is prefilled and quantizes at "
+        "the handover to decoding, as mlx-lm does; 'quantized' writes it "
+        "quantized from the first token, which saves the prompt's full-"
+        "precision transient (~2 GB for a 64k prompt on a 27B) and on some "
+        "models costs accuracy - use it for a profile that was measured with "
+        'it (a kv_config object may carry "prefill": "quantized")',
+    )
     p.add_argument(
         "--max-queued",
         type=int,
@@ -284,6 +295,7 @@ def kv_policy_from_args(args):
     from mlx_beam.engine import KVPolicy
 
     bits, group_size, layers = args.kv_bits, args.kv_group_size, {}
+    prefill, source = "exact", "default"
     if args.kv_config:
         try:
             with open(args.kv_config) as f:
@@ -320,10 +332,20 @@ def kv_policy_from_args(args):
                 bits = cfg.get("bits", bits)
                 group_size = cfg.get("group_size", group_size)
                 layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
+                if "prefill" in cfg:
+                    prefill, source = cfg["prefill"], "profile"
         except (OSError, ValueError) as e:
             raise SystemExit(f"--kv-config {args.kv_config}: {e}") from None
+    if getattr(args, "kv_prefill", None):
+        prefill, source = args.kv_prefill, "flag"
     try:
-        return KVPolicy(bits=bits, group_size=group_size, layers=layers)
+        return KVPolicy(
+            bits=bits,
+            group_size=group_size,
+            layers=layers,
+            prefill=prefill,
+            prefill_source=source,
+        )
     except ValueError as e:
         raise SystemExit(f"kv policy: {e}") from None
 

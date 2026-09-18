@@ -6,6 +6,21 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Added
+- `--kv-prefill exact|quantized` (default `exact`): a quantized layer is
+  kept at model precision while the prompt is prefilled and quantized once
+  at the move to decoding, which is what mlx-lm's quantized path computes
+  and the semantics every bit profile was calibrated under. `quantized`
+  writes the cache quantized from the first token, the batch path's former
+  only behaviour: it saves the prompt's full-precision transient and on
+  some models costs accuracy (Gemma 4 at 8 bit: KL 0.022 against 0.0005).
+  A `kv_config` object may carry `"prefill": "quantized"` for a profile
+  measured with it; the flag beats the profile; `/health` shows the value
+  and where it came from. A prefix restored from the prompt store keeps its
+  quantized codes across the round trip.
+
+## [0.1.0a2] - 2026-09-18
+
 ### Fixed
 - The same prompt sent again resumes from the stored entry instead of
   prefilling from scratch on hybrid models: the prompt's checkpoint is taken

@@ -93,17 +93,20 @@ def test_health_reports_the_kv_layout_actually_built():
     mx.random.seed(0)
     model = qwen3_next.Model(qwen3_next.ModelArgs(**{**TINY_HYBRID, "head_dim": 64}))
     mx.eval(model.parameters())
-    with Engine(model, kv_policy=KVPolicy(bits=4)) as engine:
-        collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=2)))
-        h = engine.health()
-        assert h["alive"] and h["kv"]["policy"]["bits"] == 4
-        applied = h["kv"]["applied"]
-        # Attention layers carry 4 bits; the recurrent layers stay as they are.
-        assert {e["type"] for e in applied} >= {
-            "MergeableQuantizedKVCache",
-            "ArraysCache",
-        }
-        assert all(e.get("bits", 4) == 4 for e in applied)
+    for prefill, kind in (
+        ("exact", "DeferredQuantizedKVCache"),
+        ("quantized", "MergeableQuantizedKVCache"),
+    ):
+        with Engine(model, kv_policy=KVPolicy(bits=4, prefill=prefill)) as engine:
+            collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=2)))
+            h = engine.health()
+            assert h["alive"] and h["kv"]["policy"]["bits"] == 4
+            assert h["kv"]["policy"]["prefill"] == prefill
+            applied = h["kv"]["applied"]
+            # Attention layers carry 4 bits; the recurrent layers stay as they are.
+            assert {e["type"] for e in applied} >= {kind, "ArraysCache"}
+            assert all(e.get("bits", 4) == 4 for e in applied)
+            assert {e.get("prefill") for e in applied if "bits" in e} == {prefill}
 
 
 def test_a_policy_the_model_cannot_carry_fails_at_start():
