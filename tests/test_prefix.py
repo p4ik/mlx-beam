@@ -283,3 +283,40 @@ def test_a_second_turn_replaces_the_first_entry():
         # and the conversation's first turn is still served from it
         _, cached = run(engine, prompt + out1 + [60])
         assert cached == len(prompt) + len(out1)
+
+
+def test_two_branches_from_one_entry_replace_it_and_keep_their_own_ends():
+    model = tiny_hybrid()
+    prompt = list(range(1, 21))
+    with Engine(model) as engine:
+        out, _ = run(engine, prompt)
+        prefix = prompt + out
+        a, b = prefix + [50, 51, 52], prefix + [55, 56, 57]
+        with Engine(model) as cold:
+            ref_a, _ = run(cold, a)
+        with Engine(model) as cold:
+            ref_b, _ = run(cold, b)
+        out_a, cached_a = run(engine, a)
+        out_b, cached_b = run(engine, b)
+        assert (out_a, out_b) == (ref_a, ref_b)
+        assert cached_a == cached_b == len(prefix)
+        # the first turn's entry is gone, each branch is its own entry
+        assert engine.prefix_store.describe()["entries"] == 2
+        assert not engine.prefix_store.has(engine.model_key, prefix)
+        again, cached = run(engine, a)
+        assert again == ref_a and cached == len(a) - 1
+
+
+def test_a_divergent_continuation_keeps_the_entry_it_branched_from():
+    # Sharing a checkpoint with an entry is not extending it: nothing is
+    # inherited, the entry stays, the new one has only its own checkpoints.
+    model = tiny_hybrid()
+    prompt = list(range(1, 25))
+    with Engine(model) as engine:
+        run(engine, prompt, boundaries=[12])
+        div = prompt[:12] + [40] * 8
+        out, cached = run(engine, div, boundaries=[12])
+        assert cached == 12
+        assert engine.prefix_store.describe()["entries"] == 2
+        entry = engine.prefix_store._trie.get(engine.model_key, div + out)
+        assert sorted(entry.checkpoints) == [12, len(div) - 1]

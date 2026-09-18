@@ -131,6 +131,15 @@ def test_serve_kv_policy_from_arguments(tmp_path):
         kv_policy_from_args(
             argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(nameless))
         )
+    # Without bits an entry must be an error, not "this layer stays at model
+    # precision" behind the caller's back (nor with an explicit null).
+    for text in ('[{"layer_idx": 3}]', '[{"layer_idx": 3, "bits": null}]'):
+        bitless = tmp_path / "bitless.json"
+        bitless.write_text(text)
+        with pytest.raises(SystemExit, match="bits"):
+            kv_policy_from_args(
+                argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(bitless))
+            )
 
 
 def serve_args(*argv):

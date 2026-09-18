@@ -291,12 +291,20 @@ def kv_policy_from_args(args):
             if isinstance(cfg, list):
                 # The list a quantized package ships: only the layers it
                 # names, each with its own bits; the rest follow --kv-bits.
+                # A missing or null bits must not pass as "keep the layer
+                # unquantized": that would silently undo --kv-bits for it.
                 bad = [
-                    e for e in cfg if not isinstance(e, dict) or "layer_idx" not in e
+                    e
+                    for e in cfg
+                    if not isinstance(e, dict)
+                    or "layer_idx" not in e
+                    or not isinstance(e.get("bits"), int)
                 ]
                 if bad:
-                    raise ValueError("every list entry needs layer_idx and bits")
-                layers = {int(e["layer_idx"]): e.get("bits") for e in cfg}
+                    raise ValueError(
+                        f"every list entry needs layer_idx and integer bits, got {bad[0]!r}"
+                    )
+                layers = {int(e["layer_idx"]): e["bits"] for e in cfg}
                 sizes = {e["group_size"] for e in cfg if "group_size" in e}
                 if len(sizes) > 1:
                     raise ValueError(

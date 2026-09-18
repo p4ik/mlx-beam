@@ -10,9 +10,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - The same prompt sent again resumes from the stored entry instead of
   prefilling from scratch on hybrid models: the prompt's checkpoint is taken
   before its last token, which is the token a lookup keeps to prefill.
-- A conversation is one store entry, not one per turn: when a request
-  continues a stored entry, that point is checkpointed, so the finished
-  turn can replace the entry it grew from.
+- A conversation is one store entry, not one per turn: when a finished
+  turn extends a stored entry, it inherits that entry's recurrent end
+  state as a checkpoint and replaces it. What is freed is the old entry's
+  KV cache and its place in the entry count; the recurrent states stay.
 - `max_context` (and the vocabulary size) are read through multimodal
   wrapper configs (`text_config`, the nested language model), so a
   Qwen3.5-class model reports its window instead of `null`.

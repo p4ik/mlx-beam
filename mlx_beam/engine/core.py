@@ -20,7 +20,7 @@ from mlx.utils import tree_flatten
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
 from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
-from mlx_beam.engine.prefix import PrefixStore, recurrent_layers, snapshot_recurrent
+from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -464,17 +464,6 @@ class Engine:
                 )
             else:
                 cache, covered, carried = hit.cache, hit.covered, hit.checkpoints
-                if (
-                    hit.kind == "shorter"
-                    and hit.covered == hit.found
-                    and covered not in carried
-                    and recurrent_layers(cache)
-                ):
-                    # The entry is a prefix of this prompt and came back whole.
-                    # A snapshot here lets the finished sequence replace it in
-                    # the store instead of standing beside it (one entry per
-                    # conversation, not one per turn).
-                    carried = {**carried, covered: snapshot_recurrent(cache)}
             rest = list(req.tokens[covered:])
             # Segments end where a checkpoint is wanted; the generator reports
             # each end, and the last token always stands alone.

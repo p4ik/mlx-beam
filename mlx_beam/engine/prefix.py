@@ -96,6 +96,10 @@ class Entry:
             _snapshot_bytes(s) for s in self.checkpoints.values()
         )
 
+    def add_checkpoint(self, position: int, snap: dict[int, list]) -> None:
+        self.checkpoints[position] = snap
+        self.nbytes += _snapshot_bytes(snap)
+
 
 @dataclass
 class Hit:
@@ -227,13 +231,15 @@ class PrefixStore:
         rec = recurrent_layers(cache)
         cuttable = all(c.is_trimmable() for i, c in enumerate(cache) if i not in rec)
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
-            if (
-                old.cache_type == "system"
-                or not cuttable
-                or (rec and prefix_len not in entry.checkpoints)
-            ):
+            if old.cache_type == "system" or not cuttable:
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue
+            if rec and prefix_len not in entry.checkpoints:
+                # The old entry stands at its own end; that recurrent state
+                # is exactly the checkpoint the new entry lacks there. Moved,
+                # not copied: one entry per conversation, not one per turn.
+                entry.add_checkpoint(prefix_len, {i: old.cache[i].cache for i in rec})
+                self._nbytes += _snapshot_bytes(entry.checkpoints[prefix_len])
             self._nbytes -= old.nbytes
             self._remove_lru(model, tokens[:prefix_len])
         self._evict()
