@@ -20,7 +20,7 @@ from mlx.utils import tree_flatten
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
 from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
-from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
+from mlx_beam.engine.prefix import PrefixStore, recurrent_layers, snapshot_recurrent
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -61,18 +61,40 @@ class QueueFull(RuntimeError):
     """More requests are waiting than --max-queued allows; try again later."""
 
 
+def _model_args(model: Any) -> list:
+    """Where a model keeps its sizes: its own args, the `text_config` dict a
+    multimodal wrapper stores instead (qwen3_5, gemma), and the nested
+    language model's args."""
+    found = []
+    args = getattr(model, "args", None)
+    if args is not None:
+        found.append(args)
+        text = getattr(args, "text_config", None)
+        if isinstance(text, dict):
+            found.append(text)
+    inner = getattr(getattr(model, "language_model", None), "args", None)
+    if inner is not None:
+        found.append(inner)
+    return found
+
+
+def _model_int(model: Any, names: tuple[str, ...]) -> int | None:
+    for args in _model_args(model):
+        for name in names:
+            value = (
+                args.get(name) if isinstance(args, dict) else getattr(args, name, None)
+            )
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None
+
+
 def model_vocab_size(model: Any) -> int | None:
-    value = getattr(getattr(model, "args", None), "vocab_size", None)
-    return value if isinstance(value, int) and value > 0 else None
+    return _model_int(model, ("vocab_size",))
 
 
 def model_context_length(model: Any) -> int | None:
-    args = getattr(model, "args", None)
-    for name in ("max_position_embeddings", "max_seq_len", "n_positions"):
-        value = getattr(args, name, None)
-        if isinstance(value, int) and value > 0:
-            return value
-    return None
+    return _model_int(model, ("max_position_embeddings", "max_seq_len", "n_positions"))
 
 
 def _logits_processors(p: SamplingParams):
@@ -442,6 +464,17 @@ class Engine:
                 )
             else:
                 cache, covered, carried = hit.cache, hit.covered, hit.checkpoints
+                if (
+                    hit.kind == "shorter"
+                    and hit.covered == hit.found
+                    and covered not in carried
+                    and recurrent_layers(cache)
+                ):
+                    # The entry is a prefix of this prompt and came back whole.
+                    # A snapshot here lets the finished sequence replace it in
+                    # the store instead of standing beside it (one entry per
+                    # conversation, not one per turn).
+                    carried = {**carried, covered: snapshot_recurrent(cache)}
             rest = list(req.tokens[covered:])
             # Segments end where a checkpoint is wanted; the generator reports
             # each end, and the last token always stands alone.
@@ -641,11 +674,12 @@ class Engine:
                         continue
                     s.put(PromptProgress(r.progress[0], r.progress[1], s.prompt_cached))
                     # The generator splits the last prompt token into its own
-                    # segment; that end is no boundary of ours.
+                    # segment. The end before it is the prompt's checkpoint:
+                    # a lookup keeps one token to prefill, so the same prompt
+                    # again resumes from len-1; a snapshot after the last
+                    # token would serve only longer prompts.
                     covered = self._bookkeeping[r.uid][0]
-                    if r.end_of_segment and (
-                        r.end_of_prompt or r.progress[0] != r.progress[1] - 1
-                    ):
+                    if r.end_of_segment and not r.end_of_prompt:
                         self._checkpoint(gen, r.uid, covered + r.progress[0])
                     elif not r.end_of_prompt:
                         self._stride_checkpoint(gen, r.uid, covered + r.progress[0])

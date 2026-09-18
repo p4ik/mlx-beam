@@ -51,13 +51,16 @@ def test_hybrid_needs_a_checkpoint():
         prompt = list(range(1, 21))
         cold, cached = run(engine, prompt)
         assert cached == 0
-        # Stored with the prompt end as its only checkpoint: a strict prefix
-        # cannot be served, a longer prompt continues from the prompt end.
+        # Stored with one checkpoint, before the prompt's last token: a
+        # strict prefix cannot be served, a longer prompt continues from
+        # there, and the same prompt again has one token left to prefill.
         assert engine.prefix_store.describe()["entries"] == 1
         _, cached = run(engine, prompt[:10] + [50, 51])
         assert cached == 0
         out, cached = run(engine, prompt + [60, 61])
-        assert cached >= 20
+        assert cached == 19
+        again, cached = run(engine, prompt)
+        assert cached == 19 and again == cold
 
 
 def test_hybrid_resumes_from_boundary_exactly():
@@ -73,7 +76,7 @@ def test_hybrid_resumes_from_boundary_exactly():
         assert out_a == ref_a
         store = engine.prefix_store
         entry = store._trie.get(engine.model_key, prompt + out_a)
-        assert sorted(entry.checkpoints) == [12, 24]
+        assert sorted(entry.checkpoints) == [12, 23]
         out_b, cached = run(engine, prompt[:12] + [40, 41, 42], boundaries=[12])
         assert cached == 12 and out_b == ref_b
         d = store.describe()
@@ -185,7 +188,8 @@ def test_stride_checkpoints_are_thinned_to_the_cap():
         entry = engine.prefix_store._trie.get(
             engine.model_key, prompt + entry_tail(engine, prompt)
         )
-        stride_points = [p for p in entry.checkpoints if p < 40]
+        # the prompt's own checkpoint (39) is a boundary, not a stride point
+        stride_points = [p for p in entry.checkpoints if p < 39]
         assert len(stride_points) == 2 and max(stride_points) == 32
 
 
@@ -256,3 +260,26 @@ def test_a_prefix_entry_owns_only_its_own_tokens():
     assert entry.nbytes == 2 * 4 * 8 * 4  # keys + values, 4 tokens, 8 dims, fp32
     hit = store.fetch("m", tokens[:4] + [99])
     assert hit is not None and hit.covered == 4
+
+
+def test_a_second_turn_replaces_the_first_entry():
+    # A hybrid cannot trim, so the first turn's entry could only be dropped
+    # if the second turn can be cut back to it: the snapshot taken where the
+    # restored entry ends makes that possible. One entry per conversation.
+    model = tiny_hybrid()
+    prompt = list(range(1, 21))
+    with Engine(model) as engine:
+        out1, _ = run(engine, prompt)
+        turn2 = prompt + out1 + [50, 51, 52]
+        bounds = [len(prompt), len(prompt) + len(out1)]
+        with Engine(model) as cold:
+            ref2, _ = run(cold, turn2, boundaries=bounds)
+        out2, cached = run(engine, turn2, boundaries=bounds)
+        assert cached == len(prompt) + len(out1) and out2 == ref2
+        d = engine.prefix_store.describe()
+        assert d["entries"] == 1 and d["by_type"]["assistant"] == 1
+        entry = engine.prefix_store._trie.get(engine.model_key, turn2 + out2)
+        assert len(prompt) + len(out1) in entry.checkpoints
+        # and the conversation's first turn is still served from it
+        _, cached = run(engine, prompt + out1 + [60])
+        assert cached == len(prompt) + len(out1)

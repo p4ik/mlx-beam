@@ -423,3 +423,45 @@ def test_a_group_size_the_head_dim_cannot_carry_names_the_policy():
     with pytest.raises(EngineDead, match="group size 64 does not divide") as exc:
         engine.start()
     assert "head_dim 96" in str(exc.value) and "[32]" in str(exc.value)
+
+
+# Qwen3.5/3.8 ship as a multimodal wrapper: `Model.args` holds only the
+# model type and a `text_config` dict, the sizes live one level down.
+TINY_QWEN35_WRAPPED = {
+    "model_type": "qwen3_5",
+    "text_config": dict(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        vocab_size=64,
+        max_position_embeddings=512,
+        full_attention_interval=2,
+    ),
+}
+
+
+def test_sizes_come_from_the_wrapper_text_config():
+    from mlx_beam._vendor.mlx_lm.models import qwen3_5
+    from mlx_beam.engine import ContextTooLong
+    from mlx_beam.engine.core import model_context_length, model_vocab_size
+
+    mx.random.seed(0)
+    model = qwen3_5.Model(qwen3_5.ModelArgs.from_dict(TINY_QWEN35_WRAPPED))
+    mx.eval(model.parameters())
+    assert model_context_length(model) == 512
+    assert model_vocab_size(model) == 64
+    with Engine(model) as engine:
+        out = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=3)))
+        assert len(out) == 3
+        assert engine.health()["max_context"] == 512
+        with pytest.raises(ContextTooLong):
+            engine.submit(GenerationRequest(list(range(1, 60)) * 9, max_tokens=8))
