@@ -62,8 +62,9 @@ def xtc_special_ids(tokenizer) -> tuple[int, ...]:
 def holds_incomplete_bytes(detokenizer) -> bool:
     """Whether the text the detokenizer holds back ends in a cut UTF-8
     sequence. mlx-lm's BPE and SPM detokenizers keep bytes until they form
-    a character; only those bytes tell a fragment from a real U+FFFD. An
-    unknown detokenizer is taken to hold a fragment, as before."""
+    a character; only those bytes tell a fragment from a real U+FFFD. With
+    no bytes to look at (the naive detokenizer) nothing is dropped: a
+    spare U+FFFD is cosmetic, a deleted character is not."""
     held = getattr(detokenizer, "_unflushed", None)
     if isinstance(held, str):  # BPE: byte-level characters
         try:
@@ -71,9 +72,9 @@ def holds_incomplete_bytes(detokenizer) -> bool:
 
             held = bytes(_byte_decoder()[c] for c in held)
         except KeyError:
-            return True
+            return False
     if not isinstance(held, bytes):
-        return True
+        return False
     try:
         held.decode("utf-8")
     except UnicodeDecodeError:

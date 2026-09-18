@@ -116,6 +116,11 @@ def _parameter_bodies(parameters: str) -> list:
         close = chunk.rfind(_parameter_end)
         if close < 0:
             raise ValueError("Parameter without a closing tag.")
+        # Text between a parameter's end tag and the next tag is nobody's:
+        # a literal tag inside a value put it there, and dropping it would
+        # lose part of that value in silence.
+        if chunk[close + len(_parameter_end) :].strip():
+            raise ValueError("Text outside a parameter.")
         bodies.append(chunk[:close])
     return bodies
 

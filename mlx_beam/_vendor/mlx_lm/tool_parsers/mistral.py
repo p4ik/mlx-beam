@@ -48,14 +48,31 @@ def _parse_header_calls(text: str) -> list[dict[str, Any]]:
     decoder = json.JSONDecoder()
     calls = []
     pos = 0
-    while (match := _tool_call_header_regex.search(text, pos)) is not None:
+    # Anchored, not searched: a header stands where the text begins or right
+    # after the previous call's JSON (and its own [TOOL_CALLS] marker). A
+    # search would read "name[ARGS]{}" out of a JSON string in a cut-off
+    # list and make it a call.
+    while (match := _tool_call_header_regex.match(text, _skip_between(text, pos))):
         pos = match.end()
         try:
             arguments, pos = decoder.raw_decode(text, pos)
         except json.JSONDecodeError as e:
             raise ValueError(f"Could not parse tool call from: {text}") from e
         calls.append(dict(name=match.group(1), arguments=arguments))
+    if calls and text[pos:].strip():
+        raise ValueError(f"Could not parse tool call from: {text}")
     return calls
+
+
+def _skip_between(text: str, pos: int) -> int:
+    """Past the whitespace and the start marker every call repeats."""
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if text.startswith(tool_call_start, pos):
+            pos += len(tool_call_start)
+            continue
+        return pos
 
 
 def parse_tool_call(text: str, tools: Any | None = None):

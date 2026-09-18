@@ -86,7 +86,7 @@ def test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split():
         "<parameter=content>Use </parameter> before <parameter=path>other.txt"
         "</parameter> after</parameter></function>"
     )
-    with pytest.raises(ValueError, match="twice"):
+    with pytest.raises(ValueError, match="twice|outside"):
         qwen3_coder.parse_tool_call(text, WRITE)
     # A name outside a closed schema is refused the same way; an open
     # schema (no additionalProperties: false) still lets it through.
@@ -104,3 +104,41 @@ def test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split():
         qwen3_coder.parse_tool_call(text, closed)
     with pytest.raises(ValueError, match="No function"):
         qwen3_coder.parse_tool_call("plain text", WRITE)
+
+
+def test_mistral_headers_are_anchored_never_read_out_of_a_json_string():
+    """A cut-off JSON list is not a call; a search for "name[ARGS]" would
+    find one inside a string argument. Headers stand at the start or right
+    after the previous call, with the marker the model repeats in between."""
+    cut = (
+        '[{"name":"write","arguments":{"content":"Example: example_action[ARGS]{}"}},'
+        ' {"name":"bad","arguments":'
+    )
+    with pytest.raises(ValueError):
+        mistral.parse_tool_call(cut, None)
+    calls = mistral.parse_tool_call(
+        'write[ARGS]{"a": 1}[TOOL_CALLS]other[ARGS]{"b": 2}', None
+    )
+    assert [c["name"] for c in calls] == ["write", "other"]
+    with pytest.raises(ValueError):
+        mistral.parse_tool_call('write[ARGS]{"a": 1} stray text', None)
+
+
+def test_qwen_text_between_parameters_is_an_error_not_dropped():
+    """A literal <parameter=…> in a value that names an unused, allowed
+    parameter would split the value and drop the words after the literal
+    end tag; that text belongs to nobody, so the call is refused."""
+    text = (
+        "<function=write><parameter=content>Use </parameter> before "
+        "<parameter=path>other.txt</parameter> after</parameter></function>"
+    )
+    closed = copy.deepcopy(WRITE)
+    closed[0]["function"]["parameters"]["additionalProperties"] = False
+    with pytest.raises(ValueError, match="outside"):
+        qwen3_coder.parse_tool_call(text, closed)
+    # Whitespace and newlines between parameters are the format itself.
+    ok = "<function=write>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nx\n</parameter>\n</function>"
+    assert qwen3_coder.parse_tool_call(ok, closed)["arguments"] == {
+        "path": "a",
+        "content": "x",
+    }

@@ -42,20 +42,24 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and `finish_reason` says what really happened (`stop` / `length`) instead
   of `tool_calls` with no call. Calls before a cut-off one are kept by
   parsing the longest prefix that parses, so a `[TOOL_CALLS]` quoted inside
-  a JSON argument never becomes a call of its own. A parser result JSON
-  cannot carry (a set from a literal) is an unreadable call, not a 500.
+  a JSON argument never becomes a call of its own, and the Mistral header
+  parser no longer reads a `name[ARGS]` out of a string argument of a
+  cut-off JSON list. A parser result JSON cannot carry (a set from a
+  literal) is an unreadable call, not a 500.
 - Qwen tool-call parameters end at their last `</parameter>`, so a single
-  literal end tag in a value survives; a parameter name seen twice, or one a
-  schema with `additionalProperties: false` rules out, is an error the
-  caller sees instead of one argument silently overwriting another. The
+  literal end tag in a value survives; a parameter name seen twice, one a
+  schema with `additionalProperties: false` rules out, or text left between
+  two parameters by a literal tag is an error the caller sees instead of an
+  argument silently overwritten or shortened. The
   vendored Qwen and Mistral parsers carry upstream's fixes for a parameter
   name without `>` and for the JSON list form (see `VENDORED.md`).
 - A stream sends an SSE comment whenever nothing went out for five seconds
   while the worker made progress, not only during the prefill: a tool call
   is collected until it closes, so a long one used to be decoded in silence
   and clients with an idle timeout gave the request up in the middle of it.
-  A worker that stopped stepping gets no comment, so a watchdog in front of
-  the server still sees the hang.
+  A worker that stopped stepping gets no comment, before the first token as
+  well as after it, so a watchdog in front of the server still sees the
+  hang.
 - `/v1/completions` returns what the model wrote: think markers and
   tool-call blocks stay in the text; they were parsed away. Chat parses a
   tool-call block only when the request offered tools.
@@ -64,7 +68,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   other request with it (`extract()` on an empty cache).
 - Text the detokenizer or the marker automaton still held when the stop
   token came is no longer lost; a real U+FFFD the model wrote before a
-  forced close is kept, only a byte fragment the cut left is dropped.
+  forced close is kept, only a byte fragment the cut left is dropped - and
+  only when the detokenizer shows its bytes (BPE, SPM); without that
+  evidence nothing is dropped.
 - A think-block end marker the model began on the arming token and
   continued on the next is completed instead of answered with a forced
   newline in place of the first answer token (multi-token markers). A
@@ -97,9 +103,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - Responses API: every output item has its own id and text when text and
   tool calls interleave; `output_text.*` carry `logprobs`,
   `function_call_arguments.done` carries `name`, a cut-off message item is
-  `incomplete`, `instructions` and `tool_choice` are echoed, and a
-  `reasoning` input item reaches the template as the reasoning of the turn
-  it preceded.
+  `incomplete` from its done event on, `instructions` and `tool_choice` are
+  echoed, and a `reasoning` input item reaches the template as the
+  reasoning of the turn it preceded (a badly shaped one is a 400).
 - Wrongly shaped request fields (`response_format`, `stream_options`,
   `chat_template_kwargs`, `metadata`, `text`, a content part's `text`,
   `stream`/`echo`/`logprobs` that are not booleans, `n: true`) are 400s,

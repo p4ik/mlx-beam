@@ -148,9 +148,12 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
             # The client hands the earlier think block back; a template that
             # reads reasoning_content gets it on the assistant turn that
             # follows (mirror_reasoning fills the other keys).
+            parts = item.get("content") or []
+            if not isinstance(parts, list):
+                raise ApiError(f"input[{i}].content must be a list", param="input")
             text = "".join(
-                part.get("text", "")
-                for part in item.get("content") or []
+                text_field(part, "text", f"input[{i}]")
+                for part in parts
                 if isinstance(part, dict)
             )
             if text:
@@ -340,7 +343,7 @@ class ResponsesResponder:
         item_id = ""
         item_text = ""
 
-        def close_current():
+        def close_current(cut: bool = False):
             nonlocal current
             if current == "reasoning":
                 item = {
@@ -363,7 +366,7 @@ class ResponsesResponder:
                 item = {
                     "id": item_id,
                     "type": "message",
-                    "status": "completed",
+                    "status": "incomplete" if cut else "completed",
                     "role": "assistant",
                     "content": [part],
                 }
@@ -478,13 +481,13 @@ class ResponsesResponder:
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
                 break
-        yield from close_current()
+        # The item's status goes out with its done event; nothing already
+        # on the wire is changed afterwards.
+        yield from close_current(cut=total.finish_reason == "length")
         incomplete = (
             {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
         )
         status = "incomplete" if incomplete else "completed"
-        if incomplete and output and output[-1]["type"] == "message":
-            output[-1]["status"] = "incomplete"
         final = self._response(status, output, cached, incomplete)
         yield ev(
             "response.completed" if not incomplete else "response.incomplete",

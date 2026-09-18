@@ -109,6 +109,17 @@ the upstream files at those commits, nothing else; they postdate the pin and
 go away with the next pin bump. Tests: `test_qwen_parameter_without_closing_bracket`,
 `test_mistral_json_list_and_cut_call`.
 
+`anchored headers` - `tool_parsers/mistral.py`, `_parse_header_calls`:
+upstream searches the text for the next `name[ARGS]` header, so a cut-off
+JSON list (`[{"name": …, "arguments": {"content": "see other[ARGS]{}"}}, {`)
+that fails `json.loads` falls through to the header parser, which reads
+`other[ARGS]{}` out of the string argument and returns it as a call. A
+header now has to stand at the start of the text or right after the
+previous call's JSON, with only whitespace and the model's repeated
+`[TOOL_CALLS]` marker in between; anything else is an error, and the engine
+returns the block as text. Test:
+`test_mistral_headers_are_anchored_never_read_out_of_a_json_string`.
+
 `parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies` and
 `_closed_parameters`: upstream cuts every parameter at the first
 `</parameter>` (`<parameter=(.*?)</parameter>`), so a value that contains the
@@ -117,11 +128,15 @@ error. A parameter now ends at the last `</parameter>` before the next
 `<parameter=` or the end of the call, and a parameter without an end tag is
 an error (the call was cut short) instead of a silently missing argument. A
 literal `<parameter=name>` inside a value cannot be told from a second
-parameter, so a name seen twice, or one a schema with `additionalProperties:
-false` rules out, raises instead of overwriting an argument; the engine then
-returns the call as text. Stays after the pin bump unless upstream fixes it.
+parameter, so a name seen twice, one a schema with `additionalProperties:
+false` rules out, or text left between a parameter's end tag and the next
+tag (a literal tag split the value) raises instead of overwriting or
+dropping part of an argument; the engine then returns the call as text.
+Unescaped markup stays ambiguous, so the promise is "never silently", not
+"always parsed". Stays after the pin bump unless upstream fixes it.
 Tests: `test_qwen_literal_end_tag_in_a_value`,
-`test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split`.
+`test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split`,
+`test_qwen_text_between_parameters_is_an_error_not_dropped`.
 
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).

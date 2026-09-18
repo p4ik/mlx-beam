@@ -335,13 +335,19 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
     def _await_first(self, result, keepalive: bool):
+        """The first event; while it is awaited a streaming client gets a
+        comment per wait, but only while the worker keeps stepping - a hung
+        worker must not look busy (see _events)."""
+        engine = self.served.engine
+        seen_step = engine.last_step
         while True:
             try:
                 return result.next_event(timeout=KEEPALIVE_S)
             except queue.Empty:
                 if self._client_gone():
                     raise ConnectionResetError("client went away") from None
-                if keepalive:
+                if keepalive and engine.last_step != seen_step:
+                    seen_step = engine.last_step
                     p = result.progress
                     self._comment(
                         f"prefill {p.processed}/{p.total}" if p else "waiting"

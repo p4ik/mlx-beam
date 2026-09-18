@@ -533,3 +533,47 @@ def test_bad_bodies_are_400s_and_methods_405(server):
     assert raw("HEAD", {})[0] == 405  # no body on HEAD, by the protocol
     status, data = raw("PUT", {"Content-Length": "0"})
     assert status == 405 and json.loads(data)["error"]["message"]
+
+
+def test_no_keepalive_before_the_first_token_without_worker_progress(monkeypatch):
+    """The wait for the first token follows the same rule as the stream
+    after it: a comment per wait only while the worker steps."""
+    import io
+    import queue as q
+
+    import mlx_beam.server as srv
+
+    class Stalled:
+        progress = None
+
+        def __init__(self):
+            self.calls = 0
+
+        def next_event(self, timeout):
+            self.calls += 1
+            if self.calls <= 3:
+                raise q.Empty
+            return None
+
+    class FakeEngine:
+        last_step = 1.0
+
+    monkeypatch.setattr(srv, "KEEPALIVE_S", 0.001)
+    handler = object.__new__(srv.Handler)
+    handler.wfile = io.BytesIO()
+    handler._last_write = 0.0
+    handler._client_gone = lambda: False
+    handler.served = type("S", (), {"engine": FakeEngine()})()
+    assert handler._await_first(Stalled(), keepalive=True) is None
+    assert handler.wfile.getvalue() == b""
+    stepping = Stalled()
+    real = stepping.next_event
+
+    def next_event(timeout):
+        FakeEngine.last_step += 1
+        return real(timeout)
+
+    stepping.next_event = next_event
+    handler.wfile = io.BytesIO()
+    handler._await_first(stepping, keepalive=True)
+    assert handler.wfile.getvalue().count(b": waiting") == 3

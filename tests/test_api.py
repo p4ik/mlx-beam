@@ -645,9 +645,11 @@ def test_server_template_args_are_overridden_by_the_request():
     assert chat.parse_chat_request({"messages": msgs}, "m").template_kwargs == {}
 
 
-def test_forced_close_drops_the_half_character_the_cut_left():
-    # A byte-level tokenizer cut mid-character flushes the fragment as U+FFFD
-    # together with the first forced token; the stub plays that token.
+def test_forced_close_keeps_a_replacement_char_without_byte_evidence():
+    # Only a detokenizer that shows its held bytes (BPE, SPM - see the
+    # ByteTokenizer test) can prove a U+FFFD was a cut character. The stub
+    # cannot, so its U+FFFD stays: a spare one is cosmetic, a deleted real
+    # character is not.
     tok = StubTokenizer()
     tok._words[40] = "�\n"
     req = chat.parse_chat_request(
@@ -664,17 +666,16 @@ def test_forced_close_drops_the_half_character_the_cut_left():
     ]
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
     msg = out["choices"][0]["message"]
-    assert msg["reasoning"] == "w10 \n" and msg["content"] == "w11 "
-    # Streamed, the fragment never reaches the wire either.
+    assert msg["reasoning"] == "w10 \ufffd\n" and msg["content"] == "w11 "
     req.stream = True
     chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
     joined = "".join(c["choices"][0]["delta"].get("reasoning", "") for c in chunks)
-    assert joined == "w10 \n"
+    assert joined == "w10 \ufffd\n"
     # In none mode the same text sits in the content, markers and all.
     out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
         iter(evs), cached=0
     )
-    assert out["choices"][0]["message"]["content"] == "<think>w10 \n</think>w11 "
+    assert out["choices"][0]["message"]["content"] == "<think>w10 \ufffd\n</think>w11 "
     # The model's own U+FFFD, not forced, is left alone.
     evs[2] = TokenEvent(40, -0.1)
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
@@ -1077,3 +1078,69 @@ def test_completions_stream_usage_rides_on_a_choiceless_last_chunk():
     assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["completion_tokens"] == 3
     assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
     assert all("usage" not in c for c in chunks[:-1])
+
+
+def test_a_cut_mistral_json_list_comes_back_as_text_not_as_a_quoted_call():
+    tok = MistralLike()
+    quoted = "Example: example_action[ARGS]{}"
+    tok._words[34] = (
+        '[{"name": "write", "arguments": {"content": "' + quoted + '"}}, '
+        '{"name": "bad", "arguments":'
+    )
+    tools = [
+        {"type": "function", "function": {"name": n}}
+        for n in ("write", "example_action", "bad")
+    ]
+    for stream in (False, True):
+        req, prompt = _chat(tok, stream=stream)
+        req.tools = tools
+        evs = [TokenEvent(TOOL_START, -0.1), TokenEvent(34, -0.1, "length")]
+        responder = chat.ChatResponder(tok, req, prompt)
+        if stream:
+            chunks = list(responder.stream(iter(evs), 0))
+            calls = [
+                c
+                for ch in chunks
+                for c in ch["choices"][0]["delta"].get("tool_calls", [])
+            ]
+            text = "".join(
+                ch["choices"][0]["delta"].get("content", "") for ch in chunks
+            )
+        else:
+            msg = responder.complete(iter(evs), 0)["choices"][0]["message"]
+            calls, text = msg.get("tool_calls", []), msg["content"]
+        assert not calls and text.startswith("[TOOL_CALLS][{")
+
+
+def test_responses_cut_message_item_is_incomplete_on_the_wire_already():
+    """The status an item is sent with is the status it keeps; a client
+    that stores items as their done events arrive must not see completed
+    for a message the final response calls incomplete."""
+    tok = StubTokenizer()
+    req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
+    gen = responses.to_generation_request(tok, req)
+    wire = [
+        json.loads(json.dumps(e))  # as the handler serialises, event by event
+        for e in responses.ResponsesResponder(tok, req, gen.tokens).stream(
+            iter([TokenEvent(10, -0.1, "length")]), 0
+        )
+    ]
+    done = next(e["item"] for e in wire if e["type"] == "response.output_item.done")
+    final = wire[-1]["response"]
+    assert done["status"] == final["output"][0]["status"] == "incomplete"
+    assert wire[-1]["type"] == "response.incomplete"
+
+
+@pytest.mark.parametrize("content", [42, [{"type": "reasoning_text", "text": 42}]])
+def test_a_badly_shaped_reasoning_input_item_is_a_400(content):
+    with pytest.raises(ApiError) as exc:
+        responses.parse_responses_request(
+            {
+                "input": [
+                    {"type": "reasoning", "content": content},
+                    {"role": "assistant", "content": "w2"},
+                ]
+            },
+            "m",
+        )
+    assert exc.value.status == 400 and exc.value.param == "input"
