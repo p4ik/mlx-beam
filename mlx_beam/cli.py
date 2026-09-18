@@ -170,7 +170,11 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     kv.add_argument(
         "--kv-config",
-        help='JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": {"3": 8}}',
+        help='JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": '
+        '{"3": 8}}, or the list a quantized package ships '
+        '([{"layer_idx": 3, "bits": 4, "group_size": 64}, ...]): listed layers '
+        "take their bits, unlisted ones follow --kv-bits (optiq leaves them "
+        "at full precision and ignores --kv-bits)",
     )
     p.add_argument(
         "--max-queued",
@@ -284,11 +288,38 @@ def kv_policy_from_args(args):
         try:
             with open(args.kv_config) as f:
                 cfg = json.load(f)
-            if not isinstance(cfg, dict) or not isinstance(cfg.get("layers", {}), dict):
+            if isinstance(cfg, list):
+                # The list a quantized package ships: only the layers it
+                # names, each with its own bits; the rest follow --kv-bits.
+                # A missing or null bits must not pass as "keep the layer
+                # unquantized": that would silently undo --kv-bits for it.
+                bad = [
+                    e
+                    for e in cfg
+                    if not isinstance(e, dict)
+                    or "layer_idx" not in e
+                    or not isinstance(e.get("bits"), int)
+                ]
+                if bad:
+                    raise ValueError(
+                        f"every list entry needs layer_idx and integer bits, got {bad[0]!r}"
+                    )
+                layers = {int(e["layer_idx"]): e["bits"] for e in cfg}
+                sizes = {e["group_size"] for e in cfg if "group_size" in e}
+                if len(sizes) > 1:
+                    raise ValueError(
+                        f"one group size per policy, the list has {sorted(sizes)}"
+                    )
+                if sizes:
+                    group_size = sizes.pop()
+            elif not isinstance(cfg, dict) or not isinstance(
+                cfg.get("layers", {}), dict
+            ):
                 raise ValueError("expected an object with bits, group_size, layers")
-            bits = cfg.get("bits", bits)
-            group_size = cfg.get("group_size", group_size)
-            layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
+            else:
+                bits = cfg.get("bits", bits)
+                group_size = cfg.get("group_size", group_size)
+                layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
         except (OSError, ValueError) as e:
             raise SystemExit(f"--kv-config {args.kv_config}: {e}") from None
     try:

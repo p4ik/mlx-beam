@@ -103,6 +103,43 @@ def test_serve_kv_policy_from_arguments(tmp_path):
     assert policy.bits_for(3) == 8 and policy.bits_for(0) == 4
     with pytest.raises(SystemExit):
         main(["serve", "--kv-bits", "3", "--model", "x"])
+    # A package's list names the layers it quantizes; the rest follow --kv-bits.
+    listed = tmp_path / "kv_config.json"
+    listed.write_text(
+        '[{"layer_idx": 3, "bits": 4, "group_size": 32}, {"layer_idx": 7, "bits": 4, "group_size": 32}]'
+    )
+    policy = kv_policy_from_args(
+        argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(listed))
+    )
+    assert (policy.bits, policy.group_size, policy.layers) == (8, 32, {3: 4, 7: 4})
+    assert policy.bits_for(7) == 4 and policy.bits_for(11) == 8
+    policy = kv_policy_from_args(
+        argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(listed))
+    )
+    assert policy.bits is None and policy.bits_for(11) is None
+    mixed = tmp_path / "mixed.json"
+    mixed.write_text(
+        '[{"layer_idx": 3, "bits": 4, "group_size": 32}, {"layer_idx": 7, "bits": 4, "group_size": 64}]'
+    )
+    with pytest.raises(SystemExit, match="one group size"):
+        kv_policy_from_args(
+            argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(mixed))
+        )
+    nameless = tmp_path / "nameless.json"
+    nameless.write_text('[{"bits": 4}]')
+    with pytest.raises(SystemExit, match="layer_idx"):
+        kv_policy_from_args(
+            argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(nameless))
+        )
+    # Without bits an entry must be an error, not "this layer stays at model
+    # precision" behind the caller's back (nor with an explicit null).
+    for text in ('[{"layer_idx": 3}]', '[{"layer_idx": 3, "bits": null}]'):
+        bitless = tmp_path / "bitless.json"
+        bitless.write_text(text)
+        with pytest.raises(SystemExit, match="bits"):
+            kv_policy_from_args(
+                argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(bitless))
+            )
 
 
 def serve_args(*argv):

@@ -96,6 +96,10 @@ class Entry:
             _snapshot_bytes(s) for s in self.checkpoints.values()
         )
 
+    def add_checkpoint(self, position: int, snap: dict[int, list]) -> None:
+        self.checkpoints[position] = snap
+        self.nbytes += _snapshot_bytes(snap)
+
 
 @dataclass
 class Hit:
@@ -105,7 +109,8 @@ class Hit:
     # what the store found before cutting back (for the miss/hit accounting)
     found: int
     kind: str  # "exact", "longer", "shorter"
-    # the entry's checkpoints at or before ``covered``, still valid
+    # the entry's checkpoints at or before ``covered``, still valid - and
+    # for a recurrent model always one at ``covered`` itself
     checkpoints: dict[int, dict[int, list]] = field(default_factory=dict)
 
 
@@ -194,6 +199,13 @@ class PrefixStore:
             self.stats.tokens_found += shared
             self.stats.tokens_restored += pos
             carried = {p: s for p, s in entry.checkpoints.items() if p <= pos}
+            rec = recurrent_layers(cache)
+            if rec and pos == entry.length and pos not in carried:
+                # Restored whole: the entry's end state is the restore point
+                # this request stands on. Carried along (shared, not copied),
+                # it survives the entry being replaced or evicted before the
+                # request finishes.
+                carried[pos] = {i: entry.cache[i].cache for i in rec}
             if len(key) == len(tokens):
                 kind = "exact"
             elif len(key) < len(tokens):
@@ -227,13 +239,20 @@ class PrefixStore:
         rec = recurrent_layers(cache)
         cuttable = all(c.is_trimmable() for i, c in enumerate(cache) if i not in rec)
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
-            if (
-                old.cache_type == "system"
-                or not cuttable
-                or (rec and prefix_len not in entry.checkpoints)
-            ):
+            if old.cache_type == "system" or not cuttable:
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue
+            if rec:
+                # Whatever the old entry could restore, the new one can too:
+                # its checkpoints and its end state (the recurrent state at
+                # prefix_len). Moved, not copied - the old KV cache is what
+                # goes away. One entry per conversation, not one per turn.
+                inherited = dict(old.checkpoints)
+                inherited[prefix_len] = {i: old.cache[i].cache for i in rec}
+                for position, snap in inherited.items():
+                    if position <= prefix_len and position not in entry.checkpoints:
+                        entry.add_checkpoint(position, snap)
+                        self._nbytes += _snapshot_bytes(snap)
             self._nbytes -= old.nbytes
             self._remove_lru(model, tokens[:prefix_len])
         self._evict()

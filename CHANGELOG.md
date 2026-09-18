@@ -6,6 +6,28 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Fixed
+- The same prompt sent again resumes from the stored entry instead of
+  prefilling from scratch on hybrid models: the prompt's checkpoint is taken
+  before its last token, which is the token a lookup keeps to prefill.
+- A conversation is one store entry, not one per turn: when a finished
+  turn extends a stored entry, it inherits that entry's checkpoints and
+  its recurrent end state, then replaces it. What is freed is the old
+  entry's KV cache and its place in the entry count; every position the
+  old entry could restore, the new one can. A request restored on an
+  entry's end carries that state along, so it keeps its restore point
+  even if the entry is replaced or evicted before the request finishes.
+- `max_context` (and the vocabulary size) are read through multimodal
+  wrapper configs (`text_config`, the nested language model), so a
+  Qwen3.5-class model reports its window instead of `null`.
+
+### Added
+- `--kv-config` also takes the list a quantized package ships
+  (`[{"layer_idx": 3, "bits": 4, "group_size": 64}, ...]`): the listed
+  layers override `--kv-bits`, the rest follow it.
+
+## [0.1.0a1] - 2026-09-18
+
 ### Added
 - Request defaults with provenance: `--max-completion-tokens`, `--temp`,
   `--top-p`, `--top-k`, `--min-p` beat the model's `generation_config.json`,
