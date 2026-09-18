@@ -6,7 +6,12 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, create_ssm_mask
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 
 from .activations import swiglu
 from .cache import ArraysCache, KVCache
@@ -277,12 +282,8 @@ class Attention(nn.Module):
             q = self.rope(q)
             k = self.rope(k)
 
-        output = mx.fast.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scale,
-            mask=mask,
+        output = scaled_dot_product_attention(
+            q, k, v, cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(
             B, T, self.q_num_heads * self.v_dim

@@ -228,6 +228,8 @@ def test_short_request_is_not_stuck_behind_a_long_prefill():
         time.sleep(min(0.15, solo_long / 10))
         short = ttft(engine, [7, 11, 13, 17])
         t.join()
+        # One short request is no starvation: the guard never stepped in.
+        assert engine.health()["prefill_starved_calls"] == 0
     assert short < 0.5 * solo_long, (short, solo_long)
     assert result["long"] < 2.0 * solo_long, (result["long"], solo_long)
 
@@ -269,3 +271,155 @@ def test_max_queued_refuses_the_overflow_with_a_count():
             assert len(collect(s)) == 40
         # The backlog drained: the next one is admitted again.
         assert len(collect(engine.submit(GenerationRequest([5, 9], max_tokens=2)))) == 2
+
+
+def test_cancelling_a_row_that_never_prefilled_does_not_kill_the_worker(monkeypatch):
+    """A one-token prompt is handed to generation before the rows admitted
+    with it are prefilled; those rows hold empty caches. Cancelling one of
+    them then must drop it, not the engine."""
+    import importlib
+
+    G = importlib.import_module("mlx_beam._vendor.mlx_lm.generate")
+    fired = threading.Event()
+    target = {}
+    real_next = G.BatchGenerator.next
+
+    def cancel_when_unprefilled(self):
+        out = real_next(self)
+        pb = self._prompt_batch
+        if (
+            not fired.is_set()
+            and target.get("stream") is not None
+            and pb.uids
+            and getattr(pb.prompt_cache[0], "keys", 1) is None
+        ):
+            fired.set()
+            target["stream"].cancel()
+        return out
+
+    monkeypatch.setattr(G.BatchGenerator, "next", cancel_when_unprefilled)
+    with Engine(
+        tiny_llama(), decode_concurrency=4, prompt_concurrency=2, prompt_cache_size=0
+    ) as engine:
+        busy = engine.submit(GenerationRequest([20, 21, 22], max_tokens=300))
+        next(iter(busy))
+        outcome = {}
+        for _ in range(20):
+            one = engine.submit(GenerationRequest([42], max_tokens=3))
+            many = engine.submit(GenerationRequest(list(range(7, 15)), max_tokens=3))
+            target["stream"] = many
+            threads = [
+                threading.Thread(
+                    target=lambda n, s: outcome.setdefault(n, collect(s)), args=a
+                )
+                for a in (("one", one), ("many", many))
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            if fired.is_set():
+                break
+            outcome.clear()
+        assert fired.is_set(), "the window was never hit"
+        assert engine.alive and len(outcome["one"]) == 3
+        assert collect(busy)  # the bystander finishes normally
+
+
+def _tiny(module, seed=0, **overrides):
+    mx.random.seed(seed)
+    model = module.Model(module.ModelArgs(**overrides))
+    mx.eval(model.parameters())
+    return model
+
+
+GEMMA4_SHARED = dict(
+    model_type="gemma4_text",
+    hidden_size=64,
+    num_hidden_layers=6,
+    intermediate_size=128,
+    num_attention_heads=2,
+    head_dim=64,
+    global_head_dim=64,
+    num_key_value_heads=1,
+    num_kv_shared_layers=2,
+    vocab_size=64,
+    vocab_size_per_layer_input=64,
+    hidden_size_per_layer_input=16,
+    sliding_window=8,
+    sliding_window_pattern=3,
+    use_double_wide_mlp=False,
+)
+
+# MeroMero-26B-A4B's shape in small: no shared layers, keys are the values,
+# the global layers have twice the head dim of the sliding ones.
+GEMMA4_MEROMERO = dict(
+    GEMMA4_SHARED,
+    num_kv_shared_layers=0,
+    attention_k_eq_v=True,
+    global_head_dim=128,
+)
+
+PLAMO2 = dict(
+    model_type="plamo2",
+    hidden_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=2,
+    num_key_value_heads=1,
+    hidden_size_per_head=64,
+    intermediate_size=128,
+    vocab_size=64,
+    mamba_num_heads=2,
+    mamba_d_state=8,
+)
+
+
+@pytest.mark.parametrize(
+    "module_name, cfg",
+    [
+        ("gemma4_text", GEMMA4_SHARED),
+        ("gemma4_text", GEMMA4_MEROMERO),
+        ("plamo2", PLAMO2),
+    ],
+)
+def test_quantized_kv_on_kv_sharing_and_direct_sdpa_models(module_name, cfg):
+    """Gemma 4's KV-shared layers get another layer's packed cache with no
+    cache of their own; PLaMo-2 called MLX's attention directly. Both must
+    run under a KV policy, stay close to the unquantized logits, and serve
+    through the engine (whose worker thread must see every lazy array)."""
+    import importlib
+
+    from mlx_beam._vendor.mlx_lm.models.cache import make_prompt_cache
+    from mlx_beam.engine.kv import make_request_cache
+
+    module = importlib.import_module(f"mlx_beam._vendor.mlx_lm.models.{module_name}")
+    model = _tiny(module, **cfg)
+    prompt = [3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43]
+
+    def logprobs(caches):
+        model(mx.array([prompt]), cache=caches)
+        out = model(mx.array([[5]]), cache=caches)[0, -1]
+        return out - mx.logsumexp(out)
+
+    ref = logprobs(make_prompt_cache(model))
+    # Random weights make flat distributions, so 4 bit moves them visibly;
+    # 8 bit is within a few hundredths and keeps the argmax.
+    for bits, tolerance in ((8, 0.1), (4, 0.6)):
+        quant = logprobs(make_request_cache(model, KVPolicy(bits=bits)))
+        assert mx.abs(ref - quant).max().item() < tolerance, bits
+        if bits == 8:
+            assert mx.argmax(ref).item() == mx.argmax(quant).item()
+    with Engine(model, kv_policy=KVPolicy(bits=8)) as engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=4)))
+        applied = engine.health()["kv"]["applied"]
+    assert len(out) == 4 and any(a.get("bits") == 8 for a in applied), applied
+
+
+def test_a_group_size_the_head_dim_cannot_carry_names_the_policy():
+    from mlx_beam._vendor.mlx_lm.models import gemma4_text
+
+    model = _tiny(gemma4_text, **dict(GEMMA4_SHARED, head_dim=96, global_head_dim=96))
+    engine = Engine(model, kv_policy=KVPolicy(bits=4, group_size=64))
+    with pytest.raises(EngineDead, match="group size 64 does not divide") as exc:
+        engine.start()
+    assert "head_dim 96" in str(exc.value) and "[32]" in str(exc.value)

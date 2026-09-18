@@ -58,7 +58,18 @@ current segment, so nobody is padded; (2) every call is at most
 `prefill_slice` tokens wide, so a newcomer waits at most one such call (512 ran
 at 125 tok/s against 114 for 2048); (3) while a prefill shares the worker,
 decode runs for `decode_share` times the last prefill call's wall time and
-hands its tokens back before the next prefill call. Alone, a prompt sees
+hands its tokens back before the next prefill call; a burst also ends when
+a row finishes, because its extracted cache is a lazy slice of the batch
+buffers until the caller evaluates it, and every further step would copy
+the whole batch KV instead of writing in place. (4) The width rule has a
+starvation guard: when a row with a whole slice to go was held under a
+quarter slice by newcomers in two prefill calls in a row, the next call
+admits nobody, so that row gets its full width once; measured on a
+600-token prompt under one 8-token newcomer per call, 91 calls to the first
+token instead of 295, and a newcomer waits at most one call more
+(`test_a_trickle_of_short_prompts_cannot_starve_a_long_prefill`). The
+count of such calls is `starved_calls`, reported by the engine's health as
+`prefill_starved_calls`. Alone, a prompt sees
 upstream's chunking at slice width; greedy output is byte-identical
 (`test_prefill_slice_keeps_output`, and the greedy replay against an unpatched
 worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,
@@ -69,12 +80,63 @@ quantized cache, the tiled attention from the optiq part below runs whenever
 it supports the shape (4/8 bit, group 32/64/128, fp16/bf16 queries, causal or
 no mask); the stock path stays for everything else.
 
+`packed K/V without a cache` - `models/base.py`, `scaled_dot_product_attention`
+and `_packed_layout`: a layer that shares another layer's cache (Gemma 4's
+KV-shared layers) receives that cache's packed `(packed, scales, biases)`
+triple with no cache of its own, and the dispatch keyed on `cache.bits` sent
+it down the stock path, which cannot take a triple. Bits and group size are
+now read off the packed shapes when the cache does not carry them. And
+`models/plamo2.py` calls `base.scaled_dot_product_attention` instead of
+`mx.fast.scaled_dot_product_attention` directly, so its attention layers
+take a quantized cache like every other model's. Tests:
+`test_quantized_kv_on_kv_sharing_and_direct_sdpa_models` (Gemma 4 with and
+without shared layers, PLaMo-2; 8-bit within 0.1 logprob of the plain run).
+
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
 is the whole buffer, so the assignment into a zero-width destination raised a
 broadcast error and took the generation thread down. Reached by any
 sliding-window model reusing a cached prefix across turns. Guarded with
 `or l == 0`. Test: `test_rotating_merge_survives_a_zero_length_cache`.
+
+`tool parsers, picked from upstream` - `tool_parsers/qwen3_coder.py` at
+mlx-lm `e99e3df` (2026-09-14, #1881): the parameter name survives a missing
+`>` (`_name_regex`) instead of raising `ValueError: substring not found`.
+`tool_parsers/mistral.py` at mlx-lm `5681834` (2026-09-14, #1394): the JSON
+list form `[{"name": ..., "arguments": ...}]` is parsed, and a header-form
+call cut short raises instead of being skipped in silence. Both files are
+the upstream files at those commits, nothing else; they postdate the pin and
+go away with the next pin bump. Tests: `test_qwen_parameter_without_closing_bracket`,
+`test_mistral_json_list_and_cut_call`.
+
+`anchored headers` - `tool_parsers/mistral.py`, `_parse_header_calls`:
+upstream searches the text for the next `name[ARGS]` header, so a cut-off
+JSON list (`[{"name": …, "arguments": {"content": "see other[ARGS]{}"}}, {`)
+that fails `json.loads` falls through to the header parser, which reads
+`other[ARGS]{}` out of the string argument and returns it as a call. A
+header now has to stand at the start of the text or right after the
+previous call's JSON, with only whitespace and the model's repeated
+`[TOOL_CALLS]` marker in between; anything else is an error, and the engine
+returns the block as text. Test:
+`test_mistral_headers_are_anchored_never_read_out_of_a_json_string`.
+
+`parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies` and
+`_closed_parameters`: upstream cuts every parameter at the first
+`</parameter>` (`<parameter=(.*?)</parameter>`), so a value that contains the
+tag literally - a file with this markup, HTML - comes back shortened, with no
+error. A parameter now ends at the last `</parameter>` before the next
+`<parameter=` or the end of the call, and a parameter without an end tag is
+an error (the call was cut short) instead of a silently missing argument. A
+literal `<parameter=name>` inside a value cannot be told from a second
+parameter, so a name seen twice, one a schema with `additionalProperties:
+false` rules out, or text left between a parameter's end tag and the next
+tag (a literal tag split the value) raises instead of overwriting or
+dropping part of an argument; the engine then returns the call as text.
+Unescaped markup stays ambiguous, so the promise is "never silently", not
+"always parsed". Stays after the pin bump unless upstream fixes it.
+Tests: `test_qwen_literal_end_tag_in_a_value`,
+`test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split`,
+`test_qwen_text_between_parameters_is_an_error_not_dropped`.
 
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
@@ -84,7 +146,7 @@ in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
 | | |
 |---|---|
 | Upstream | `mlx-optiq` on PyPI (https://mlx-optiq.com); no public source repository, the wheel is the upstream |
-| Version | 0.5.6 (wheel sha256 in `tools/vendor.toml`); 0.5.7 checked 2026-09-15, both files unchanged |
+| Version | 0.5.6 (wheel sha256 in `tools/vendor.toml`); 0.5.7 checked 2026-09-15 and 0.5.8-0.5.10 checked 2026-09-17: both files unchanged, nothing taken. New in 0.5.9, noted for later: a GQA decode/verify attention kernel for head dim 256 (`ops/gqa_decode_attention.py`, MLX's own kernel with the template constants for dim 256, up to 16 query positions, enabled per tested model only) and a chunked verify attention for 5-15 positions (`ops/chunked_verify_attention.py`) - both for unquantized KV, so they do not touch the tiled path taken here; candidates for the speculative verify pass once it exists, to be measured on our hardware first |
 | License | MIT, `mlx_beam/_vendor/optiq/LICENSE` |
 | Taken | `runtime/kv/batch.py` as `kv_batch.py`, `runtime/fused_quant_sdpa.py` as `fused_quant_sdpa.py` |
 | Left out | everything else: the package is a server with its own glue, and the only parts the engine needs are the two below |

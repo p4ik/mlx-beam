@@ -17,7 +17,7 @@ from mlx_beam.api.chat import (
     with_xtc_specials,
 )
 from mlx_beam.api.defaults import RequestDefaults
-from mlx_beam.api.errors import ApiError, unsupported
+from mlx_beam.api.errors import ApiError, bool_field, object_field, unsupported
 from mlx_beam.api.text import TextAssembler, logprob_entry, stop_sequence_ids
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 
@@ -47,13 +47,15 @@ def parse_completion_request(
         raise unsupported("n > 1", "n")
     if body.get("best_of", 1) not in (None, 1):
         raise unsupported("best_of", "best_of")
+    if body.get("suffix"):
+        raise unsupported("suffix (insertion)", "suffix")
     prompt = body.get("prompt")
     ok = isinstance(prompt, str) or (
         isinstance(prompt, list) and prompt and all(isinstance(t, int) for t in prompt)
     )
     if not ok:
         raise ApiError("prompt must be a string or a list of token ids", param="prompt")
-    stream_opts = body.get("stream_options") or {}
+    stream_opts = object_field(body, "stream_options")
     return CompletionRequest(
         prompt=prompt,
         model=body.get("model") or default_model,
@@ -61,9 +63,9 @@ def parse_completion_request(
             body, "max_tokens", defaults.max_completion_tokens, 1, None, int
         ),
         sampling=parse_sampling(body, defaults),
-        stream=bool(body.get("stream", False)),
+        stream=bool_field(body, "stream"),
         stop=parse_stop(body),
-        echo=bool(body.get("echo", False)),
+        echo=bool_field(body, "echo"),
         logprobs=_number(body, "logprobs", None, 0, 20, int),
         stream_usage=bool(stream_opts.get("include_usage", False)),
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
@@ -110,8 +112,14 @@ class CompletionResponder:
         self._tokenizer = tokenizer
         self.echo_text = tokenizer.decode(prompt_tokens) if req.echo else ""
         self._offset = len(self.echo_text)
+        # The raw endpoint returns what the model wrote: markers stay in
+        # the text, a tool-call block is text, thinking is only counted.
         self.assembler = TextAssembler(
-            tokenizer, prompt_tokens=prompt_tokens, stop_words=req.stop
+            tokenizer,
+            prompt_tokens=prompt_tokens,
+            stop_words=req.stop,
+            route_thinking=False,
+            tools_enabled=False,
         )
 
     def _envelope(self) -> dict:
@@ -149,7 +157,7 @@ class CompletionResponder:
             "top_logprobs": [],
             "text_offset": [],
         }
-        for e in events:
+        for e, _ in events:
             entry = logprob_entry(self._tokenizer, e)
             out["tokens"].append(entry["token"])
             out["token_logprobs"].append(entry["logprob"])
@@ -172,11 +180,15 @@ class CompletionResponder:
                 continue
             out = self._envelope()
             out["choices"] = [self._choice(text, d.finish_reason)]
-            if d.finish_reason and self.req.stream_usage:
-                out["usage"] = self._usage(cached)
             yield out
             if d.finish_reason:
                 break
+        if self.req.stream_usage:
+            # As at OpenAI: the usage rides on a last chunk with no choices.
+            out = self._envelope()
+            out["choices"] = []
+            out["usage"] = self._usage(cached)
+            yield out
 
     def complete(self, events, cached: int) -> dict:
         text = self.echo_text

@@ -93,6 +93,45 @@ def test_image_parts_name_the_missing_extra():
     assert exc.value.code == "extra_not_installed" and "vision" in exc.value.message
 
 
+def test_tool_call_arguments_reach_the_template_as_a_mapping():
+    """The wire carries arguments as a JSON string and content as null; the
+    Qwen3.8 template raises on a string, others trim the content."""
+
+    def call(args):
+        return {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "f", "arguments": args},
+        }
+
+    body = {
+        "messages": [
+            {"role": "user", "content": "w1"},
+            {"role": "assistant", "content": None, "tool_calls": [call('{"a": 1}')]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w2"},
+            {"role": "assistant", "content": None, "tool_calls": [call("")]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w3"},
+            {"role": "assistant", "content": None, "tool_calls": [call({"b": 2})]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "w4"},
+        ]
+    }
+    req = chat.parse_chat_request(body, "m")
+    turns = [m for m in req.messages if m.get("tool_calls")]
+    assert [t["content"] for t in turns] == ["", "", ""]
+    assert [t["tool_calls"][0]["function"]["arguments"] for t in turns] == [
+        {"a": 1},
+        {},
+        {"b": 2},
+    ]
+    # The request body is left as the client sent it.
+    assert body["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"a": 1}'
+    for bad in ("{not json", "[1, 2]", 3):
+        body["messages"][1]["tool_calls"][0]["function"]["arguments"] = bad
+        with pytest.raises(ApiError) as exc:
+            chat.parse_chat_request(body, "m")
+        assert exc.value.param == "messages" and "arguments" in exc.value.message
+
+
 def test_chat_prompt_goes_through_the_template():
     tok = StubTokenizer()
     req = chat.parse_chat_request(
@@ -195,6 +234,10 @@ def test_responses_items_become_messages_and_back():
                 "content": [{"type": "input_text", "text": "w2"}],
             },
             {
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": "w9"}],
+            },
+            {
                 "type": "function_call",
                 "call_id": "c1",
                 "name": "w20",
@@ -208,6 +251,9 @@ def test_responses_items_become_messages_and_back():
     req = responses.parse_responses_request(body, "m")
     roles = [m["role"] for m in req.chat.messages]
     assert roles == ["system", "user", "assistant", "tool"]
+    # The reasoning the client handed back rides on the turn it preceded.
+    assert req.chat.messages[2]["reasoning_content"] == "w9"
+    assert req.instructions == "w1" and req.tool_choice == "auto"
     assert req.chat.tools == [
         {"type": "function", "function": {"name": "w20", "parameters": {}}}
     ]
@@ -220,6 +266,7 @@ def test_responses_items_become_messages_and_back():
     assert out["output"][1]["content"][0]["text"] == "w11 "
     assert out["output"][2]["name"] == "w20" and out["status"] == "completed"
     assert out["usage"]["input_tokens"] == len(gen.tokens)
+    assert out["instructions"] == "w1"
 
 
 def test_responses_refuse_state_and_hosted_tools():
@@ -273,7 +320,14 @@ def test_non_finite_numbers_are_rejected():
 
 def test_responses_stream_has_the_item_and_part_events():
     tok = StubTokenizer()
-    req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
+    req = responses.parse_responses_request(
+        {
+            "input": "w1",
+            "stream": True,
+            "tools": [{"type": "function", "name": "w20", "parameters": {}}],
+        },
+        "m",
+    )
     gen = responses.to_generation_request(tok, req)
     evs = list(
         responses.ResponsesResponder(tok, req, gen.tokens).stream(
@@ -476,6 +530,28 @@ def test_request_defaults_precedence(tmp_path):
         "value": 0,
         "source": "mlx-lm",
     }
+    # A default a request could not ask for is refused at start, not later
+    # on every request that leaves the field to the server.
+    (tmp_path / "generation_config.json").write_text('{"temperature": 3.0}')
+    with pytest.raises(ValueError, match="temperature from generation_config"):
+        RequestDefaults.resolve(tmp_path)
+    with pytest.raises(ValueError, match="top_p from flag"):
+        RequestDefaults.resolve(tmp_path / "missing", flags={"top_p": 1.5})
+
+
+def test_logit_bias_values_are_bounded_numbers():
+    for bad in ({"1": "nan"}, {"1": "inf"}, {"1": 1e6}, {"1": True}):
+        with pytest.raises(ApiError) as exc:
+            chat.parse_chat_request(
+                {"messages": [{"role": "user", "content": "w1"}], "logit_bias": bad},
+                "m",
+            )
+        assert exc.value.param == "logit_bias", bad
+    with pytest.raises(ApiError) as exc:
+        chat.parse_chat_request(
+            {"messages": [{"role": "user", "content": "w1"}], "n": True}, "m"
+        )
+    assert exc.value.param == "n"
 
 
 def test_seed_and_xtc_reach_the_engine_request():
@@ -519,7 +595,7 @@ def test_chat_logprobs_carry_text_bytes_and_alternatives():
     ]
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
     content = out["choices"][0]["logprobs"]["content"]
-    assert [c["token"] for c in content] == ["w10 ", "w11 ", tok.decode([EOS])]
+    assert [c["token"] for c in content] == ["w10 ", "w11 "]  # no stop token
     assert content[0]["bytes"] == list(b"w10 ")
     assert [t["token"] for t in content[0]["top_logprobs"]] == ["w10 ", "w11 "]
     req.stream = True
@@ -569,9 +645,11 @@ def test_server_template_args_are_overridden_by_the_request():
     assert chat.parse_chat_request({"messages": msgs}, "m").template_kwargs == {}
 
 
-def test_forced_close_drops_the_half_character_the_cut_left():
-    # A byte-level tokenizer cut mid-character flushes the fragment as U+FFFD
-    # together with the first forced token; the stub plays that token.
+def test_forced_close_keeps_a_replacement_char_without_byte_evidence():
+    # Only a detokenizer that shows its held bytes (BPE, SPM - see the
+    # ByteTokenizer test) can prove a U+FFFD was a cut character. The stub
+    # cannot, so its U+FFFD stays: a spare one is cosmetic, a deleted real
+    # character is not.
     tok = StubTokenizer()
     tok._words[40] = "�\n"
     req = chat.parse_chat_request(
@@ -588,18 +666,512 @@ def test_forced_close_drops_the_half_character_the_cut_left():
     ]
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
     msg = out["choices"][0]["message"]
-    assert msg["reasoning"] == "w10 \n" and msg["content"] == "w11 "
-    # Streamed, the fragment never reaches the wire either.
+    assert msg["reasoning"] == "w10 \ufffd\n" and msg["content"] == "w11 "
     req.stream = True
     chunks = list(chat.ChatResponder(tok, req, gen.tokens).stream(iter(evs), cached=0))
     joined = "".join(c["choices"][0]["delta"].get("reasoning", "") for c in chunks)
-    assert joined == "w10 \n"
+    assert joined == "w10 \ufffd\n"
     # In none mode the same text sits in the content, markers and all.
     out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
         iter(evs), cached=0
     )
-    assert out["choices"][0]["message"]["content"] == "<think>w10 \n</think>w11 "
+    assert out["choices"][0]["message"]["content"] == "<think>w10 \ufffd\n</think>w11 "
     # The model's own U+FFFD, not forced, is left alone.
     evs[2] = TokenEvent(40, -0.1)
     out = chat.ChatResponder(tok, req, gen.tokens).complete(iter(evs), cached=0)
     assert out["choices"][0]["message"]["reasoning"] == "w10 �\n"
+
+
+class PickyTokenizer(StubTokenizer):
+    """A tool parser that rejects calls whose name starts with 'bad'."""
+
+    @staticmethod
+    def tool_parser(text: str, tools):
+        name, _, rest = text.strip().partition(" ")
+        if name.startswith("bad") or not name:
+            raise ValueError(f"no such tool: {name!r}")
+        return {"name": name, "arguments": {"words": rest.strip()}}
+
+
+def _tool_events(*blocks, finish="stop"):
+    """Token events for tool blocks; each block is a list of word ids."""
+    out = []
+    for words in blocks:
+        out += [TokenEvent(TOOL_START, -0.1)]
+        out += [TokenEvent(w, -0.1) for w in words]
+        out += [TokenEvent(TOOL_END, -0.1)]
+    if finish == "stop":
+        out.append(TokenEvent(EOS, -0.1, "stop"))
+    else:
+        out[-1] = TokenEvent(out[-1].token, -0.1, "length")
+    return out
+
+
+def _chat(tok, stream=False):
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "tools": [{"type": "function", "function": {"name": "w10"}}],
+            "stream": stream,
+        },
+        "m",
+    )
+    return req, chat.to_generation_request(tok, req).tokens
+
+
+def test_a_tool_call_that_does_not_parse_comes_back_as_text():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    out = chat.ChatResponder(tok, req, prompt).complete(_tool_events([20, 11]), 0)
+    choice = out["choices"][0]
+    # No call was made, so no call is reported; the client sees the text.
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == "<tool_call>bad w11 </tool_call>"
+
+
+def test_valid_calls_survive_next_to_an_invalid_one():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    out = chat.ChatResponder(tok, req, prompt).complete(
+        _tool_events([10, 11], [20, 12], [10, 13]), 0
+    )
+    choice = out["choices"][0]
+    names = [c["function"]["name"] for c in choice["message"]["tool_calls"]]
+    assert names == ["w10", "w10"] and choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "<tool_call>bad w12 </tool_call>"
+
+
+def test_a_call_cut_by_the_length_limit_keeps_its_text_and_reason():
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    req, prompt = _chat(tok)
+    evs = _tool_events([20, 11], finish="length")[:-1]
+    evs[-1] = TokenEvent(11, -0.1, "length")
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert choice["finish_reason"] == "length" and "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == "<tool_call>bad w11 "
+    # Streamed: the same text arrives as a content chunk, no tool-call chunk.
+    req.stream = True
+    chunks = list(chat.ChatResponder(tok, req, prompt).stream(iter(evs), 0))
+    content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    assert (
+        content == "<tool_call>bad w11 "
+        and chunks[-1]["choices"][0]["finish_reason"] == "length"
+    )
+    assert not any("tool_calls" in c["choices"][0]["delta"] for c in chunks)
+
+
+class MistralLike(StubTokenizer):
+    """Mistral's shape: a start marker, no end marker, several calls in a row."""
+
+    tool_call_start = "[TOOL_CALLS]"
+    tool_call_end = ""
+
+    def __init__(self):
+        super().__init__()
+        self._words[TOOL_START] = "[TOOL_CALLS]"
+        self._words[30] = 'good[ARGS]{"x": 1}'
+        self._words[31] = 'bad[ARGS]{"x":'
+        self._words[32] = 'other[ARGS]{"y": 2}'
+
+    @staticmethod
+    def tool_parser(text, tools):
+        from mlx_beam._vendor.mlx_lm.tool_parsers import mistral
+
+        return mistral.parse_tool_call(text, tools)
+
+
+def test_mistral_calls_before_a_cut_are_kept_and_the_cut_one_is_text():
+    tok = MistralLike()
+    req, prompt = _chat(tok)
+    # good, then a second call cut by the length limit.
+    evs = [
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(30, -0.1),
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(31, -0.1, "length"),
+    ]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert [c["function"]["name"] for c in choice["message"]["tool_calls"]] == ["good"]
+    assert choice["message"]["content"] == '[TOOL_CALLS]bad[ARGS]{"x":'
+    assert choice["finish_reason"] == "length"
+    # Two complete calls, ended by the eos: both parsed, a tool-call turn.
+    evs = [
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(30, -0.1),
+        TokenEvent(TOOL_START, -0.1),
+        TokenEvent(32, -0.1),
+        TokenEvent(EOS, -0.1, "stop"),
+    ]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    choice = out["choices"][0]
+    assert [c["function"]["name"] for c in choice["message"]["tool_calls"]] == [
+        "good",
+        "other",
+    ]
+    assert (
+        choice["finish_reason"] == "tool_calls" and choice["message"]["content"] is None
+    )
+
+
+def test_mistral_marker_inside_a_json_string_is_not_a_call():
+    """A quoted "[TOOL_CALLS]…" in an argument must never become a call of
+    its own, and the complete call that holds it must survive a later cut."""
+    tok = MistralLike()
+    quoted = "Example: [TOOL_CALLS]example_action[ARGS]{}"
+    tok._words[33] = "write[ARGS]" + json.dumps({"content": quoted})
+    tools = [
+        {"type": "function", "function": {"name": n}}
+        for n in ("write", "example_action", "bad")
+    ]
+    for stream in (False, True):
+        req, prompt = _chat(tok, stream=stream)
+        req.tools = tools
+        evs = [
+            TokenEvent(TOOL_START, -0.1),
+            TokenEvent(33, -0.1),
+            TokenEvent(TOOL_START, -0.1),
+            TokenEvent(31, -0.1, "length"),
+        ]
+        responder = chat.ChatResponder(tok, req, prompt)
+        if stream:
+            chunks = list(responder.stream(iter(evs), 0))
+            calls = [
+                c
+                for ch in chunks
+                for c in ch["choices"][0]["delta"].get("tool_calls", [])
+            ]
+            text = "".join(
+                ch["choices"][0]["delta"].get("content", "") for ch in chunks
+            )
+            finish = chunks[-1]["choices"][0]["finish_reason"]
+        else:
+            msg = responder.complete(iter(evs), 0)["choices"][0]
+            calls, text, finish = (
+                msg["message"]["tool_calls"],
+                msg["message"]["content"],
+                msg["finish_reason"],
+            )
+        assert [c["function"]["name"] for c in calls] == ["write"]
+        assert json.loads(calls[0]["function"]["arguments"]) == {"content": quoted}
+        assert text == '[TOOL_CALLS]bad[ARGS]{"x":' and finish == "length"
+
+
+def test_a_parser_result_json_cannot_carry_comes_back_as_text():
+    """The Qwen parser evaluates literals; a set or bytes is a Python value
+    JSON has no form for. That is an unreadable call, not a 500."""
+
+    class SetTokenizer(StubTokenizer):
+        @staticmethod
+        def tool_parser(text, tools):
+            return {"name": "f", "arguments": {"x": {1, 2}}}
+
+    tok = SetTokenizer()
+    req, prompt = _chat(tok)
+    out = chat.ChatResponder(tok, req, prompt).complete(_tool_events([10]), 0)
+    choice = out["choices"][0]
+    assert "tool_calls" not in choice["message"] and choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "<tool_call>w10 </tool_call>"
+
+
+class ByteTokenizer(StubTokenizer):
+    """The stub vocabulary as raw bytes, detokenized by mlx-lm's real BPE or
+    SPM detokenizer: token 40 is the first byte of a cut character, token 10
+    a complete U+FFFD, token 41 a newline."""
+
+    def __init__(self, kind: str):
+        super().__init__()
+        self.kind = kind
+        self.raw = [w.encode() for w in self._words]
+        self.raw[10] = "�".encode()
+        self.raw[40] = b"\xe2"
+        self.raw[41] = b"\n"
+        self.raw[42] = b" <"
+
+    def __len__(self):
+        return len(self.raw)
+
+    def convert_ids_to_tokens(self, ids):
+        from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
+
+        if self.kind == "bpe":
+            to_char = {v: k for k, v in _byte_decoder().items()}
+            return ["".join(to_char[b] for b in self.raw[t]) for t in ids]
+        return [
+            f"<0x{self.raw[t][0]:02X}>" if t == 40 else self.raw[t].decode()
+            for t in ids
+        ]
+
+    @property
+    def detokenizer(self):
+        from mlx_beam._vendor.mlx_lm import tokenizer_utils as tu
+
+        cls = {"bpe": tu.BPEStreamingDetokenizer, "spm": tu.SPMStreamingDetokenizer}
+        return cls[self.kind](self)
+
+
+@pytest.mark.parametrize("kind", ["bpe", "spm"])
+@pytest.mark.parametrize("held", ["fragment", "real"])
+def test_forced_close_drops_a_byte_fragment_but_keeps_a_real_replacement_char(
+    kind, held
+):
+    tok = ByteTokenizer(kind)
+    token = 40 if held == "fragment" else 10
+    req, prompt = _chat(tok)
+    evs = [
+        TokenEvent(THINK_START, -0.1),
+        TokenEvent(token, -0.1),
+        TokenEvent(41, 0.0, forced=True),
+        TokenEvent(THINK_END, 0.0, forced=True),
+        TokenEvent(11, -0.1),
+        TokenEvent(EOS, -0.1, "stop"),
+    ]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    reasoning = out["choices"][0]["message"]["reasoning"]
+    assert reasoning == ("\n" if held == "fragment" else "�\n")
+
+
+def test_text_held_back_at_the_eos_is_not_lost():
+    """A ' <' the automaton keeps as a possible marker start, and a lone
+    space the detokenizer holds, are the model's text when the eos comes."""
+    tok = ByteTokenizer("bpe")
+    req, prompt = _chat(tok)
+    evs = [TokenEvent(11, -0.1), TokenEvent(42, -0.1), TokenEvent(EOS, -0.1, "stop")]
+    out = chat.ChatResponder(tok, req, prompt).complete(iter(evs), 0)
+    assert out["choices"][0]["message"]["content"] == "w11  <"
+
+
+def test_completions_return_the_raw_text_markers_and_tool_blocks_included():
+    tok = StubTokenizer()
+    req = completions.parse_completion_request({"prompt": [1, 2]}, "m")
+    ids = [THINK_START, 10, THINK_END, 11, TOOL_START, 20, 21, TOOL_END, 12]
+    out = completions.CompletionResponder(tok, req, [1, 2]).complete(events(ids), 0)
+    choice = out["choices"][0]
+    assert (
+        choice["text"] == "<think>w10 </think>w11 <tool_call>w20 w21 </tool_call>w12 "
+    )
+    assert choice["finish_reason"] == "stop"
+
+
+def test_chat_without_tools_on_offer_keeps_a_tool_block_as_text():
+    tok = StubTokenizer()
+    req, prompt = _chat(tok)
+    req.tools = None
+    out = chat.ChatResponder(tok, req, prompt).complete(_tool_events([20, 21]), 0)
+    choice = out["choices"][0]
+    assert "tool_calls" not in choice["message"] and choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "<tool_call>w20 w21 </tool_call>"
+
+
+def test_responses_items_that_interleave_get_their_own_ids_and_text():
+    """Text, a call, then text again is three items with three ids; the
+    second message holds only its own text, and complete() agrees with the
+    final stream event."""
+    tok = PickyTokenizer()
+    tok._words[20] = "bad "
+    body = {
+        "input": "w1",
+        "stream": True,
+        "tools": [{"type": "function", "name": "w10", "parameters": {}}],
+    }
+    req = responses.parse_responses_request(body, "m")
+    gen = responses.to_generation_request(tok, req)
+
+    def evs():
+        return iter(
+            [TokenEvent(12, -0.1)] + _tool_events([10, 11], [20, 13], finish="stop")
+        )
+
+    stream = list(responses.ResponsesResponder(tok, req, gen.tokens).stream(evs(), 0))
+    output = stream[-1]["response"]["output"]
+    assert [i["type"] for i in output] == ["message", "function_call", "message"]
+    assert output[0]["id"] != output[2]["id"]
+    assert output[0]["content"][0]["text"] == "w12 "
+    assert output[2]["content"][0]["text"] == "<tool_call>bad w13 </tool_call>"
+    done = [e for e in stream if e["type"] == "response.output_text.done"]
+    assert [e["text"] for e in done] == ["w12 ", "<tool_call>bad w13 </tool_call>"]
+    assert all("logprobs" in e for e in done)
+    args_done = [
+        e for e in stream if e["type"] == "response.function_call_arguments.done"
+    ]
+    assert args_done[0]["name"] == "w10"
+    req.chat.stream = False
+    whole = responses.ResponsesResponder(tok, req, gen.tokens).complete(evs(), 0)
+
+    def strip(items):
+        return [
+            {k: v for k, v in i.items() if k not in ("id", "call_id")} for i in items
+        ]
+
+    assert strip(whole["output"]) == strip(output)
+
+
+@pytest.mark.parametrize(
+    "body, param",
+    [
+        (
+            {"messages": [{"role": "user", "content": "x"}], "response_format": "json"},
+            "response_format",
+        ),
+        (
+            {"messages": [{"role": "user", "content": "x"}], "stream_options": [1]},
+            "stream_options",
+        ),
+        (
+            {
+                "messages": [{"role": "user", "content": "x"}],
+                "chat_template_kwargs": "a",
+            },
+            "chat_template_kwargs",
+        ),
+        (
+            {"messages": [{"role": "user", "content": [{"type": "text", "text": 5}]}]},
+            "messages",
+        ),
+    ],
+)
+def test_wrongly_shaped_nested_fields_are_400s_not_500s(body, param):
+    with pytest.raises(ApiError) as exc:
+        chat.parse_chat_request(body, "m")
+    assert exc.value.status == 400 and exc.value.param == param
+
+
+def test_responses_and_completions_reject_wrong_shapes_and_suffix():
+    for body, param in (
+        ({"input": "w1", "metadata": "x"}, "metadata"),
+        ({"input": "w1", "text": "abc"}, "text"),
+        ({"input": "w1", "text": {"format": "json"}}, "text"),
+        (
+            {
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": 1}]}
+                ]
+            },
+            "input",
+        ),
+    ):
+        with pytest.raises(ApiError) as exc:
+            responses.parse_responses_request(body, "m")
+        assert exc.value.status == 400 and exc.value.param == param, body
+    with pytest.raises(ApiError) as exc:
+        completions.parse_completion_request({"prompt": "w1", "suffix": "w2"}, "m")
+    assert exc.value.param == "suffix"
+    with pytest.raises(ApiError) as exc:
+        completions.parse_completion_request({"prompt": "w1", "stream_options": 3}, "m")
+    assert exc.value.param == "stream_options"
+
+
+def test_completions_stream_usage_rides_on_a_choiceless_last_chunk():
+    tok = StubTokenizer()
+    req = completions.parse_completion_request(
+        {"prompt": [1, 2], "stream": True, "stream_options": {"include_usage": True}},
+        "m",
+    )
+    chunks = list(
+        completions.CompletionResponder(tok, req, [1, 2]).stream(events([10, 11]), 0)
+    )
+    assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["completion_tokens"] == 3
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert all("usage" not in c for c in chunks[:-1])
+
+
+def test_a_cut_mistral_json_list_comes_back_as_text_not_as_a_quoted_call():
+    tok = MistralLike()
+    quoted = "Example: example_action[ARGS]{}"
+    tok._words[34] = (
+        '[{"name": "write", "arguments": {"content": "' + quoted + '"}}, '
+        '{"name": "bad", "arguments":'
+    )
+    tools = [
+        {"type": "function", "function": {"name": n}}
+        for n in ("write", "example_action", "bad")
+    ]
+    for stream in (False, True):
+        req, prompt = _chat(tok, stream=stream)
+        req.tools = tools
+        evs = [TokenEvent(TOOL_START, -0.1), TokenEvent(34, -0.1, "length")]
+        responder = chat.ChatResponder(tok, req, prompt)
+        if stream:
+            chunks = list(responder.stream(iter(evs), 0))
+            calls = [
+                c
+                for ch in chunks
+                for c in ch["choices"][0]["delta"].get("tool_calls", [])
+            ]
+            text = "".join(
+                ch["choices"][0]["delta"].get("content", "") for ch in chunks
+            )
+        else:
+            msg = responder.complete(iter(evs), 0)["choices"][0]["message"]
+            calls, text = msg.get("tool_calls", []), msg["content"]
+        assert not calls and text.startswith("[TOOL_CALLS][{")
+
+
+def test_responses_cut_message_item_is_incomplete_on_the_wire_already():
+    """The status an item is sent with is the status it keeps; a client
+    that stores items as their done events arrive must not see completed
+    for a message the final response calls incomplete."""
+    tok = StubTokenizer()
+    req = responses.parse_responses_request({"input": "w1", "stream": True}, "m")
+    gen = responses.to_generation_request(tok, req)
+    wire = [
+        json.loads(json.dumps(e))  # as the handler serialises, event by event
+        for e in responses.ResponsesResponder(tok, req, gen.tokens).stream(
+            iter([TokenEvent(10, -0.1, "length")]), 0
+        )
+    ]
+    done = next(e["item"] for e in wire if e["type"] == "response.output_item.done")
+    final = wire[-1]["response"]
+    assert done["status"] == final["output"][0]["status"] == "incomplete"
+    assert wire[-1]["type"] == "response.incomplete"
+
+
+@pytest.mark.parametrize("content", [42, [{"type": "reasoning_text", "text": 42}]])
+def test_a_badly_shaped_reasoning_input_item_is_a_400(content):
+    with pytest.raises(ApiError) as exc:
+        responses.parse_responses_request(
+            {
+                "input": [
+                    {"type": "reasoning", "content": content},
+                    {"role": "assistant", "content": "w2"},
+                ]
+            },
+            "m",
+        )
+    assert exc.value.status == 400 and exc.value.param == "input"
+
+
+def test_responses_cut_tail_next_to_a_recovered_call_is_the_incomplete_item():
+    """A block with a complete call and a cut-off second one yields the call
+    as completed and the tail as a message that is incomplete - on the wire
+    and in the final response, in that order."""
+    tok = MistralLike()
+    tok._words[35] = 'good[ARGS]{"x": 1}[TOOL_CALLS]bad[ARGS]{"x":'
+    body = {
+        "input": "w1",
+        "stream": True,
+        "tools": [{"type": "function", "name": n} for n in ("good", "bad")],
+    }
+    req = responses.parse_responses_request(body, "m")
+    gen = responses.to_generation_request(tok, req)
+    evs = [TokenEvent(TOOL_START, -0.1), TokenEvent(35, -0.1, "length")]
+    wire = [
+        json.loads(json.dumps(e))
+        for e in responses.ResponsesResponder(tok, req, gen.tokens).stream(iter(evs), 0)
+    ]
+    items = [e["item"] for e in wire if e["type"] == "response.output_item.done"]
+    assert [i["type"] for i in items] == ["function_call", "message"]
+    assert items[0]["name"] == "good" and items[0]["status"] == "completed"
+    assert items[1]["status"] == "incomplete"
+    assert items[1]["content"][0]["text"] == '[TOOL_CALLS]bad[ARGS]{"x":'
+    final = wire[-1]["response"]
+    assert final["status"] == "incomplete"
+    assert [i["status"] for i in final["output"]] == ["completed", "incomplete"]
+    req.chat.stream = False
+    whole = responses.ResponsesResponder(tok, req, gen.tokens).complete(iter(evs), 0)
+    assert [i["status"] for i in whole["output"]] == ["completed", "incomplete"]

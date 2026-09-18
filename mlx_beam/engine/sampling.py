@@ -23,10 +23,18 @@ from mlx_beam._vendor.mlx_lm.sample_utils import (
 )
 from mlx_beam.engine.request import SamplingParams
 
+# Below this a temperature is greedy: 1/temp overflows float32 near 1e-38
+# and the draw turns random, the opposite of what the client asked for.
+GREEDY_BELOW = 1e-4
+
+
+def is_greedy(p: SamplingParams) -> bool:
+    return p.temperature < GREEDY_BELOW
+
 
 def sampler_key(p: SamplingParams) -> tuple:
     """Everything make_sampler reads; two requests with equal keys share."""
-    if p.temperature == 0:
+    if is_greedy(p):
         return ("greedy",)
     return (
         p.temperature,
@@ -46,13 +54,13 @@ class SamplerPool:
         self._capacity = capacity
 
     def get(self, p: SamplingParams):
-        if p.seed is not None and p.temperature != 0:
+        if p.seed is not None and not is_greedy(p):
             return SeededSampler(p)
         key = sampler_key(p)
         sampler = self._pool.get(key)
         if sampler is None:
             sampler = make_sampler(
-                temp=p.temperature,
+                temp=0.0 if is_greedy(p) else p.temperature,
                 top_p=p.top_p,
                 min_p=p.min_p,
                 min_tokens_to_keep=p.min_tokens_to_keep,

@@ -100,8 +100,23 @@ class _Matcher:
                 self._pos = 0
                 return True
             return False
-        self._pos = 1 if token == self._seq[0] else 0
+        # Fall back to the longest prefix the recent tokens still match, so
+        # a marker whose prefix repeats (7 7 9 fed 7 7 7 9) is not missed.
+        window = self._seq[: self._pos] + (token,)
+        self._pos = next(
+            (
+                k
+                for k in range(min(self._pos, len(self._seq) - 1), 0, -1)
+                if window[-k:] == self._seq[:k]
+            ),
+            0,
+        )
         return False
+
+    @property
+    def matched(self) -> int:
+        """Tokens of the sequence seen so far, in order."""
+        return self._pos
 
 
 class ThinkingBudget:
@@ -128,6 +143,9 @@ class ThinkingBudget:
         # alternative when the free token already began the end marker: the
         # rest of that marker, then the model goes on by itself.
         self._queue: tuple[int, ...] = ()
+        # Set at arming: the marker token the free token would have to be
+        # for the model's own close to count, and the rest of the marker.
+        self._guard = limits.end[0] if limits.end else -1
         self._cont = tuple(limits.end[1:])
         self._pos = 0
         self._armed_at: int | None = None
@@ -162,7 +180,7 @@ class ThinkingBudget:
             self._pos += 1
             forced = self._forced(self._queue[k], vocab, logits.dtype)
             if self._closed is None:
-                self._closed = context[-1] == self.limits.end[0]
+                self._closed = context[-1] == self._guard
             if k < len(self._cont):
                 # The model started the marker: finish it, do not double it.
                 other = self._forced(self._cont[k], vocab, logits.dtype)
@@ -233,7 +251,7 @@ class ThinkingBudget:
             return False
         since = self.reasoning_tokens - self._armed_at
         if since < self._free:
-            self._natural = token == self.limits.end[0]
+            self._natural = token == self._guard
             return False
         return not self._natural
 
@@ -253,6 +271,12 @@ class ThinkingBudget:
         self._natural = False
         self._armed_at = self.reasoning_tokens
         self._free = free
+        # The model may be inside the marker already (its first tokens were
+        # observed): then the free token continues it, not begins it.
+        end = self.limits.end
+        done = self._end.matched if free else 0
+        self._guard = end[done] if done < len(end) else -1
+        self._cont = tuple(end[done + 1 :])
 
     def _disarm(self) -> None:
         self._queue = ()

@@ -15,6 +15,7 @@ from dataclasses import asdict, replace
 from typing import Any
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
@@ -32,6 +33,7 @@ from mlx_beam.engine.thinking import (
     ContextTooLong,
     ThinkingBudget,
     budget,
+    close_counted,
     close_tail,
 )
 
@@ -44,6 +46,15 @@ class EngineDead(RuntimeError):
 
 class InvalidRequest(ValueError):
     """A request the worker would choke on; refused before it is queued."""
+
+
+def own_recurrent_state(caches: list) -> None:
+    """extract() hands back views into the batch arrays; a stored entry must
+    own its bytes, or every entry pins a whole batch array per layer."""
+    for i in recurrent_layers(caches):
+        caches[i].cache = [
+            None if a is None else mx.contiguous(a) for a in caches[i].cache
+        ]
 
 
 class QueueFull(RuntimeError):
@@ -105,7 +116,17 @@ class Engine:
         self.checkpoint_stride = checkpoint_stride
         self.checkpoint_stride_max = checkpoint_stride_max
         # Prompt plus generation must fit; None reads the model's own limit.
-        self.max_context = max_context or model_context_length(model)
+        native = model_context_length(model)
+        if max_context and native and max_context > native:
+            # The model was not trained past its own window; a larger cap
+            # would let a prompt run into positions it never saw.
+            logger.warning(
+                "max_context %d is above the model's %d; using the model's",
+                max_context,
+                native,
+            )
+            max_context = native
+        self.max_context = max_context or native
         # A prompt above this is refused; a request may only lower it.
         self.max_prompt_tokens = max_prompt_tokens
         # Waiting requests beyond this are refused at once instead of queued.
@@ -164,9 +185,13 @@ class Engine:
         fails here, not on the first client request."""
         if self._thread is not None:
             return self
-        # Lazy parameters carry the loading thread's stream; the worker cannot
+        # Lazy arrays carry the loading thread's stream; the worker cannot
         # evaluate them ("There is no Stream(cpu, 0) in current thread").
-        mx.eval(self.model.parameters())
+        # The state holds more than the parameters: rope frequency tables
+        # (Gemma 4, Llama 3) are lazy arrays outside parameters().
+        mx.eval(
+            [a for _, a in tree_flatten(self.model.state) if isinstance(a, mx.array)]
+        )
         self._started_at = time.monotonic()
         self._thread = threading.Thread(
             target=self._run, name="beam-engine", daemon=True
@@ -195,6 +220,11 @@ class Engine:
         return (
             self._thread is not None and self._thread.is_alive() and self._error is None
         )
+
+    @property
+    def last_step(self) -> float:
+        """Monotonic time of the worker's last step: progress, not liveness."""
+        return self._last_step
 
     # -- submission -------------------------------------------------------
 
@@ -260,6 +290,20 @@ class Engine:
                 limits.max_tokens
                 if reasoning_cap is None
                 else min(limits.max_tokens, reasoning_cap)
+            )
+        if (
+            limits is not None
+            and limits.seeded
+            and reasoning_cap is not None
+            and reasoning_cap <= close_counted(limits)
+            and completion_cap - len(limits.close) < request.min_response_tokens
+        ):
+            # The block is open already and closing it costs the whole close
+            # whatever the cap says; the answer's reserve cannot be kept.
+            raise ContextTooLong(
+                f"the prompt opens a think block; closing it takes "
+                f"{len(limits.close)} of the {completion_cap} completion tokens, "
+                f"below the {request.min_response_tokens} the answer reserves"
             )
         return completion_cap, reasoning_cap
 
@@ -334,6 +378,9 @@ class Engine:
                 else None
             ),
             "counters": counters,
+            # Prefill calls that admitted nobody so a starved long prompt got
+            # its full slice (VENDORED.md, scheduler); 0 means never needed.
+            "prefill_starved_calls": gen.starved_calls if gen is not None else 0,
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
             # recommended working set) and what it found before.
@@ -512,7 +559,14 @@ class Engine:
             return
         # What was computed so far is worth keeping: a retry of the same
         # prompt continues from here instead of from the last stored entry.
-        partial = gen.remove(uids, return_prompt_caches=True)
+        try:
+            partial = gen.remove(uids, return_prompt_caches=True)
+        except TypeError:
+            # A row admitted but never prefilled holds empty caches, which
+            # extract() cannot slice; nothing computed, nothing to keep.
+            # extract runs before any mutation, so the plain remove is safe.
+            partial = {}
+            gen.remove(uids)
         for u in uids:
             self._live.pop(u).put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
@@ -525,6 +579,7 @@ class Engine:
             if len(tokens) <= covered:
                 continue  # nothing new beyond what the store already had
             try:
+                own_recurrent_state(cache)
                 self.prefix_store.insert(
                     self.model_key,
                     list(tokens),
@@ -606,11 +661,7 @@ class Engine:
                         # failing store still reaches it as EngineDead.
                         _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
                         self._stride.pop(r.uid, None)
-                        for i in recurrent_layers(r.prompt_cache):
-                            r.prompt_cache[i].cache = [
-                                None if a is None else mx.contiguous(a)
-                                for a in r.prompt_cache[i].cache
-                            ]
+                        own_recurrent_state(r.prompt_cache)
                         tokens = list(r.all_tokens)
                         self.prefix_store.insert(
                             self.model_key,

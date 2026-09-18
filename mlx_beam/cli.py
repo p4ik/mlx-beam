@@ -125,7 +125,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     limits.add_argument(
         "--max-completion-tokens",
         type=int,
-        default=512,
+        default=None,
         help="generated tokens when the client sends no max_tokens / "
         "max_completion_tokens / max_output_tokens; the request overrides "
         "(mlx-lm: --max-tokens, default 512)",
@@ -205,7 +205,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     batching.add_argument(
         "--decode-share",
-        type=float,
+        type=lambda v: _unit_interval(v, "--decode-share"),
         default=0.5,
         help="share of the worker's time decode keeps while a prefill runs (0-1)",
     )
@@ -227,7 +227,12 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="run a model_file shipped inside the checkpoint",
     )
-    p.add_argument("--log-level", default="INFO")
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
 
 
 def _json_object(text: str) -> dict:
@@ -249,12 +254,24 @@ DEFAULT_CHAT_TEMPLATE = (
 )
 
 
+def _unit_interval(value: str, flag: str) -> float:
+    x = float(value)
+    if not 0.0 <= x <= 1.0:
+        raise argparse.ArgumentTypeError(f"{flag} must be between 0 and 1")
+    return x
+
+
 def chat_template_from_args(args) -> str | None:
     """The --chat-template text: read from the file when the value names one."""
     if not args.chat_template:
         return None
     path = Path(args.chat_template)
-    if path.is_file():
+    try:
+        is_file = path.is_file()
+    except OSError:
+        # A template's text is longer than a file name may be.
+        is_file = False
+    if is_file:
         return path.read_text(encoding="utf-8")
     return args.chat_template
 
@@ -264,12 +281,20 @@ def kv_policy_from_args(args):
 
     bits, group_size, layers = args.kv_bits, args.kv_group_size, {}
     if args.kv_config:
-        with open(args.kv_config) as f:
-            cfg = json.load(f)
-        bits = cfg.get("bits", bits)
-        group_size = cfg.get("group_size", group_size)
-        layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
-    return KVPolicy(bits=bits, group_size=group_size, layers=layers)
+        try:
+            with open(args.kv_config) as f:
+                cfg = json.load(f)
+            if not isinstance(cfg, dict) or not isinstance(cfg.get("layers", {}), dict):
+                raise ValueError("expected an object with bits, group_size, layers")
+            bits = cfg.get("bits", bits)
+            group_size = cfg.get("group_size", group_size)
+            layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--kv-config {args.kv_config}: {e}") from None
+    try:
+        return KVPolicy(bits=bits, group_size=group_size, layers=layers)
+    except ValueError as e:
+        raise SystemExit(f"kv policy: {e}") from None
 
 
 def serve(args) -> int:
@@ -285,6 +310,8 @@ def serve(args) -> int:
         level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s"
     )
     log = logging.getLogger("beam")
+    # Flags are checked before minutes of loading are spent on a typo.
+    policy = kv_policy_from_args(args)
     log.info("loading %s", args.model)
     # Handed to the tokenizer at load, so the think and tool markers are
     # inferred from the template that will actually render.
@@ -316,7 +343,6 @@ def serve(args) -> int:
             "min_response_tokens": args.min_response_tokens or None,
         },
     )
-    policy = kv_policy_from_args(args)
     engine = Engine(
         model,
         model_key=args.model,

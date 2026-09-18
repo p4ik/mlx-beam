@@ -27,7 +27,13 @@ from mlx_beam.api.chat import (
 )
 from mlx_beam.api.chat import to_generation_request as chat_to_generation_request
 from mlx_beam.api.defaults import RequestDefaults
-from mlx_beam.api.errors import ApiError, unsupported
+from mlx_beam.api.errors import (
+    ApiError,
+    bool_field,
+    object_field,
+    text_field,
+    unsupported,
+)
 from mlx_beam.api.reasoning import read_aliases
 from mlx_beam.api.text import TextAssembler, TextDelta
 from mlx_beam.engine.request import GenerationRequest
@@ -40,6 +46,8 @@ class ResponsesRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
     # Function tools in Responses shape, echoed back in the response object.
     tools: list[dict] = field(default_factory=list)
+    instructions: str | None = None
+    tool_choice: str = "auto"
 
 
 def _content_text(content: Any, item_index: int) -> str | None:
@@ -53,7 +61,7 @@ def _content_text(content: Any, item_index: int) -> str | None:
     for part in content:
         kind = part.get("type") if isinstance(part, dict) else None
         if kind in ("input_text", "output_text", "text"):
-            texts.append(part.get("text", ""))
+            texts.append(text_field(part, "text", f"input[{item_index}]"))
         elif kind in ("input_image",):
             raise ApiError(
                 "image input needs the 'vision' extra", code="extra_not_installed"
@@ -77,28 +85,43 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
     if not isinstance(inp, list):
         raise ApiError("input must be a string or a list of items", param="input")
     pending_calls: list[dict] = []
+    pending_reasoning = ""
+    pending_calls_reasoning = ""
+
+    def flush_calls() -> None:
+        nonlocal pending_calls, pending_calls_reasoning
+        if not pending_calls:
+            return
+        turn = {"role": "assistant", "content": None, "tool_calls": pending_calls}
+        if pending_calls_reasoning:
+            turn["reasoning_content"] = pending_calls_reasoning
+        messages.append(turn)
+        pending_calls, pending_calls_reasoning = [], ""
+
     for i, item in enumerate(inp):
         if not isinstance(item, dict):
             raise ApiError(f"input[{i}] must be an object", param="input")
         kind = item.get("type", "message")
         if kind == "message":
-            if pending_calls:
-                messages.append(
-                    {"role": "assistant", "content": None, "tool_calls": pending_calls}
-                )
-                pending_calls = []
+            flush_calls()
             role = item.get("role")
             if role not in ("user", "assistant", "system", "developer"):
                 raise ApiError(
                     f"input[{i}] has an unknown role {role!r}", param="input"
                 )
-            messages.append(
-                {
-                    "role": "system" if role == "developer" else role,
-                    "content": _content_text(item.get("content"), i),
-                }
-            )
+            message = {
+                "role": "system" if role == "developer" else role,
+                "content": _content_text(item.get("content"), i),
+            }
+            if role == "assistant" and pending_reasoning:
+                message["reasoning_content"] = pending_reasoning
+                pending_reasoning = ""
+            messages.append(message)
         elif kind == "function_call":
+            if pending_reasoning:
+                # The block preceded the call: it belongs to that turn.
+                pending_calls_reasoning = pending_reasoning
+                pending_reasoning = ""
             pending_calls.append(
                 {
                     "id": item.get("call_id") or item.get("id") or f"call_{i}",
@@ -110,11 +133,7 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
                 }
             )
         elif kind == "function_call_output":
-            if pending_calls:
-                messages.append(
-                    {"role": "assistant", "content": None, "tool_calls": pending_calls}
-                )
-                pending_calls = []
+            flush_calls()
             output = item.get("output")
             messages.append(
                 {
@@ -126,15 +145,23 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
                 }
             )
         elif kind == "reasoning":
-            # Carried by the client for its own bookkeeping; the template
-            # does not need it.
+            # The client hands the earlier think block back; a template that
+            # reads reasoning_content gets it on the assistant turn that
+            # follows (mirror_reasoning fills the other keys).
+            parts = item.get("content") or []
+            if not isinstance(parts, list):
+                raise ApiError(f"input[{i}].content must be a list", param="input")
+            text = "".join(
+                text_field(part, "text", f"input[{i}]")
+                for part in parts
+                if isinstance(part, dict)
+            )
+            if text:
+                pending_reasoning = text
             continue
         else:
             raise unsupported(f"input item type {kind}", "input")
-    if pending_calls:
-        messages.append(
-            {"role": "assistant", "content": None, "tool_calls": pending_calls}
-        )
+    flush_calls()
     if not messages:
         raise ApiError("input is empty", param="input")
     return messages
@@ -175,7 +202,7 @@ def parse_responses_request(
             )
     if body.get("n", 1) not in (None, 1):
         raise unsupported("n > 1", "n")
-    text_format = ((body.get("text") or {}).get("format") or {}).get("type")
+    text_format = object_field(object_field(body, "text"), "format", "text").get("type")
     if text_format not in (None, "text"):
         raise ApiError(
             "text.format needs the 'structured' extra", code="extra_not_installed"
@@ -201,7 +228,7 @@ def parse_responses_request(
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
         sampling=parse_sampling(body, defaults),
-        stream=bool(body.get("stream", False)),
+        stream=bool_field(body, "stream"),
         stop=[],
         tools=tools,
         reasoning_effort=level,
@@ -215,7 +242,9 @@ def parse_responses_request(
     return ResponsesRequest(
         chat=chat,
         stream=chat.stream,
-        metadata=dict(body.get("metadata") or {}),
+        instructions=body.get("instructions") or None,
+        tool_choice=tool_choice,
+        metadata=object_field(body, "metadata"),
         tools=list(body.get("tools") or []),
     )
 
@@ -248,8 +277,8 @@ class ResponsesResponder:
             tools=req.chat.tools,
             streaming=False,
             route_thinking=route_thinking,
+            tools_enabled=req.chat.tools is not None,
         )
-        self.msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     def _response(
         self, status: str, output: list[dict], cached: int, incomplete=None
@@ -263,14 +292,14 @@ class ResponsesResponder:
             "output": output,
             "error": None,
             "incomplete_details": incomplete,
-            "instructions": None,
+            "instructions": self.req.instructions,
             "metadata": self.req.metadata,
             "parallel_tool_calls": True,
             "previous_response_id": None,
             "store": False,
             "temperature": self.req.chat.sampling.temperature,
             "top_p": self.req.chat.sampling.top_p,
-            "tool_choice": "auto",
+            "tool_choice": self.req.tool_choice,
             "tools": self.req.tools,
             "usage": {
                 "input_tokens": self.prompt_len,
@@ -282,61 +311,13 @@ class ResponsesResponder:
         }
         return out
 
-    def _output_items(self, total: TextDelta) -> list[dict]:
-        items: list[dict] = []
-        if total.reasoning:
-            items.append(
-                {
-                    "id": f"rs_{uuid.uuid4().hex[:24]}",
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": [{"type": "reasoning_text", "text": total.reasoning}],
-                }
-            )
-        if total.content:
-            items.append(
-                {
-                    "id": self.msg_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": total.content,
-                            "annotations": [],
-                        }
-                    ],
-                }
-            )
-        for tc in total.tool_calls:
-            items.append(
-                {
-                    "id": f"fc_{uuid.uuid4().hex[:24]}",
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "arguments": tc["function"]["arguments"],
-                }
-            )
-        return items
-
     def complete(self, events, cached: int) -> dict:
-        total = TextDelta()
-        for event in events:
-            d = self.assembler.feed(event)
-            total.content += d.content
-            total.reasoning += d.reasoning
-            total.tool_calls += d.tool_calls
-            if d.finish_reason:
-                total.finish_reason = d.finish_reason
-                break
-        incomplete = (
-            {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
-        )
-        status = "incomplete" if incomplete else "completed"
-        return self._response(status, self._output_items(total), cached, incomplete)
+        """The same items the stream builds, without the events: the last
+        stream event carries the whole response."""
+        final = None
+        for ev in self.stream(events, cached):
+            final = ev
+        return final["response"]
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         """Server-sent events of the Responses stream: created, in_progress,
@@ -357,45 +338,49 @@ class ResponsesResponder:
         output: list[dict] = []
         index = -1
         current: str | None = None  # "reasoning" or "message" while open
-        rs_id = f"rs_{uuid.uuid4().hex[:24]}"
+        # Every opened item has its own id and text; the model may return
+        # to reasoning or text after a tool call, and that is a new item.
+        item_id = ""
+        item_text = ""
 
-        def close_current():
+        def close_current(cut: bool = False):
             nonlocal current
             if current == "reasoning":
                 item = {
-                    "id": rs_id,
+                    "id": item_id,
                     "type": "reasoning",
                     "summary": [],
-                    "content": [{"type": "reasoning_text", "text": total.reasoning}],
+                    "content": [{"type": "reasoning_text", "text": item_text}],
                 }
                 yield ev(
                     "response.reasoning_text.done",
-                    item_id=rs_id,
+                    item_id=item_id,
                     output_index=index,
                     content_index=0,
-                    text=total.reasoning,
+                    text=item_text,
                 )
                 yield ev("response.output_item.done", output_index=index, item=item)
                 output.append(item)
             elif current == "message":
-                part = {"type": "output_text", "text": total.content, "annotations": []}
+                part = {"type": "output_text", "text": item_text, "annotations": []}
                 item = {
-                    "id": self.msg_id,
+                    "id": item_id,
                     "type": "message",
-                    "status": "completed",
+                    "status": "incomplete" if cut else "completed",
                     "role": "assistant",
                     "content": [part],
                 }
                 yield ev(
                     "response.output_text.done",
-                    item_id=self.msg_id,
+                    item_id=item_id,
                     output_index=index,
                     content_index=0,
-                    text=total.content,
+                    text=item_text,
+                    logprobs=[],
                 )
                 yield ev(
                     "response.content_part.done",
-                    item_id=self.msg_id,
+                    item_id=item_id,
                     output_index=index,
                     content_index=0,
                     part=part,
@@ -406,59 +391,34 @@ class ResponsesResponder:
 
         for event in events:
             d = self.assembler.feed(event)
+            # Calls go out before the text of the same delta: what parsed came
+            # first, and a cut-off tail is what the length limit hit - it is
+            # the item still open at the end, closed as incomplete below.
             if d.reasoning:
                 if current != "reasoning":
                     yield from close_current()
                     index += 1
                     current = "reasoning"
+                    item_id = f"rs_{uuid.uuid4().hex[:24]}"
+                    item_text = ""
                     yield ev(
                         "response.output_item.added",
                         output_index=index,
                         item={
-                            "id": rs_id,
+                            "id": item_id,
                             "type": "reasoning",
                             "summary": [],
                             "content": [],
                         },
                     )
                 total.reasoning += d.reasoning
+                item_text += d.reasoning
                 yield ev(
                     "response.reasoning_text.delta",
-                    item_id=rs_id,
+                    item_id=item_id,
                     output_index=index,
                     content_index=0,
                     delta=d.reasoning,
-                )
-            if d.content:
-                if current != "message":
-                    yield from close_current()
-                    index += 1
-                    current = "message"
-                    yield ev(
-                        "response.output_item.added",
-                        output_index=index,
-                        item={
-                            "id": self.msg_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        },
-                    )
-                    yield ev(
-                        "response.content_part.added",
-                        item_id=self.msg_id,
-                        output_index=index,
-                        content_index=0,
-                        part={"type": "output_text", "text": "", "annotations": []},
-                    )
-                total.content += d.content
-                yield ev(
-                    "response.output_text.delta",
-                    item_id=self.msg_id,
-                    output_index=index,
-                    content_index=0,
-                    delta=d.content,
                 )
             for tc in d.tool_calls:
                 yield from close_current()
@@ -480,15 +440,53 @@ class ResponsesResponder:
                     "response.function_call_arguments.done",
                     item_id=item["id"],
                     output_index=index,
+                    name=item["name"],
                     arguments=item["arguments"],
                 )
                 yield ev("response.output_item.done", output_index=index, item=item)
                 output.append(item)
                 total.tool_calls.append(tc)
+            if d.content:
+                if current != "message":
+                    yield from close_current()
+                    index += 1
+                    current = "message"
+                    item_id = f"msg_{uuid.uuid4().hex[:24]}"
+                    item_text = ""
+                    yield ev(
+                        "response.output_item.added",
+                        output_index=index,
+                        item={
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    )
+                    yield ev(
+                        "response.content_part.added",
+                        item_id=item_id,
+                        output_index=index,
+                        content_index=0,
+                        part={"type": "output_text", "text": "", "annotations": []},
+                    )
+                total.content += d.content
+                item_text += d.content
+                yield ev(
+                    "response.output_text.delta",
+                    item_id=item_id,
+                    output_index=index,
+                    content_index=0,
+                    delta=d.content,
+                    logprobs=[],
+                )
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
                 break
-        yield from close_current()
+        # The item's status goes out with its done event; nothing already
+        # on the wire is changed afterwards.
+        yield from close_current(cut=total.finish_reason == "length")
         incomplete = (
             {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
         )

@@ -12,7 +12,9 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_parameter_start = re.compile(r"<parameter=")
+_parameter_end = "</parameter>"
+_name_regex = re.compile(r"\s*([^\s<>]+)>?")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -31,6 +33,20 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
                 return {}
             return params.get("properties", {})
     return {}
+
+
+def _closed_parameters(func_name: str, tools: Optional[Any]) -> Optional[set]:
+    """The parameter names a schema with ``additionalProperties: false``
+    allows, or None when the schema leaves the names open."""
+    for tool in tools or ():
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not function or function.get("name") != func_name:
+            continue
+        params = function.get("parameters")
+        if isinstance(params, dict) and params.get("additionalProperties") is False:
+            return set(params.get("properties") or {})
+        return None
+    return None
 
 
 def _convert_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
@@ -86,18 +102,51 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             return param_value
 
 
+def _parameter_bodies(parameters: str) -> list:
+    """Each parameter's ``name>value``. A parameter ends at the last
+    ``</parameter>`` before the next ``<parameter=`` (or the end), so a value
+    that contains the end tag literally - HTML, XML, a file with this very
+    markup - is kept whole instead of cut at its first occurrence. A
+    parameter without an end tag means the call was cut short."""
+    starts = [m.end() for m in _parameter_start.finditer(parameters)]
+    bodies = []
+    for i, start in enumerate(starts):
+        stop = starts[i + 1] - len("<parameter=") if i + 1 < len(starts) else None
+        chunk = parameters[start:stop]
+        close = chunk.rfind(_parameter_end)
+        if close < 0:
+            raise ValueError("Parameter without a closing tag.")
+        # Text between a parameter's end tag and the next tag is nobody's:
+        # a literal tag inside a value put it there, and dropping it would
+        # lose part of that value in silence.
+        if chunk[close + len(_parameter_end) :].strip():
+            raise ValueError("Text outside a parameter.")
+        bodies.append(chunk[:close])
+    return bodies
+
+
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
-    name_match = re.match(r"\s*([^\s<>]+)>?", function_call_str)
+    name_match = _name_regex.match(function_call_str)
     if name_match is None:
         raise ValueError("No function name provided.")
     function_name = name_match.group(1)
     param_config = _get_arguments_config(function_name, tools)
+    closed = _closed_parameters(function_name, tools)
     parameters = function_call_str[name_match.end() :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
-        idx = match_text.index(">")
-        param_name = match_text[:idx]
-        param_value = str(match_text[idx + 1 :])
+    for match_text in _parameter_bodies(parameters):
+        param_match = _name_regex.match(match_text)
+        if param_match is None:
+            continue
+        param_name = param_match.group(1)
+        # A parameter tag inside a value looks like a second parameter; a
+        # name seen twice, or one the schema rules out, is that case or a
+        # broken call - either way not a call to make in silence.
+        if param_name in param_dict:
+            raise ValueError(f"Parameter {param_name!r} given twice.")
+        if closed is not None and param_name not in closed:
+            raise ValueError(f"Parameter {param_name!r} is not in the schema.")
+        param_value = str(match_text[param_match.end() :])
         if param_value.startswith("\n"):
             param_value = param_value[1:]
         if param_value.endswith("\n"):

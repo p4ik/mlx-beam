@@ -109,6 +109,15 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def _packed_layout(queries, keys):
+    """Bits and group size of packed keys, read off their shapes: a layer
+    that shares another layer's cache (Gemma 4) gets the packed triple
+    with no cache of its own to ask."""
+    head_dim = queries.shape[-1]
+    packed, scales = keys[0], keys[1]
+    return packed.shape[-1] * 32 // head_dim, head_dim // scales.shape[-1]
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -119,19 +128,25 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if hasattr(cache, "bits"):
+        bits, group_size = cache.bits, cache.group_size
+    elif isinstance(keys, (tuple, list)):
+        bits, group_size = _packed_layout(queries, keys)
+    else:
+        bits = None
+    if bits is not None:
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
         # The tiled path bounds the prefill transient; the stock one takes
         # the shapes and masks it does not cover (VENDORED.md, tiled SDPA).
-        if fused_quant_sdpa.supported(queries, cache.bits, cache.group_size, mask):
+        if fused_quant_sdpa.supported(queries, bits, group_size, mask):
             return fused_quant_sdpa.fused_quantized_scaled_dot_product_attention(
                 queries,
                 keys,
                 values,
                 scale=scale,
                 mask=mask,
-                group_size=cache.group_size,
-                bits=cache.bits,
+                group_size=group_size,
+                bits=bits,
             )
         return quantized_scaled_dot_product_attention(
             queries,
@@ -139,8 +154,8 @@ def scaled_dot_product_attention(
             values,
             scale=scale,
             mask=mask,
-            group_size=cache.group_size,
-            bits=cache.bits,
+            group_size=group_size,
+            bits=bits,
         )
     else:
         return mx.fast.scaled_dot_product_attention(

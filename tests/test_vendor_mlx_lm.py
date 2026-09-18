@@ -130,3 +130,68 @@ def test_scheduler_alternates_under_sharing():
         assert calls < 50
     gen.close()
     assert first_tokens_during_prefill >= 1
+
+
+def test_decode_burst_ends_when_a_row_finishes():
+    """While a prefill shares the worker, decode runs for a time budget; a
+    row that finishes inside that burst ends it, so its extracted cache is
+    evaluated before the next step instead of forcing batch-wide copies."""
+    model = tiny_hybrid()
+    gen = BatchGenerator(
+        model, max_tokens=40, stop_tokens=[], prefill_slice=4, prefill_batch_size=2
+    )
+    short, long_ = gen.insert([[3, 7, 11], [5, 9, 13]], max_tokens=[3, 40])
+    seen = {short: 0, long_: 0}
+    while min(seen.values()) < 1:
+        for r in gen.next()[1]:
+            seen[r.uid] += 1
+    # A prefill now shares the worker; give every burst a budget of seconds.
+    gen.insert([list(range(1, 30))])
+    for _ in range(20):
+        gen._last_prefill_s = 10.0
+        _, generated = gen.next()
+        if any(r.uid == short and r.finish_reason is not None for r in generated):
+            break
+    else:
+        raise AssertionError("the short row never finished")
+    gen.close()
+    # Both rows step together; the burst stopped at the step that finished
+    # the short row, so the long one got no more tokens in this call.
+    assert sum(r.uid == long_ for r in generated) == sum(
+        r.uid == short for r in generated
+    )
+
+
+def test_a_trickle_of_short_prompts_cannot_starve_a_long_prefill():
+    """Width is the shortest row's segment, so one short newcomer per call
+    would hold a long prompt at a few tokens per call for as long as the
+    trickle lasts. After two such calls the next one admits nobody, and the
+    long row gets a whole slice; the newcomers still wait at most one call
+    more than usual."""
+    model = tiny_hybrid()
+    gen = BatchGenerator(
+        model, max_tokens=2, stop_tokens=[], prefill_slice=64, prefill_batch_size=2
+    )
+    (long_,) = gen.insert([list(range(1, 601))])
+    waited = {}
+    calls = 0
+    while True:
+        # A fresh eight-token newcomer whenever the previous one is admitted.
+        if not gen._unprocessed_sequences:
+            (uid,) = gen.insert([[3, 5, 7, 9, 11, 13, 15, 17]])
+            waited[uid] = calls
+        _, generated = gen.next()
+        calls += 1
+        for r in generated:
+            if r.uid in waited and isinstance(waited[r.uid], int):
+                waited[r.uid] = ("done", calls - waited[r.uid])
+        if any(r.uid == long_ for r in generated):
+            break
+        assert calls < 200, "the long prompt is starving"
+    gen.close()
+    # Without the guard this takes ~295 calls (measured); decode turns for
+    # the newcomers alternate with the prefill calls, hence the margin.
+    assert calls < 150 and gen.starved_calls >= 3
+    # A newcomer waits at most one call more than without the guard (7).
+    delays = [v[1] for v in waited.values() if isinstance(v, tuple)]
+    assert delays and max(delays) <= 8, delays

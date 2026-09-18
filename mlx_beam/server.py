@@ -35,7 +35,8 @@ from mlx_beam.engine import (
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 64 << 20
-# Seconds between SSE comments while a client waits for its first token.
+# Seconds of silence on a stream before an SSE comment goes out: while the
+# prompt prefills, and while a tool call is decoded without a chunk.
 KEEPALIVE_S = 5.0
 # A socket that neither delivers the body nor takes the stream for this long
 # is given up: the request is cancelled instead of holding a batch slot.
@@ -116,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
     timeout = SOCKET_TIMEOUT_S
     _streaming = False
     _sse_events = False
+    _pending = b""
+    _last_write = 0.0
 
     def log_message(self, fmt, *args):  # one line per request, via logging
         logger.info("%s %s", self.address_string(), fmt % args)
@@ -140,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, err: ApiError) -> None:
-        headers = {"Retry-After": "1"} if err.status == 503 else None
+        # A full queue clears; a dead engine does not come back on its own.
+        headers = {"Retry-After": "1"} if err.code == "queue_full" else None
         self._send_json(err.status, err.body(), headers)
 
     def _cors(self) -> None:
@@ -155,7 +159,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        # A browser client sends its own header names (the OpenAI SDK adds
+        # x-stainless-*); the preflight must allow what it asked for.
+        asked = self.headers.get("Access-Control-Request-Headers")
+        self.send_header(
+            "Access-Control-Allow-Headers", asked or "Content-Type, Authorization"
+        )
+        self.send_header("Access-Control-Max-Age", "600")
 
     def _start_sse(self) -> None:
         self.send_response(HTTPStatus.OK)
@@ -179,15 +189,28 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise ApiError("Content-Length must be a number") from None
+        if length < 0:
+            raise ApiError("Content-Length must not be negative")
         if length > MAX_BODY_BYTES:
             raise ApiError("request body too large", status=413)
+        if not length and "chunked" in (self.headers.get("Transfer-Encoding") or ""):
+            raise ApiError("chunked request bodies are not supported", status=411)
         raw = self.rfile.read(length) if length else b""
         try:
             return json.loads(raw or b"{}")
+        except UnicodeDecodeError as e:
+            raise ApiError(f"request body is not UTF-8: {e.reason}") from None
         except json.JSONDecodeError as e:
             raise ApiError(f"invalid JSON: {e.msg}") from None
 
     # -- routes -----------------------------------------------------------
+
+    def do_HEAD(self):
+        self._send_error(
+            ApiError("method not allowed", status=405, type="not_found_error")
+        )
+
+    do_PUT = do_DELETE = do_PATCH = do_HEAD
 
     def do_OPTIONS(self):
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -254,39 +277,45 @@ class Handler(BaseHTTPRequestHandler):
     def _run(self, gen_request, responder, stream: bool, sse_events: bool = False):
         """Submit, then either stream chunks as they come or answer once.
 
-        The first event is awaited before any header goes out, so a request
-        the worker rejects still gets a proper error status. While a long
-        prefill runs, a streaming client gets SSE comments with the progress
-        so proxies and clients do not give up on an idle connection."""
+        A plain request waits for the first event before any header goes
+        out, so one the worker rejects gets a proper error status; a stream
+        opens with the 200 at once and reports a rejection as an error event.
+        While a long prefill runs, a streaming client gets SSE comments with
+        the progress so proxies and clients do not give up on an idle
+        connection."""
         result = self.served.engine.submit(gen_request)
         self._sse_events = sse_events
         try:
             if stream:
                 self._start_sse()
                 self._streaming = True
+                self._last_write = time.monotonic()
                 first = self._await_first(result, keepalive=True)
                 if first is None:
                     raise ApiError("the engine produced nothing", status=500)
-                events = _chain(first, result)
-                pending = bytearray()
+                events = self._events(first, result)
+                self._pending = bytearray()
                 try:
                     for payload in responder.stream(events, result.prompt_cached):
-                        pending += self._sse_bytes(
+                        self._pending += self._sse_bytes(
                             payload, payload.get("type") if sse_events else None
                         )
                         # Flush when the engine has nothing more ready, or
                         # the batch is large enough as it is.
-                        if not result.ready or len(pending) >= SSE_WRITE_BATCH_BYTES:
-                            self.wfile.write(pending)
-                            self.wfile.flush()
-                            pending = bytearray()
+                        if (
+                            not result.ready
+                            or len(self._pending) >= SSE_WRITE_BATCH_BYTES
+                        ):
+                            self._flush_pending()
                     if not sse_events:
-                        pending += self._sse_bytes("[DONE]")
+                        self._pending += self._sse_bytes("[DONE]")
+                except OSError:
+                    # The socket is the problem: nothing more goes out.
+                    self._pending = bytearray()
+                    raise
                 finally:
                     # What was generated goes out before any error does.
-                    if pending:
-                        self.wfile.write(pending)
-                        self.wfile.flush()
+                    self._flush_pending()
             else:
                 first = self._await_first(result, keepalive=False)
                 if first is None:
@@ -306,17 +335,66 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
     def _await_first(self, result, keepalive: bool):
+        """The first event; while it is awaited a streaming client gets a
+        comment per wait, but only while the worker keeps stepping - a hung
+        worker must not look busy (see _events)."""
+        engine = self.served.engine
+        seen_step = engine.last_step
         while True:
             try:
                 return result.next_event(timeout=KEEPALIVE_S)
             except queue.Empty:
                 if self._client_gone():
                     raise ConnectionResetError("client went away") from None
-                if keepalive:
+                if keepalive and engine.last_step != seen_step:
+                    seen_step = engine.last_step
                     p = result.progress
-                    note = f"prefill {p.processed}/{p.total}" if p else "waiting"
-                    self.wfile.write(f": {note}\n\n".encode())
-                    self.wfile.flush()
+                    self._comment(
+                        f"prefill {p.processed}/{p.total}" if p else "waiting"
+                    )
+
+    def _events(self, first, result) -> Iterator:
+        """The token events, with an SSE comment whenever nothing went out
+        for KEEPALIVE_S while the worker made progress. A tool call is
+        collected until it closes, so a long one is decoded in silence and a
+        client's idle timeout would give the request up in the middle of
+        it. A worker that stopped stepping gets no comment: the silence is
+        what lets a watchdog see the hang."""
+        yield first
+        if first.finish_reason is not None:
+            return
+        engine = self.served.engine
+        seen_step = engine.last_step
+        while True:
+            try:
+                event = result.next_event(timeout=KEEPALIVE_S)
+            except queue.Empty:
+                if self._client_gone():
+                    raise ConnectionResetError("client went away") from None
+                if engine.last_step != seen_step:
+                    seen_step = engine.last_step
+                    self._comment("keepalive")
+                continue
+            if event is None:
+                return
+            if time.monotonic() - self._last_write >= KEEPALIVE_S:
+                if self._pending:
+                    self._flush_pending()
+                else:
+                    self._comment("keepalive")
+            yield event
+
+    def _comment(self, note: str) -> None:
+        self.wfile.write(f": {note}\n\n".encode())
+        self.wfile.flush()
+        self._last_write = time.monotonic()
+
+    def _flush_pending(self) -> None:
+        if self._pending:
+            self.wfile.write(self._pending)
+            self.wfile.flush()
+            self._pending = bytearray()
+        self._last_write = time.monotonic()
 
     def _check_model(self, body: dict) -> None:
         """A model name that is not the served one is a 404, as at OpenAI;

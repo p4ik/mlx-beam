@@ -221,3 +221,38 @@ def entry_tail(engine, prompt):
         if list(key[: len(prompt)]) == list(prompt):
             return list(key[len(prompt) :])
     raise AssertionError("no entry for the prompt")
+
+
+def test_system_entries_are_capped_so_conversations_keep_their_place():
+    """Many distinct system prompts must not turn the whole store into
+    system entries: past a quarter of it the oldest system entry goes, and
+    a conversation's second turn still finds its first."""
+    model = tiny_llama()
+    with Engine(model, prompt_cache_size=4) as engine:
+        assert engine.prefix_store.system_cap == 1
+        for n in range(5):
+            system = [2, 6, 1, n + 10]
+            run(engine, system + [7, 3], 2, system_end=len(system))
+        d = engine.prefix_store.describe()["by_type"]
+        assert d["system"] == 1 and d["assistant"] >= 2
+        system = [2, 6, 1, 14]
+        _, cached = run(engine, system + [7, 3] + [5, 4], 2, system_end=len(system))
+        # The last conversation is still there: more than its system block hit.
+        assert cached > len(system)
+
+
+def test_a_prefix_entry_owns_only_its_own_tokens():
+    """A system entry cut from a long conversation must not keep the whole
+    conversation's KV buffers alive."""
+    store = PrefixStore()
+    caches = [KVCache()]
+    k = mx.zeros((1, 1, 600, 8))
+    caches[0].update_and_fetch(k, k)
+    mx.eval(caches[0].keys)
+    tokens = list(range(600))
+    assert store.insert_prefix("m", tokens, caches, {}, 4)
+    entry = store._trie.get("m", tokens[:4])
+    assert entry.cache[0].offset == 4 and entry.cache[0].keys.shape[2] == 4
+    assert entry.nbytes == 2 * 4 * 8 * 4  # keys + values, 4 tokens, 8 dims, fp32
+    hit = store.fetch("m", tokens[:4] + [99])
+    assert hit is not None and hit.covered == 4

@@ -27,6 +27,21 @@ MLX_LM_DEFAULTS = {
 # Ours, with no mlx-lm counterpart: no reasoning budget, no reserve.
 BEAM_DEFAULTS = {"max_reasoning_tokens": None, "min_response_tokens": 0}
 
+# What a request may ask for; a default outside this is refused at start,
+# not on every request that leaves the field empty.
+RANGES = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.0, 1.0),
+    "min_p": (0.0, 1.0),
+    "top_k": (-1, None),
+    "repetition_penalty": (0.0, None),
+    "presence_penalty": (-2.0, 2.0),
+    "frequency_penalty": (-2.0, 2.0),
+    "max_completion_tokens": (1, None),
+    "max_reasoning_tokens": (0, None),
+    "min_response_tokens": (0, None),
+}
+
 # The generation_config.json keys we read, and what they map to.
 GENERATION_CONFIG_KEYS = {
     "temperature": "temperature",
@@ -91,6 +106,20 @@ class RequestDefaults:
             if value is not None:
                 values[key] = value
                 sources[key] = "flag"
+        for key, (lo, hi) in RANGES.items():
+            value = values.get(key)
+            if value is None:
+                continue
+            bad = isinstance(value, bool) or not isinstance(value, (int, float))
+            if not bad and (
+                (lo is not None and value < lo) or (hi is not None and value > hi)
+            ):
+                bad = True
+            if bad:
+                raise ValueError(
+                    f"{key} from {sources[key]} is {value!r}; "
+                    f"a request may use {lo} to {hi if hi is not None else 'any'}"
+                )
         out = cls(**{k: values[k] for k in values})
         out.sources = sources
         return out

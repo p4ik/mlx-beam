@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 import uuid
@@ -10,7 +11,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from mlx_beam.api.defaults import RequestDefaults
-from mlx_beam.api.errors import ApiError, missing_extra, unsupported
+from mlx_beam.api.errors import (
+    ApiError,
+    bool_field,
+    missing_extra,
+    object_field,
+    text_field,
+    unsupported,
+)
 from mlx_beam.api.reasoning import (
     effort_candidates,
     is_effort_rejection,
@@ -75,11 +83,17 @@ def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> Sampling
     logit_bias = body.get("logit_bias")
     if logit_bias:
         try:
+            if any(isinstance(v, bool) for v in logit_bias.values()):
+                raise ValueError
             logit_bias = {int(k): float(v) for k, v in logit_bias.items()}
         except (TypeError, ValueError, AttributeError):
             raise ApiError(
                 "logit_bias must map token ids to numbers", param="logit_bias"
             ) from None
+        if any(
+            not math.isfinite(v) or not -100 <= v <= 100 for v in logit_bias.values()
+        ):
+            raise ApiError("logit_bias values must be in -100..100", param="logit_bias")
     d = defaults
     penalty = _number(body, "repetition_penalty", d.repetition_penalty, 0.0)
     presence = _number(body, "presence_penalty", d.presence_penalty or 0.0, -2.0, 2.0)
@@ -131,10 +145,9 @@ def parse_stop(body: dict) -> list[str]:
 
 def _reject_unsupported(body: dict) -> None:
     n = body.get("n", 1)
-    if n not in (None, 1):
+    if n not in (None, 1) or isinstance(n, bool):
         raise unsupported("n > 1", "n")
-    rf = body.get("response_format")
-    if rf and rf.get("type") not in (None, "text"):
+    if object_field(body, "response_format").get("type") not in (None, "text"):
         raise missing_extra("response_format", "structured")
     if body.get("tool_choice") not in (None, "auto", "none"):
         raise unsupported("tool_choice other than auto or none", "tool_choice")
@@ -154,7 +167,7 @@ def _normalise_messages(messages: Any) -> list[dict]:
             for part in content:
                 kind = part.get("type") if isinstance(part, dict) else None
                 if kind == "text":
-                    texts.append(part.get("text", ""))
+                    texts.append(text_field(part, "text", f"messages[{i}].content"))
                 elif kind in ("image_url", "input_image"):
                     raise missing_extra("image input", "vision")
                 elif kind in ("input_audio", "audio", "video_url"):
@@ -165,10 +178,52 @@ def _normalise_messages(messages: Any) -> list[dict]:
                         param="messages",
                     )
             m["content"] = "".join(texts)
-        elif content is not None and not isinstance(content, str):
+        elif content is None:
+            # A turn made of tool calls has no content; a template that trims
+            # or concatenates it must see "", not None.
+            m["content"] = ""
+        elif not isinstance(content, str):
             raise ApiError(f"messages[{i}].content must be text", param="messages")
+        if m.get("tool_calls"):
+            m["tool_calls"] = [
+                _normalise_tool_call(tc, f"messages[{i}].tool_calls[{j}]")
+                for j, tc in enumerate(m["tool_calls"])
+            ]
         out.append(m)
     return out
+
+
+def _normalise_tool_call(tc: Any, where: str) -> dict:
+    """Arguments reach the template as a mapping. The wire carries them as a
+    JSON string; templates iterate them (Qwen3.8 raises on a string, Gemma 4
+    on anything that is not a mapping), and a call without arguments comes
+    as "" - which is {}, not an error."""
+    if not isinstance(tc, dict) or not isinstance(tc.get("function"), dict):
+        raise ApiError(f"{where} needs a function", param="messages")
+    tc = dict(tc)
+    fn = dict(tc["function"])
+    args = fn.get("arguments")
+    if args is None or args == "":
+        fn["arguments"] = {}
+    elif isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except json.JSONDecodeError as e:
+            raise ApiError(
+                f"{where}.function.arguments is not JSON: {e.msg}", param="messages"
+            ) from None
+        if not isinstance(parsed, dict):
+            raise ApiError(
+                f"{where}.function.arguments must be a JSON object", param="messages"
+            )
+        fn["arguments"] = parsed
+    elif not isinstance(args, dict):
+        raise ApiError(
+            f"{where}.function.arguments must be a JSON object or string",
+            param="messages",
+        )
+    tc["function"] = fn
+    return tc
 
 
 def parse_chat_request(
@@ -201,17 +256,17 @@ def parse_chat_request(
         template_kwargs["enable_thinking"] = thinking
     if level is not None:
         template_kwargs["reasoning_effort"] = level
-    template_kwargs.update(body.get("chat_template_kwargs") or {})
-    stream_opts = body.get("stream_options") or {}
+    template_kwargs.update(object_field(body, "chat_template_kwargs"))
+    stream_opts = object_field(body, "stream_options")
     return ChatRequest(
         messages=_normalise_messages(body.get("messages")),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
         sampling=parse_sampling(body, defaults),
-        stream=bool(body.get("stream", False)),
+        stream=bool_field(body, "stream"),
         stop=parse_stop(body),
         tools=tools,
-        logprobs=bool(body.get("logprobs", False)),
+        logprobs=bool_field(body, "logprobs"),
         top_logprobs=parse_top_logprobs(body),
         stream_usage=bool(stream_opts.get("include_usage", False)),
         reasoning_effort=level,
@@ -494,6 +549,8 @@ class ChatResponder:
             tools=req.tools,
             streaming=req.stream,
             route_thinking=reasoning_field != "none",
+            # Without tools on offer a tool-call block is the model's text.
+            tools_enabled=req.tools is not None,
         )
 
     def _envelope(self, kind: str) -> dict:
@@ -534,7 +591,13 @@ class ChatResponder:
 
     def _logprobs(self) -> dict:
         events, self.assembler.pending_events = self.assembler.pending_events, []
-        return {"content": [logprob_entry(self._tokenizer, e) for e in events]}
+        # OpenAI's logprobs.content covers the message content: not the
+        # think block, not the markers, not the stop token.
+        return {
+            "content": [
+                logprob_entry(self._tokenizer, e) for e, content in events if content
+            ]
+        }
 
     def stream(self, events, cached: int) -> Iterator[dict]:
         """Chunks as the tokens arrive; tool-call text is held until complete."""
