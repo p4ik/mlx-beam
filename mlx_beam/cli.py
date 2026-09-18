@@ -171,8 +171,10 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     kv.add_argument(
         "--kv-config",
         help='JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": '
-        '{"3": 8}}, or a package\'s list [{"layer_idx": 3, "bits": 4, ...}] whose '
-        "layers override --kv-bits",
+        '{"3": 8}}, or the list a quantized package ships '
+        '([{"layer_idx": 3, "bits": 4, "group_size": 64}, ...]): listed layers '
+        "take their bits, unlisted ones follow --kv-bits (optiq leaves them "
+        "at full precision and ignores --kv-bits)",
     )
     p.add_argument(
         "--max-queued",
