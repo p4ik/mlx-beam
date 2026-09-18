@@ -391,6 +391,9 @@ class ResponsesResponder:
 
         for event in events:
             d = self.assembler.feed(event)
+            # Calls go out before the text of the same delta: what parsed came
+            # first, and a cut-off tail is what the length limit hit - it is
+            # the item still open at the end, closed as incomplete below.
             if d.reasoning:
                 if current != "reasoning":
                     yield from close_current()
@@ -417,6 +420,32 @@ class ResponsesResponder:
                     content_index=0,
                     delta=d.reasoning,
                 )
+            for tc in d.tool_calls:
+                yield from close_current()
+                index += 1
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                }
+                yield ev(
+                    "response.output_item.added",
+                    output_index=index,
+                    item={**item, "status": "in_progress", "arguments": ""},
+                )
+                yield ev(
+                    "response.function_call_arguments.done",
+                    item_id=item["id"],
+                    output_index=index,
+                    name=item["name"],
+                    arguments=item["arguments"],
+                )
+                yield ev("response.output_item.done", output_index=index, item=item)
+                output.append(item)
+                total.tool_calls.append(tc)
             if d.content:
                 if current != "message":
                     yield from close_current()
@@ -452,32 +481,6 @@ class ResponsesResponder:
                     delta=d.content,
                     logprobs=[],
                 )
-            for tc in d.tool_calls:
-                yield from close_current()
-                index += 1
-                item = {
-                    "id": f"fc_{uuid.uuid4().hex[:24]}",
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": tc["id"],
-                    "name": tc["function"]["name"],
-                    "arguments": tc["function"]["arguments"],
-                }
-                yield ev(
-                    "response.output_item.added",
-                    output_index=index,
-                    item={**item, "status": "in_progress", "arguments": ""},
-                )
-                yield ev(
-                    "response.function_call_arguments.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    name=item["name"],
-                    arguments=item["arguments"],
-                )
-                yield ev("response.output_item.done", output_index=index, item=item)
-                output.append(item)
-                total.tool_calls.append(tc)
             if d.finish_reason:
                 total.finish_reason = d.finish_reason
                 break

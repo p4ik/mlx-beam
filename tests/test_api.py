@@ -1144,3 +1144,34 @@ def test_a_badly_shaped_reasoning_input_item_is_a_400(content):
             "m",
         )
     assert exc.value.status == 400 and exc.value.param == "input"
+
+
+def test_responses_cut_tail_next_to_a_recovered_call_is_the_incomplete_item():
+    """A block with a complete call and a cut-off second one yields the call
+    as completed and the tail as a message that is incomplete - on the wire
+    and in the final response, in that order."""
+    tok = MistralLike()
+    tok._words[35] = 'good[ARGS]{"x": 1}[TOOL_CALLS]bad[ARGS]{"x":'
+    body = {
+        "input": "w1",
+        "stream": True,
+        "tools": [{"type": "function", "name": n} for n in ("good", "bad")],
+    }
+    req = responses.parse_responses_request(body, "m")
+    gen = responses.to_generation_request(tok, req)
+    evs = [TokenEvent(TOOL_START, -0.1), TokenEvent(35, -0.1, "length")]
+    wire = [
+        json.loads(json.dumps(e))
+        for e in responses.ResponsesResponder(tok, req, gen.tokens).stream(iter(evs), 0)
+    ]
+    items = [e["item"] for e in wire if e["type"] == "response.output_item.done"]
+    assert [i["type"] for i in items] == ["function_call", "message"]
+    assert items[0]["name"] == "good" and items[0]["status"] == "completed"
+    assert items[1]["status"] == "incomplete"
+    assert items[1]["content"][0]["text"] == '[TOOL_CALLS]bad[ARGS]{"x":'
+    final = wire[-1]["response"]
+    assert final["status"] == "incomplete"
+    assert [i["status"] for i in final["output"]] == ["completed", "incomplete"]
+    req.chat.stream = False
+    whole = responses.ResponsesResponder(tok, req, gen.tokens).complete(iter(evs), 0)
+    assert [i["status"] for i in whole["output"]] == ["completed", "incomplete"]

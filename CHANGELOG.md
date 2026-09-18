@@ -103,7 +103,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - Responses API: every output item has its own id and text when text and
   tool calls interleave; `output_text.*` carry `logprobs`,
   `function_call_arguments.done` carries `name`, a cut-off message item is
-  `incomplete` from its done event on, `instructions` and `tool_choice` are
+  `incomplete` from its done event on (also the cut-off tail next to a
+  call that did parse, which goes out after that call), `instructions` and
+  `tool_choice` are
   echoed, and a `reasoning` input item reaches the template as the
   reasoning of the turn it preceded (a badly shaped one is a 400).
 - Wrongly shaped request fields (`response_format`, `stream_options`,
