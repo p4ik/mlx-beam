@@ -320,3 +320,92 @@ def test_a_divergent_continuation_keeps_the_entry_it_branched_from():
         assert engine.prefix_store.describe()["entries"] == 2
         entry = engine.prefix_store._trie.get(engine.model_key, div + out)
         assert sorted(entry.checkpoints) == [12, len(div) - 1]
+
+
+def _hybrid_caches(n: int):
+    from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache
+
+    kv = KVCache()
+    k = mx.zeros((1, 1, n, 8))
+    kv.update_and_fetch(k, k)
+    rec = ArraysCache(1)
+    rec.cache = [mx.full((1, 4), float(n))]
+    return [kv, rec]
+
+
+def _snap(value: float):
+    return {1: [mx.full((1, 4), value)]}
+
+
+def test_a_replaced_entry_leaves_every_restore_point_behind():
+    # A longer sequence that never carried the shorter entry's checkpoints
+    # (admitted before that entry existed) still inherits them on insert.
+    store = PrefixStore()
+    store.insert("m", list(range(10)), _hybrid_caches(10), {4: _snap(4.0)})
+    store.insert("m", list(range(15)), _hybrid_caches(15), {14: _snap(14.0)})
+    assert len(store) == 1
+    for shared, want in ((4, 4.0), (10, 10.0)):
+        hit = store.fetch("m", list(range(shared)) + [99])
+        assert hit is not None and hit.covered == shared
+        assert hit.cache[1].cache[0][0, 0].item() == want
+
+
+def test_two_requests_restored_whole_both_keep_the_end_as_restore_point():
+    # Both were admitted on the same entry; the first to finish replaces it,
+    # the second must not lose the state it was restored on.
+    store = PrefixStore(max_entries=1)
+    base = list(range(24))
+    store.insert("m", base, _hybrid_caches(24), {19: _snap(19.0)})
+    first = store.fetch("m", base + [50, 51, 52])
+    second = store.fetch("m", base + [55, 56, 57])
+    assert sorted(first.checkpoints) == sorted(second.checkpoints) == [19, 24]
+    store.insert(
+        "m",
+        base + [50, 51, 52, 1],
+        _hybrid_caches(28),
+        {**first.checkpoints, 26: _snap(26.0)},
+    )
+    store.insert(
+        "m",
+        base + [55, 56, 57, 1],
+        _hybrid_caches(28),
+        {**second.checkpoints, 26: _snap(26.0)},
+    )
+    assert len(store) == 1
+    hit = store.fetch("m", base + [60])
+    assert hit.covered == 24 and hit.cache[1].cache[0][0, 0].item() == 24.0
+
+
+def test_parallel_continuations_of_one_turn_keep_its_end_in_the_engine():
+    import threading
+
+    # A finishes first and replaces the turn's entry; B, admitted on the
+    # same entry, must still store the restore point at the turn's end.
+    admitted, go = threading.Event(), threading.Event()
+
+    class Gated(Engine):
+        gate_on = None
+
+        def _admit(self, gen, stream):
+            super()._admit(gen, stream)
+            if list(stream.request.tokens) == self.gate_on:
+                admitted.set()
+                assert go.wait(5)
+
+    model = tiny_hybrid()
+    prompt = list(range(1, 21))
+    with Gated(model, prompt_cache_size=1) as engine:
+        out, _ = run(engine, prompt)
+        prefix = prompt + out
+        a, b = prefix + [50, 51, 52], prefix + [55, 56, 57]
+        engine.gate_on = a
+        sa = engine.submit(GenerationRequest(a, max_tokens=1))
+        assert admitted.wait(5)
+        sb = engine.submit(GenerationRequest(b, max_tokens=4))
+        go.set()
+        list(sa)
+        list(sb)
+        assert sa.prompt_cached == sb.prompt_cached == len(prefix)
+        assert len(engine.prefix_store) == 1  # b's entry evicted a's
+        hit = engine.prefix_store.fetch(engine.model_key, prefix + [60])
+        assert hit is not None and hit.covered == len(prefix)

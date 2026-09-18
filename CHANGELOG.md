@@ -11,9 +11,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   prefilling from scratch on hybrid models: the prompt's checkpoint is taken
   before its last token, which is the token a lookup keeps to prefill.
 - A conversation is one store entry, not one per turn: when a finished
-  turn extends a stored entry, it inherits that entry's recurrent end
-  state as a checkpoint and replaces it. What is freed is the old entry's
-  KV cache and its place in the entry count; the recurrent states stay.
+  turn extends a stored entry, it inherits that entry's checkpoints and
+  its recurrent end state, then replaces it. What is freed is the old
+  entry's KV cache and its place in the entry count; every position the
+  old entry could restore, the new one can. A request restored on an
+  entry's end carries that state along, so it keeps its restore point
+  even if the entry is replaced or evicted before the request finishes.
 - `max_context` (and the vocabulary size) are read through multimodal
   wrapper configs (`text_config`, the nested language model), so a
   Qwen3.5-class model reports its window instead of `null`.
