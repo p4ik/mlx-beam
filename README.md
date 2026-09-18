@@ -23,7 +23,7 @@ beam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --port 8000 \
   --kv-bits 8
 ```
 
-That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) plus `/health`, which reports what was actually built: the KV layout per layer, the batching and cache settings, and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own).
+That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) plus `/health`, which reports what was actually built: the KV layout per layer, the batching and cache settings, the Metal allocator's `memory` counters (`active`, `peak`, `cache` — RSS does not see these), and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own). `POST /health/reset-peak` starts a fresh peak window for a measurement.
 
 Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`, `--prompt-cache-size`, `--chat-template`, …). Token limits say what they count: `--max-context` (prompt plus generated, a hard cap), `--max-prompt-tokens` (prompt, a hard cap), `--max-completion-tokens` (generated, the default a request may override), `--max-reasoning-tokens` (the think block; closed by force at the budget) and `--min-response-tokens` (what the answer keeps after the block). `beam serve --help` lists them all with their units.
 

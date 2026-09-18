@@ -57,6 +57,33 @@ def test_health_and_models(server):
     assert h["api"]["defaults"]["temperature"] == {"value": 0.0, "source": "mlx-lm"}
     assert h["prompt_cache"]["entries"] >= 0 and "decode_concurrency" in h["batching"]
     assert set(h["wired_limit"]) == {"recommended", "before"}
+    # Allocator counters, not RSS: the only place a Metal transient shows.
+    assert set(h["memory"]) == {"active", "peak", "cache"}
+    assert all(isinstance(v, int) and v >= 0 for v in h["memory"].values())
+    assert h["memory"]["peak"] >= h["memory"]["active"]
+
+
+def test_the_peak_memory_window_resets_on_request(server):
+    """A phase's peak, not the process's: the reset starts the window at
+    zero (mlx does not seed it with the live allocation), and the next
+    generation's allocations set it."""
+    status, _, raw = call(server, "GET", "/health")
+    peak_before = json.loads(raw)["memory"]["peak"]
+    status, _, raw = call(server, "POST", "/health/reset-peak")
+    assert status == 200
+    assert json.loads(raw)["memory"]["peak"] == peak_before
+    status, _, raw = call(server, "GET", "/health")
+    after = json.loads(raw)["memory"]
+    assert after["peak"] <= peak_before
+    call(
+        server,
+        "POST",
+        "/v1/completions",
+        {"prompt": [1, 2, 3, 4, 5, 6, 7, 8], "max_tokens": 4, "temperature": 0},
+    )
+    status, _, raw = call(server, "GET", "/health")
+    window = json.loads(raw)["memory"]["peak"]
+    assert 0 < window and window >= after["peak"]
 
 
 def test_chat_completion(server):

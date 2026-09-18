@@ -115,6 +115,26 @@ def _logits_processors(p: SamplingParams):
     )
 
 
+def memory_snapshot() -> dict:
+    """Metal allocator counters in bytes. `ps` RSS does not see these buffers,
+    so the transient of an exact prefill only shows up here; `peak` holds
+    since start or the last `reset_peak_memory`."""
+    return {
+        "active": int(mx.get_active_memory()),
+        "peak": int(mx.get_peak_memory()),
+        "cache": int(mx.get_cache_memory()),
+    }
+
+
+def reset_peak_memory() -> dict:
+    """Start a fresh peak window; returns the counters as they were. mlx
+    zeroes the peak rather than seeding it with `active`, so the window's
+    peak is what the next allocations reach."""
+    before = memory_snapshot()
+    mx.reset_peak_memory()
+    return before
+
+
 class Engine:
     def __init__(
         self,
@@ -390,6 +410,7 @@ class Engine:
         counters = asdict(gen._counters) if gen is not None else None
         return {
             "alive": self.alive,
+            "memory": memory_snapshot(),
             "error": repr(self._error) if self._error else None,
             "uptime_s": (
                 round(time.monotonic() - self._started_at, 1)

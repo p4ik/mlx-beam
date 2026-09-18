@@ -7,6 +7,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- `/health` reports `memory: {active, peak, cache}` in bytes from the Metal
+  allocator (`mx.get_active_memory`, `get_peak_memory`, `get_cache_memory`).
+  Process RSS does not include these buffers, so the full-precision transient
+  of an exact prefill was invisible to anything watching `ps`. `POST
+  /health/reset-peak` starts a fresh peak window and returns the counters as
+  they were, so a test can read one phase's peak rather than the process's;
+  mlx zeroes the peak on reset, so it is 0 until the next allocation.
 - `--kv-prefill exact|quantized` (default `exact`): a quantized layer is
   kept at model precision while the prompt is prefilled and quantized once
   at the move to decoding, so the prefill never reads quantized data. This
