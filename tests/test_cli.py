@@ -220,3 +220,35 @@ def test_bad_flags_fail_before_the_model_loads(tmp_path):
         main(["serve", "--model", "x", "--decode-share", "1.5"])
     assert serve_args("--log-level", "debug").log_level == "DEBUG"
     assert serve_args().max_completion_tokens is None
+
+
+def test_kv_prefill_comes_from_the_flag_the_profile_or_the_default(tmp_path):
+    from mlx_beam.cli import kv_policy_from_args
+
+    policy = kv_policy_from_args(serve_args("--kv-bits", "8"))
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+    # A package profile measured with the thrifty mode says so in its object form.
+    profile = tmp_path / "kv.json"
+    profile.write_text(
+        '{"bits": 8, "group_size": 64, "layers": {}, "prefill": "quantized"}'
+    )
+    policy = kv_policy_from_args(serve_args("--kv-config", str(profile)))
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "profile")
+    # The flag is the operator's word and beats the profile - visibly.
+    policy = kv_policy_from_args(
+        serve_args("--kv-config", str(profile), "--kv-prefill", "exact")
+    )
+    assert (policy.prefill, policy.prefill_source) == ("exact", "flag")
+    # The package list carries no such field; the flag still applies.
+    listed = tmp_path / "kv_config.json"
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 64}]')
+    policy = kv_policy_from_args(
+        serve_args(
+            "--kv-bits", "8", "--kv-config", str(listed), "--kv-prefill", "quantized"
+        )
+    )
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "flag")
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"bits": 8, "prefill": "later"}')
+    with pytest.raises(SystemExit, match="prefill"):
+        kv_policy_from_args(serve_args("--kv-config", str(bad)))

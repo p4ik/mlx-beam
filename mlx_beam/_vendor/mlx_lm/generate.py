@@ -1222,6 +1222,12 @@ class PromptProcessingBatch:
             self.prompt([t[:-1] for t in tokens])
         last_token = mx.array([t[-1] for t in tokens])
 
+        # A cache may change form between prefill and decoding (a prefill
+        # kept exact, quantized from here on); it says so with `quantized()`.
+        self.prompt_cache = [
+            c.quantized() if hasattr(c, "quantized") else c for c in self.prompt_cache
+        ]
+
         generation = GenerationBatch(
             self.model,
             self.uids,

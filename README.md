@@ -37,7 +37,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Batched MTP** — Multi-token prediction stays on with many requests at once.
 - **Batched vision** — Images go through the same scheduler; no request waits behind a picture.
 - **No stalls** — A short request beside a long prefill answers in seconds.
-- **Mixed-precision KV cache** — Bits per layer, set at conversion.
+- **Mixed-precision KV cache** — Bits per layer, set at conversion. Quantized after the prefill by default (the prefill never reads quantized data); `--kv-prefill quantized` writes it quantized from the first token for profiles measured that way.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
 - **Responses API** — Next to chat completions, stateless.
 

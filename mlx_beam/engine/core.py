@@ -19,7 +19,13 @@ from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
-from mlx_beam.engine.kv import KVPolicy, describe_caches, make_request_cache
+from mlx_beam.engine.kv import (
+    KVPolicy,
+    describe_caches,
+    for_prefill,
+    for_store,
+    make_request_cache,
+)
 from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
 from mlx_beam.engine.request import (
     GenerationRequest,
@@ -464,6 +470,9 @@ class Engine:
                 )
             else:
                 cache, covered, carried = hit.cache, hit.covered, hit.checkpoints
+                # The store keeps layers quantized; an exact prefill wants
+                # them back at model precision for the tokens it adds.
+                cache = for_prefill(cache, self.kv_policy)
             rest = list(req.tokens[covered:])
             # Segments end where a checkpoint is wanted; the generator reports
             # each end, and the last token always stands alone.
@@ -602,6 +611,7 @@ class Engine:
                 continue  # nothing new beyond what the store already had
             try:
                 own_recurrent_state(cache)
+                cache = for_store(cache)
                 self.prefix_store.insert(
                     self.model_key,
                     list(tokens),
@@ -685,11 +695,12 @@ class Engine:
                         _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
                         self._stride.pop(r.uid, None)
                         own_recurrent_state(r.prompt_cache)
+                        stored = for_store(r.prompt_cache)
                         tokens = list(r.all_tokens)
                         self.prefix_store.insert(
                             self.model_key,
                             tokens,
-                            r.prompt_cache,
+                            stored,
                             checkpoints=checkpoints,
                             cache_type="assistant",
                         )
@@ -700,7 +711,7 @@ class Engine:
                             self.prefix_store.insert_prefix(
                                 self.model_key,
                                 tokens,
-                                r.prompt_cache,
+                                stored,
                                 checkpoints,
                                 s.request.system_end,
                             )
