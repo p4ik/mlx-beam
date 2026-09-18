@@ -30,6 +30,7 @@ from mlx_beam.engine import (
     EngineDead,
     InvalidRequest,
     QueueFull,
+    reset_peak_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,6 +234,7 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/chat/completions": self._chat,
             "/v1/completions": self._completions,
             "/v1/responses": self._responses,
+            "/health/reset-peak": self._reset_peak,
         }
         handler = routes.get(path)
         self._streaming = False
@@ -271,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
         self._sse(err.body(), "error" if self._sse_events else None)
         if not self._sse_events:
             self._sse("[DONE]")
+
+    def _reset_peak(self, _body: dict) -> None:
+        # A measurement window: the peak from here on is this phase's peak,
+        # not the process's. Answers with the counters before the reset.
+        self._send_json(200, {"memory": reset_peak_memory()})
 
     # -- the three generation endpoints -----------------------------------
 
