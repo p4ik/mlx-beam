@@ -104,7 +104,17 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
     ``tools`` off the tool markers are ordinary text."""
     transitions: dict = {}
     thinking = getattr(tokenizer, "has_thinking", False)
-    if thinking:
+    label_end = getattr(tokenizer, "think_label_end", None)
+    if thinking and label_end:
+        # A labelled opener (Gemma 4's channel): the label runs to the line
+        # end and is part of the marker, whatever tokens it comes as.
+        transitions.setdefault("normal", []).append((tokenizer.think_start, "label"))
+        transitions["label"] = [
+            (label_end, "reasoning"),
+            (tokenizer.think_end, "normal"),
+        ]
+        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+    elif thinking:
         transitions.setdefault("normal", []).append(
             (tokenizer.think_start, "reasoning")
         )
@@ -226,6 +236,7 @@ class TextAssembler:
         self._route = route_thinking
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
+        self._label_end = getattr(tokenizer, "think_label_end", None) or ""
         # A think block the prompt opened: the client sees it once, up front.
         self._lead = seeded if not route_thinking else ""
         self._tool_text = ""
@@ -302,7 +313,7 @@ class TextAssembler:
         if current is None:
             # A stop word matched in the text: what came before it is the
             # last of the output, whatever state we were in.
-            if self._prev == "reasoning" and self._route:
+            if self._prev in ("reasoning", "label") and self._route:
                 delta.reasoning = clean
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
@@ -317,12 +328,24 @@ class TextAssembler:
             if self._made_tool_call:
                 delta.finish_reason = "tool_calls"
             return delta
-        if current == "reasoning":
+        if current == "label":
+            # The label is the opener's, not text; with routing off the
+            # client gets the block as the model wrote it, label included.
+            self.reasoning_tokens += 1
+            if not self._route:
+                opened = self._think_start if self._prev != "label" else ""
+                delta.content = (self._take_lead() or opened) + clean
+        elif current == "reasoning":
             self.reasoning_tokens += 1
             if self._route:
                 delta.reasoning = clean
             else:
-                opened = self._think_start if self._prev != "reasoning" else ""
+                if self._prev == "label":
+                    opened = self._label_end
+                elif self._prev != "reasoning":
+                    opened = self._think_start
+                else:
+                    opened = ""
                 delta.content = (self._take_lead() or opened) + clean
         elif current == "tool":
             self._tool_text += clean
@@ -331,7 +354,7 @@ class TextAssembler:
                 self._pending_tools.append((self._tool_text, True))
                 self._tool_text = ""
             closed = ""
-            if self._prev == "reasoning" and not self._route:
+            if self._prev in ("reasoning", "label") and not self._route:
                 # A block the prompt opened may close on the first token.
                 closed = self._take_lead() + self._think_end
             delta.content = closed + clean

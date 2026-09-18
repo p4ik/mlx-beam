@@ -280,15 +280,18 @@ def _infer_thinking(tokenizer):
                 (vocab[think_end],),
             )
 
-    # Multi token thinking modes
+    # Labelled channels (Gemma 4): the marker opens a channel, the label up
+    # to the line end names it. The template's own strip_thinking cuts every
+    # channel whatever its label, and the model writes the label as more
+    # than one token (`thought` after the template, ` thought` when it
+    # opens the channel itself after a tool response) - so the marker is
+    # the family, the label is read at runtime (THINK_LABEL_END).
     if "<|channel>" in vocab and "<channel|>" in vocab:
-        think_start = "<|channel>thought"
-        think_end = "<channel|>"
         return (
-            think_start,
-            think_end,
-            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
-            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+            "<|channel>",
+            "<channel|>",
+            (vocab["<|channel>"],),
+            (vocab["<channel|>"],),
         )
 
     if _is_xtml_vocab(vocab):
@@ -302,6 +305,10 @@ def _infer_thinking(tokenizer):
         )
 
     return (None, None, None, None)
+
+
+# Openers whose block begins after a label: the text that ends the label.
+THINK_LABEL_END = {"<|channel>": "\n"}
 
 
 def _is_xtml_vocab(vocab):
@@ -463,6 +470,12 @@ class TokenizerWrapper:
     @property
     def think_start_tokens(self):
         return self._think_start_tokens
+
+    @property
+    def think_label_end(self):
+        """What ends the label after the opener, or None for an opener
+        without one."""
+        return THINK_LABEL_END.get(self._think_start)
 
     @property
     def think_end(self):

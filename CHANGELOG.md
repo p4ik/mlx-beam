@@ -21,6 +21,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and where it came from. A prefix restored from the prompt store keeps its
   quantized codes across the round trip.
 
+### Fixed
+- Gemma 4's think channel is recognised whatever token its label comes
+  as. After a tool response the model opens the channel itself and writes
+  the label as ` thought` rather than the template's `thought`; the fixed
+  two-token opener never matched and `<|channel> thought\n<channel|>`
+  leaked into the content. The opener is now the channel marker alone and
+  the label up to the line end is part of it, as the template's own
+  `strip_thinking` treats it.
+
 ## [0.1.0a2] - 2026-09-18
 
 ### Fixed

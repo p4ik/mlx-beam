@@ -88,3 +88,39 @@ class StubTokenizer:
 
     def rfind_think_end(self, tokens, start=None, end=None):
         return max((i for i, t in enumerate(tokens) if t == THINK_END), default=-1)
+
+
+CHANNEL_OPEN, CHANNEL_CLOSE = 56, 57
+LABEL, LABEL_SPACED, NEWLINE = 55, 54, 53
+
+
+class ChannelStubTokenizer(StubTokenizer):
+    """Gemma 4's family: the marker opens a channel, a label up to the line
+    end names it, and the label may come as either of two tokens."""
+
+    think_start = "<|channel>"
+    think_end = "<channel|>"
+    think_label_end = "\n"
+    think_start_tokens = (CHANNEL_OPEN,)
+    think_end_tokens = (CHANNEL_CLOSE,)
+
+    def __init__(self):
+        super().__init__()
+        self._words[CHANNEL_OPEN] = "<|channel>"
+        self._words[CHANNEL_CLOSE] = "<channel|>"
+        self._words[LABEL] = "thought"
+        self._words[LABEL_SPACED] = " thought"
+        self._words[NEWLINE] = "\n"
+        self._ids = {w.strip(): t for t, w in enumerate(self._words) if w.strip()}
+        self._ids["\n"] = NEWLINE
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        if text == "\n":
+            return [NEWLINE]
+        return super().encode(text, add_special_tokens)
+
+    def rfind_think_start(self, tokens, start=None, end=None):
+        return max((i for i, t in enumerate(tokens) if t == CHANNEL_OPEN), default=-1)
+
+    def rfind_think_end(self, tokens, start=None, end=None):
+        return max((i for i, t in enumerate(tokens) if t == CHANNEL_CLOSE), default=-1)

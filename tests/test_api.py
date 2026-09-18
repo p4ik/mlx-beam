@@ -9,11 +9,17 @@ from mlx_beam.api.errors import ApiError
 from mlx_beam.api.text import TextAssembler
 from mlx_beam.engine.request import TokenEvent
 from tests.stub_tokenizer import (
+    CHANNEL_CLOSE,
+    CHANNEL_OPEN,
     EOS,
+    LABEL,
+    LABEL_SPACED,
+    NEWLINE,
     THINK_END,
     THINK_START,
     TOOL_END,
     TOOL_START,
+    ChannelStubTokenizer,
     StubTokenizer,
 )
 
@@ -353,6 +359,104 @@ def test_responses_stream_has_the_item_and_part_events():
         "function_call",
     ]
     assert [e["sequence_number"] for e in evs] == list(range(1, len(evs) + 1))
+
+
+def assembled(asm, ids, finish="stop"):
+    deltas = [asm.feed(e) for e in events(ids, finish)]
+    return "".join(d.reasoning for d in deltas), "".join(d.content for d in deltas)
+
+
+@pytest.mark.parametrize("label", [LABEL, LABEL_SPACED])
+def test_a_channel_is_thinking_whatever_token_its_label_comes_as(label):
+    # Gemma 4's template writes `<|channel>thought`; after a tool response
+    # the model opens the channel itself and writes the label as another
+    # token (` thought`). The marker is the channel, the label up to the
+    # line end belongs to it - neither is text.
+    tok = ChannelStubTokenizer()
+    ids = [CHANNEL_OPEN, label, NEWLINE, 10, 11, CHANNEL_CLOSE, 12]
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+    assert assembled(asm, ids) == ("w10 w11 ", "w12 ")
+    # Marker, label and line end count like any opener's tokens.
+    assert asm.reasoning_tokens == 5
+    # Routing off: the client gets the block as the model wrote it.
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], route_thinking=False)
+    reasoning, content = assembled(asm, ids)
+    assert reasoning == ""
+    assert content == "<|channel>" + tok.decode([label]) + "\nw10 w11 <channel|>w12 "
+
+
+def test_a_channel_closed_on_its_label_line_is_an_empty_block():
+    tok = ChannelStubTokenizer()
+    ids = [CHANNEL_OPEN, LABEL, CHANNEL_CLOSE, 12]
+    assert assembled(TextAssembler(tok, prompt_tokens=[6, 1, 7]), ids) == ("", "w12 ")
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], route_thinking=False)
+    assert assembled(asm, ids) == ("", "<|channel>thought<channel|>w12 ")
+
+
+def test_a_channel_the_prompt_opened_continues_as_thinking():
+    tok = ChannelStubTokenizer()
+    prompt = [6, 1, 7, CHANNEL_OPEN, LABEL, NEWLINE]
+    ids = [10, CHANNEL_CLOSE, 11]
+    assert assembled(TextAssembler(tok, prompt_tokens=prompt), ids) == ("w10 ", "w11 ")
+    asm = TextAssembler(tok, prompt_tokens=prompt, route_thinking=False)
+    assert assembled(asm, ids) == ("", "<|channel>thought\nw10 <channel|>w11 ")
+
+
+def test_the_channel_family_is_inferred_on_the_marker_alone():
+    from mlx_beam._vendor.mlx_lm.tokenizer_utils import TokenizerWrapper
+
+    class Gemmaish:
+        """What the wrapper reads: a vocabulary with the channel markers."""
+
+        eos_token_id = 1
+        chat_template = "{{ messages }}"
+        _vocab = {
+            "<eos>": 1,
+            "<|channel>": 5,
+            "<channel|>": 6,
+            "thought": 7,
+            "\n": 8,
+            "a": 9,
+            ",": 10,
+            "b": 11,
+        }
+
+        def get_vocab(self):
+            return self._vocab
+
+        def encode(self, text, add_special_tokens=False):
+            if text.strip(" ") == "\n\n":
+                return [8, 8]
+            return [self._vocab[t] for t in text.replace(" ", "").split(",") if t]
+
+        def decode(self, ids, **kw):
+            names = {v: k for k, v in self._vocab.items()}
+            return "".join(names.get(i, "") for i in ids)
+
+        def apply_chat_template(self, messages, **kw):
+            return [9]
+
+    tok = TokenizerWrapper(Gemmaish())
+    assert tok.think_start == "<|channel>" and tok.think_start_tokens == (5,)
+    assert tok.think_end == "<channel|>" and tok.think_end_tokens == (6,)
+    assert tok.think_label_end == "\n"
+    # The engine's budget matches the opener on that one token too.
+    limits = chat.reasoning_limits(tok, [9], 100)
+    assert limits.start == (5,) and limits.end == (6,)
+
+    class Qwenish(Gemmaish):
+        _vocab = {
+            "<eos>": 1,
+            "<think>": 5,
+            "</think>": 6,
+            "\n": 8,
+            "a": 9,
+            ",": 10,
+            "b": 11,
+        }
+
+    tok = TokenizerWrapper(Qwenish())
+    assert tok.think_start == "<think>" and tok.think_label_end is None
 
 
 def test_reasoning_tokens_are_counted():

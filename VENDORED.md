@@ -114,6 +114,21 @@ broadcast error and took the generation thread down. Reached by any
 sliding-window model reusing a cached prefix across turns. Guarded with
 `or l == 0`. Test: `test_rotating_merge_survives_a_zero_length_cache`.
 
+`labelled channel` - `tokenizer_utils.py`, `_infer_thinking` and
+`TokenizerWrapper.think_label_end`: upstream takes `<|channel>thought` as
+the opener of Gemma 4's think block, two tokens with the label fixed.
+After a tool response the template leaves the turn open and the model
+opens the channel itself, writing the label as ` thought` (a different
+token): upstream's opener never matches and `<|channel> thought\n
+<channel|>` lands in the text. The opener is now `<|channel>` alone, and
+`think_label_end` (`"\n"`) says that a label follows it up to the line
+end; the engine's text automaton reads the label at runtime and strips it
+whatever token it comes as, which is also what the template's own
+`strip_thinking` does. The budget then counts the marker token like any
+single-token opener. Tests: `test_a_channel_is_thinking_whatever_token_
+its_label_comes_as`, `test_the_channel_family_is_inferred_on_the_marker_
+alone`.
+
 `tool parsers, picked from upstream` - `tool_parsers/qwen3_coder.py` at
 mlx-lm `e99e3df` (2026-09-14, #1881): the parameter name survives a missing
 `>` (`_name_regex`) instead of raising `ValueError: substring not found`.
