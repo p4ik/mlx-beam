@@ -483,7 +483,7 @@ def reasoning_limits(
         start=start,
         end=end,
         close=close,
-        seeded=initial_state(tokenizer, prompt)[0] == "reasoning",
+        seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
     )
 

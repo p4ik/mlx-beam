@@ -33,12 +33,17 @@ class TextDelta:
 
 
 def initial_state(tokenizer, prompt_tokens: list[int]) -> tuple[str, str]:
-    """A prompt that ends inside an open think block continues as reasoning;
-    the second value is that open marker as the prompt carries it."""
+    """A prompt that ends inside an open think block continues as reasoning -
+    or inside the opener's label, when the label's line end is still to
+    come; the second value is that open marker as the prompt carries it."""
     if getattr(tokenizer, "has_thinking", False):
         start = tokenizer.rfind_think_start(prompt_tokens)
         if start > tokenizer.rfind_think_end(prompt_tokens):
-            return "reasoning", tokenizer.decode(prompt_tokens[start:])
+            opened = tokenizer.decode(prompt_tokens[start:])
+            label_end = getattr(tokenizer, "think_label_end", None)
+            if label_end and label_end not in opened:
+                return "label", opened
+            return "reasoning", opened
     return "normal", ""
 
 
@@ -104,7 +109,17 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
     ``tools`` off the tool markers are ordinary text."""
     transitions: dict = {}
     thinking = getattr(tokenizer, "has_thinking", False)
-    if thinking:
+    label_end = getattr(tokenizer, "think_label_end", None)
+    if thinking and label_end:
+        # A labelled opener (Gemma 4's channel): the label runs to the line
+        # end and is part of the marker, whatever tokens it comes as. The
+        # assembler finds that line end itself - the automaton reports one
+        # text per segment and only the state after it, so a line end it
+        # matched could not be told apart from the reasoning text behind it.
+        transitions.setdefault("normal", []).append((tokenizer.think_start, "label"))
+        transitions["label"] = [(tokenizer.think_end, "normal")]
+        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+    elif thinking:
         transitions.setdefault("normal", []).append(
             (tokenizer.think_start, "reasoning")
         )
@@ -226,6 +241,9 @@ class TextAssembler:
         self._route = route_thinking
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
+        self._label_end = getattr(tokenizer, "think_label_end", None) or ""
+        # The opener's label so far, until its line end shows up.
+        self._label = seeded[len(self._think_start) :] if start == "label" else ""
         # A think block the prompt opened: the client sees it once, up front.
         self._lead = seeded if not route_thinking else ""
         self._tool_text = ""
@@ -301,9 +319,14 @@ class TextAssembler:
 
         if current is None:
             # A stop word matched in the text: what came before it is the
-            # last of the output, whatever state we were in.
+            # last of the output, whatever state we were in - except a
+            # label, which is the opener's and never text.
             if self._prev == "reasoning" and self._route:
                 delta.reasoning = clean
+            elif self._prev == "label" and self._route:
+                # The segment may hold the label's end and reasoning text
+                # before the stop word; only the label is dropped.
+                delta.reasoning = self._after_label(clean) or ""
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
             self.stopped = True
@@ -317,7 +340,24 @@ class TextAssembler:
             if self._made_tool_call:
                 delta.finish_reason = "tool_calls"
             return delta
-        if current == "reasoning":
+        if current == "label":
+            # The label is the opener's, not text; with routing off the
+            # client gets the block as the model wrote it, label included.
+            self.reasoning_tokens += 1
+            if not self._route:
+                opened = self._think_start if self._prev != "label" else ""
+                delta.content = (self._take_lead() or opened) + clean
+            if self._prev != "label":
+                self._label = ""
+            rest = self._after_label(clean)
+            if rest is not None:
+                # The line end may arrive in one segment with the label, or
+                # with the first reasoning text: what follows it is reasoning.
+                self._state = self._enter("reasoning")
+                current = "reasoning"
+                if self._route:
+                    delta.reasoning = rest
+        elif current == "reasoning":
             self.reasoning_tokens += 1
             if self._route:
                 delta.reasoning = clean
@@ -331,9 +371,10 @@ class TextAssembler:
                 self._pending_tools.append((self._tool_text, True))
                 self._tool_text = ""
             closed = ""
-            if self._prev == "reasoning" and not self._route:
+            if self._prev in ("reasoning", "label") and not self._route:
                 # A block the prompt opened may close on the first token.
                 closed = self._take_lead() + self._think_end
+            self._label = ""
             delta.content = closed + clean
         # A marker token releases no text; the stop token none either.
         self.pending_events.append(
@@ -366,6 +407,23 @@ class TextAssembler:
     def _take_lead(self) -> str:
         lead, self._lead = self._lead, ""
         return lead
+
+    def _after_label(self, clean: str) -> str | None:
+        """Adds ``clean`` to the label; the text behind the label's line end
+        once it is there (the label is dropped), None while it is not."""
+        self._label += clean
+        if self._label_end not in self._label:
+            return None
+        rest = self._label.split(self._label_end, 1)[1]
+        self._label = ""
+        return rest
+
+    def _enter(self, state: str):
+        """The automaton moved to ``state`` by the assembler's own decision:
+        same buffer, trie at its root - a partial match held in the buffer
+        is scanned again from there on the next step."""
+        _, _, states, buf = self._state
+        return (state, states[state][0], states, buf)
 
     @property
     def in_tool_call(self) -> bool:
