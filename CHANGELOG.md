@@ -28,7 +28,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   two-token opener never matched and `<|channel> thought\n<channel|>`
   leaked into the content. The opener is now the channel marker alone and
   the label up to the line end is part of it, as the template's own
-  `strip_thinking` treats it.
+  `strip_thinking` treats it. The reasoning budget counts that marker
+  like any single-token opener, so `reasoning_tokens` on Gemma 4 is one
+  higher per block than before.
 
 ## [0.1.0a2] - 2026-09-18
 
