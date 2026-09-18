@@ -6,7 +6,7 @@ import pytest
 
 from mlx_beam.api import chat, completions, responses
 from mlx_beam.api.errors import ApiError
-from mlx_beam.api.text import TextAssembler
+from mlx_beam.api.text import TextAssembler, initial_state
 from mlx_beam.engine.request import TokenEvent
 from tests.stub_tokenizer import (
     CHANNEL_CLOSE,
@@ -391,6 +391,53 @@ def test_a_channel_closed_on_its_label_line_is_an_empty_block():
     assert assembled(TextAssembler(tok, prompt_tokens=[6, 1, 7]), ids) == ("", "w12 ")
     asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], route_thinking=False)
     assert assembled(asm, ids) == ("", "<|channel>thought<channel|>w12 ")
+
+
+@pytest.mark.parametrize("route", [True, False])
+def test_a_label_and_its_line_end_in_one_segment_are_still_the_opener(route):
+    # The automaton reports one text per segment and the state after it;
+    # a detokenizer may hand the label and the line end over together.
+    tok = ChannelStubTokenizer()
+    tok._words[40] = "thought\n"
+    tok._words[41] = "thought\nw10 "
+    for merged, rest in ((40, "w10 "), (41, "")):
+        ids = [CHANNEL_OPEN, merged] + ([10] if rest else []) + [CHANNEL_CLOSE, 11]
+        asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], route_thinking=route)
+        got = assembled(asm, ids)
+        if route:
+            assert got == ("w10 ", "w11 ")
+        else:
+            assert got == ("", "<|channel>thought\nw10 <channel|>w11 ")
+
+
+def test_a_stop_word_inside_the_label_leaves_no_label_behind():
+    tok = ChannelStubTokenizer()
+    for stop, ids in (
+        ("ught", [CHANNEL_OPEN, LABEL]),
+        ("w1", [CHANNEL_OPEN, LABEL, 10]),
+    ):
+        asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=[stop])
+        assert assembled(asm, ids) == ("", "")
+
+
+@pytest.mark.parametrize(
+    "tail, generated",
+    [
+        ([CHANNEL_OPEN], [LABEL, NEWLINE, 10, CHANNEL_CLOSE, 11]),
+        ([CHANNEL_OPEN, LABEL], [NEWLINE, 10, CHANNEL_CLOSE, 11]),
+    ],
+)
+def test_a_prompt_that_ends_inside_the_label_starts_in_the_label(tail, generated):
+    tok = ChannelStubTokenizer()
+    prompt = [6, 1, 7] + tail
+    assert initial_state(tok, prompt)[0] == "label"
+    assert chat.reasoning_limits(tok, prompt, 100).seeded
+    assert assembled(TextAssembler(tok, prompt_tokens=prompt), generated) == (
+        "w10 ",
+        "w11 ",
+    )
+    asm = TextAssembler(tok, prompt_tokens=prompt, route_thinking=False)
+    assert assembled(asm, generated) == ("", "<|channel>thought\nw10 <channel|>w11 ")
 
 
 def test_a_channel_the_prompt_opened_continues_as_thinking():
