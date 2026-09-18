@@ -96,13 +96,16 @@ without shared layers, PLaMo-2; 8-bit within 0.1 logprob of the plain run).
 generation batch is built, a cache that offers `quantized()` is replaced by
 what it returns. That is how the engine keeps a quantized layer at model
 precision through the prefill and quantizes it once, at the move to
-decoding - mlx-lm's own quantized path does the same in `generate_step`
-(`maybe_quantize_kv_cache` after the prompt), the batch path had no place
-for it. The cache classes live in `mlx_beam/engine/kv.py`; a prefix
-restored from the prompt store keeps its original codes across the round
-trip. Tests: `tests/test_kv_prefill.py` (exact mode reproduces the
-`generate_step` path to the bit at 8 and 4 bit; a cancelled prefill is
-stored quantized).
+decoding. `generate_step` quantizes with `maybe_quantize_kv_cache` after
+each prefill chunk once the cache offset reaches `quantized_kv_start`
+(default 5000); with that start at the prompt's end it computes exactly
+what the engine's exact mode computes, and the batch path had no place
+for any of it. The cache classes live in `mlx_beam/engine/kv.py`; a
+prefix restored from the prompt store keeps its original codes across the
+round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
+`generate_step` with `quantized_kv_start = len(prompt) - 1` to the bit at
+8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
+is stored quantized).
 
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`

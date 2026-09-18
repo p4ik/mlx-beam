@@ -9,8 +9,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ### Added
 - `--kv-prefill exact|quantized` (default `exact`): a quantized layer is
   kept at model precision while the prompt is prefilled and quantized once
-  at the move to decoding, which is what mlx-lm's quantized path computes
-  and the semantics every bit profile was calibrated under. `quantized`
+  at the move to decoding, so the prefill never reads quantized data. This
+  is what mlx-lm's `generate_step` computes with `quantized_kv_start` at
+  the prompt's end (its default of 5000 leaves shorter prompts unquantized
+  altogether; a start of 0 quantizes after each prefill chunk). `quantized`
   writes the cache quantized from the first token, the batch path's former
   only behaviour: it saves the prompt's full-precision transient and on
   some models costs accuracy (Gemma 4 at 8 bit: KL 0.022 against 0.0005).

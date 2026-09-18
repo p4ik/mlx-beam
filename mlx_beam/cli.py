@@ -181,7 +181,8 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         choices=("exact", "quantized"),
         help="when a quantized layer becomes quantized: 'exact' (default) keeps "
         "the prompt at model precision while it is prefilled and quantizes at "
-        "the handover to decoding, as mlx-lm does; 'quantized' writes it "
+        "the handover to decoding (mlx-lm's generate_step with "
+        "quantized_kv_start at the prompt's end); 'quantized' writes it "
         "quantized from the first token, which saves the prompt's full-"
         "precision transient (~2 GB for a 64k prompt on a 27B) and on some "
         "models costs accuracy - use it for a profile that was measured with "

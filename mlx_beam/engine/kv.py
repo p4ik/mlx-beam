@@ -34,14 +34,17 @@ class KVPolicy:
 
     ``prefill`` says when a layer's cache becomes quantized. ``exact`` keeps
     the prompt's keys and values at model precision while it is prefilled
-    and quantizes them once, when the request moves to decoding - what
-    mlx-lm's own quantized path does, and the semantics every calibration
-    of a bit profile was measured under. ``quantized`` writes each token
-    quantized as the prefill goes, so the prefill itself attends over
-    quantized data: it saves the prompt's full-precision transient (a 64k
-    prompt on a 27B is ~2 GB), and on some models it costs accuracy (Gemma 4,
-    8 bit: KL 0.022 against 0.0005 the exact way, measured 2026-09-18).
-    A package may carry ``quantized`` for a profile it was measured with.
+    and quantizes them once, when the request moves to decoding: the
+    prefill never reads quantized data. That is what mlx-lm's
+    ``generate_step`` computes with ``quantized_kv_start`` at the prompt's
+    end (its default, 5000, leaves shorter prompts unquantized altogether,
+    and a start of 0 quantizes after every prefill chunk). ``quantized``
+    writes each token quantized as the prefill goes, so the prefill itself
+    attends over quantized data: it saves the prompt's full-precision
+    transient (a 64k prompt on a 27B is ~2 GB), and on some models it costs
+    accuracy (Gemma 4, 8 bit: KL 0.022 against 0.0005 the exact way,
+    measured 2026-09-18). A package may carry ``quantized`` for a profile
+    it was measured with.
     """
 
     bits: int | None = None

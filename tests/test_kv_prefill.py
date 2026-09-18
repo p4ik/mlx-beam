@@ -1,18 +1,22 @@
 """When a quantized KV cache becomes quantized: after the prefill (exact,
 the default) or as it is written (quantized). The acceptance: the exact
-mode reproduces mlx-lm's own quantized path to the bit, and the store
-never holds a layer at model precision."""
+mode computes what mlx-lm's `generate_step` computes with
+`quantized_kv_start` at the prompt's end - to the bit, whatever the
+prefill chunking - and the store never holds a layer at model precision.
+(mlx-lm's default start of 5000 leaves shorter prompts unquantized; a
+start of 0 quantizes after every chunk; neither is a reference here.)"""
 
 import time
 
 import mlx.core as mx
+import pytest
 
+from mlx_beam._vendor.mlx_lm.generate import generate_step
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_beam._vendor.optiq.kv_batch import MergeableQuantizedKVCache
 from mlx_beam.engine import Engine, GenerationRequest, KVPolicy
 from mlx_beam.engine.kv import (
     DeferredQuantizedKVCache,
-    dequantized,
     for_prefill,
     for_store,
     make_request_cache,
@@ -34,35 +38,76 @@ def logprobs(model, caches, last):
     return logits - mx.logsumexp(logits)
 
 
-def mlx_lm_way(model, tokens, bits):
-    """Prefill at model precision, quantize, then the decode step: what
-    `mlx_lm.generate --kv-bits` computes."""
-    caches = make_prompt_cache(model)
-    prefill(model, caches, tokens[:-1])
-    for i, c in enumerate(caches):
-        if type(c) is KVCache:
-            caches[i] = c.to_quantized(group_size=64, bits=bits)
-    return logprobs(model, caches, tokens[-1])
+def mlx_lm_way(model, tokens, bits, chunk=512):
+    """mlx-lm's own generate_step, quantizing at the prompt's end: the
+    reference the exact mode is held to."""
+    gen = generate_step(
+        mx.array(tokens),
+        model,
+        max_tokens=1,
+        kv_bits=bits,
+        kv_group_size=64,
+        prefill_step_size=chunk,
+        quantized_kv_start=len(tokens) - 1,
+    )
+    _, ref = next(gen)
+    mx.eval(ref)
+    gen.close()
+    return ref
 
 
 def first_event(engine, tokens):
-    return next(iter(engine.submit(GenerationRequest(tokens, max_tokens=1, top_logprobs=5))))
+    return next(
+        iter(engine.submit(GenerationRequest(tokens, max_tokens=1, top_logprobs=5)))
+    )
 
 
-def test_exact_prefill_reproduces_mlx_lm_bit_for_bit_and_quantized_does_not():
+@pytest.mark.parametrize("chunk", [512, 64])
+def test_exact_prefill_matches_generate_step_bit_for_bit_and_quantized_does_not(chunk):
     model = tiny_llama()
     for bits in (8, 4):
-        ref = mlx_lm_way(model, PROMPT, bits)
+        ref = mlx_lm_way(model, PROMPT, bits, chunk)
         gaps = {}
         for mode in ("exact", "quantized"):
-            with Engine(model, kv_policy=KVPolicy(bits=bits, prefill=mode)) as engine:
+            with Engine(
+                model,
+                kv_policy=KVPolicy(bits=bits, prefill=mode),
+                prefill_step_size=chunk,
+                prefill_slice=chunk,
+            ) as engine:
                 ev = first_event(engine, PROMPT)
                 gaps[mode] = max(abs(ref[t].item() - lp) for t, lp in ev.top_logprobs)
                 # Whatever the prefill did, the store holds quantized layers.
-                entry = engine.prefix_store._trie.get(engine.model_key, PROMPT + [ev.token])
-                assert all(isinstance(c, MergeableQuantizedKVCache) for c in entry.cache)
+                entry = engine.prefix_store._trie.get(
+                    engine.model_key, PROMPT + [ev.token]
+                )
+                assert all(
+                    isinstance(c, MergeableQuantizedKVCache) for c in entry.cache
+                )
         assert gaps["exact"] == 0.0, gaps
         assert gaps["quantized"] > 0.001, gaps
+
+
+def test_generate_step_with_its_default_start_is_not_the_reference():
+    # The default quantized_kv_start of 5000 never quantizes a 420-token
+    # prompt; a start of 0 quantizes after every chunk. Both differ from
+    # the exact mode - the reference is the start at the prompt's end.
+    model = tiny_llama()
+    exact = mlx_lm_way(model, PROMPT, 8, 64)
+    for start in (5000, 0):
+        gen = generate_step(
+            mx.array(PROMPT),
+            model,
+            max_tokens=1,
+            kv_bits=8,
+            kv_group_size=64,
+            prefill_step_size=64,
+            quantized_kv_start=start,
+        )
+        _, other = next(gen)
+        mx.eval(other)
+        gen.close()
+        assert mx.abs(exact - other).max().item() > 0.0005, start
 
 
 def test_default_policy_is_exact_and_the_request_cache_says_so():
@@ -100,7 +145,7 @@ def test_a_stored_prefix_comes_back_exact_for_the_next_turn():
             caches[i] = c.to_quantized(group_size=64, bits=bits)
     model(mx.array([turn1[-1:]]), cache=caches)
     model(mx.array([[ev.token]]), cache=caches)
-    for i, c in enumerate(caches):
+    for c in caches:
         if hasattr(c, "bits"):
             c.__class__ = MergeableQuantizedKVCache
     caches = for_prefill(caches, KVPolicy(bits=bits))
@@ -122,9 +167,9 @@ def test_dequantize_and_requantize_round_trip_keeps_the_data():
     again = for_store([back])[0]
     assert isinstance(again, MergeableQuantizedKVCache)
     # The prefix keeps its codes; only tokens added later are quantized fresh.
-    for a, b in zip(stored.keys, again.keys):
+    for a, b in zip(stored.keys, again.keys, strict=True):
         assert mx.array_equal(a[..., :300, :], b[..., :300, :])
-    for a, b in zip(stored.values, again.values):
+    for a, b in zip(stored.values, again.values, strict=True):
         assert mx.array_equal(a[..., :300, :], b[..., :300, :])
     # The quantized policy keeps the stored form as it is.
     assert for_prefill([stored], KVPolicy(bits=8, prefill="quantized"))[0] is stored
