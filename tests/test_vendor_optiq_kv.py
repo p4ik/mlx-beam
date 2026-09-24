@@ -147,7 +147,7 @@ def test_tiled_sdpa_matches_stock_with_a_batch_mask():
     from mlx_beam._vendor.optiq import fused_quant_sdpa
 
     mx.random.seed(4)
-    B, Hq, Hkv, L, N, D = 2, 4, 2, 6, 70, 64
+    B, Hq, Hkv, L, N, D = 2, 4, 2, 70, 134, 64
     q = mx.random.normal((B, Hq, L, D)).astype(mx.float16)
     k = mx.random.normal((B, Hkv, N, D)).astype(mx.float16)
     v = mx.random.normal((B, Hkv, N, D)).astype(mx.float16)
@@ -156,7 +156,10 @@ def test_tiled_sdpa_matches_stock_with_a_batch_mask():
     mask = create_causal_mask(L, offset=N - L, left_padding=mx.array([0, 5]))
     assert mask.dtype == mx.bool_ and mask.shape == (B, 1, L, N)
     assert fused_quant_sdpa.supported(q, 4, 64, mask)
+    # Below the threshold the stock path is cheaper: one token, and the
+    # handful a speculative verify runs (fused_quant_sdpa.MIN_TILED_QUERIES).
     assert not fused_quant_sdpa.supported(q[:, :, :1], 4, 64, mask[:, :, :1])
+    assert not fused_quant_sdpa.supported(q[:, :, :4], 4, 64, mask[:, :, :4])
     tiled = fused_quantized_scaled_dot_product_attention(
         q, qk, qv, scale=D**-0.5, mask=mask, group_size=64, bits=4, n_chunk=16
     )
@@ -183,7 +186,9 @@ def test_prefill_takes_the_tiled_path(monkeypatch):
     model.set_dtype(mx.float16)
     gen = BatchGenerator(model, max_tokens=2, stop_tokens=[])
     caches = [[MergeableQuantizedKVCache(group_size=64, bits=4) for _ in model.layers]]
-    gen.insert([[1, 2, 3, 4, 5, 6]], caches=caches)
+    gen.insert(
+        [list(range(1, 80))], caches=caches
+    )  # a prefill above the tile threshold
     while calls["tiled"] == 0:
         _, generated = gen.next()
         if any(r.finish_reason for r in generated):

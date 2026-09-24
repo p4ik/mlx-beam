@@ -181,7 +181,7 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
+        out, new_state = gated_delta_update(
             q,
             k,
             v,
@@ -195,7 +195,24 @@ class GatedDeltaNet(nn.Module):
         )
 
         if cache is not None:
-            cache[1] = state
+            if getattr(cache, "stash", None) is not None:
+                # A speculative verify: keep what redoing the recurrence over
+                # an accepted prefix needs (VENDORED.md, recurrent stash).
+                cache.stash = dict(
+                    conv_input=conv_input,
+                    n_keep=n_keep,
+                    state=state,
+                    q=q,
+                    k=k,
+                    v=v,
+                    a=a,
+                    b=b,
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    mask=mask,
+                    use_kernel=not self.training,
+                )
+            cache[1] = new_state
             cache.advance(S)
 
         out = self.norm(out, z)

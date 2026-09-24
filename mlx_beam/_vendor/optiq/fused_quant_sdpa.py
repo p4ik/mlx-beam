@@ -25,15 +25,21 @@ from mlx.utils import tree_map
 N_CHUNK = 512
 
 
+# Below this many query tokens the stock path wins: at one token it is one
+# matmul, and a speculative verify of four tokens paid +40 ms per step at
+# 32k context on the tiles (2026-09-19, M4 Pro, Qwen3.8-27B, 8-bit KV).
+MIN_TILED_QUERIES = 64
+
+
 def supported(queries, bits: int, group_size: int, mask) -> bool:
-    # Prefill only: at one query token the stock path is one matmul, the
-    # tiles would be N/n_chunk launches. Masks: none, "causal", or the bool
-    # arrays the batch caches build (left padding, per row).
+    # Prefill only: the tiles would be N/n_chunk launches per call. Masks:
+    # none, "causal", or the bool arrays the batch caches build (left
+    # padding, per row).
     return (
         bits in (4, 8)
         and group_size in (32, 64, 128)
         and queries.dtype in (mx.float16, mx.bfloat16)
-        and queries.shape[2] > 1
+        and queries.shape[2] >= MIN_TILED_QUERIES
         and (
             mask is None
             or (isinstance(mask, str) and mask == "causal")
