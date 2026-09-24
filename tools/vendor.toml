@@ -25,6 +25,8 @@ modified = [
   "generate.py",
   "models/base.py",
   "models/cache.py",
+  "models/qwen3_5.py",
+  "models/qwen3_next.py",
   "utils.py",
   "tokenizer_utils.py",
   "models/plamo2.py",

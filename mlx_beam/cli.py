@@ -225,6 +225,24 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         default=0.5,
         help="share of the worker's time decode keeps while a prefill runs (0-1)",
     )
+    spec = p.add_argument_group(
+        "speculative decoding",
+        "off unless asked; a checkpoint that bundles a draft head says so at start",
+    )
+    spec.add_argument(
+        "--draft-model",
+        help="the proposer that drafts tokens for the verify pass: 'bundled' takes "
+        "the draft head the checkpoint ships (config.json mtp_file, or mtp.* "
+        "tensors in the shards); a repo or path for an external drafter is not "
+        "supported yet",
+    )
+    spec.add_argument(
+        "--max-draft-tokens",
+        type=int,
+        default=3,
+        help="cap on the drafts verified per cycle (default: 3, the fixed depth "
+        "at this stage; a lower value lowers it)",
+    )
     cache = p.add_argument_group("prompt cache")
     cache.add_argument(
         "--prompt-cache-size",
@@ -351,6 +369,37 @@ def kv_policy_from_args(args):
         raise SystemExit(f"kv policy: {e}") from None
 
 
+def proposer_from_args(args, model, model_path: Path, log):
+    """The proposer `--draft-model` names, or None. A checkpoint that ships
+    a head but was started without the flag gets a hint, not a default."""
+    from mlx_beam.engine.proposer import (
+        BundledHeadProposer,
+        bundled_head_files,
+        load_bundled_head,
+    )
+
+    if not args.draft_model:
+        try:
+            files, _ = bundled_head_files(model_path)
+            log.info(
+                "%s bundles a draft head (%s); pass --draft-model bundled to use it",
+                args.model,
+                ", ".join(str(f.relative_to(model_path)) for f in files),
+            )
+        except (OSError, ValueError):
+            pass
+        return None
+    if args.draft_model != "bundled":
+        raise ValueError(
+            "only 'bundled' (the checkpoint's own draft head) is supported at "
+            "this stage; an external drafter comes with a later release"
+        )
+    if args.max_draft_tokens < 1:
+        raise ValueError("--max-draft-tokens must be at least 1")
+    head, info = load_bundled_head(model, model_path)
+    return BundledHeadProposer(model, head, args.max_draft_tokens, info)
+
+
 def serve(args) -> int:
     import logging
 
@@ -384,6 +433,11 @@ def serve(args) -> int:
     model_path = (
         Path(args.model) if Path(args.model).exists() else hf_repo_to_path(args.model)
     )
+    try:
+        proposer = proposer_from_args(args, model, model_path, log)
+    except (OSError, ValueError) as e:
+        log.error("--draft-model %s: %s", args.draft_model, e)
+        return 3
     defaults = RequestDefaults.resolve(
         model_path,
         flags={
@@ -411,12 +465,16 @@ def serve(args) -> int:
         max_context=args.max_context,
         max_prompt_tokens=args.max_prompt_tokens,
         max_queued=args.max_queued,
+        proposer=proposer,
+        max_draft_tokens=args.max_draft_tokens,
     )
     try:
         engine.start()
     except EngineDead as e:
         log.error("%s", e)
         return 3
+    if engine.speculator is not None:
+        log.info("speculative: %s", engine.speculator.describe()["proposer"])
     served = Served(
         engine,
         tokenizer,

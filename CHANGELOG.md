@@ -7,6 +7,39 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- Speculative decoding, first stage: `--draft-model bundled` loads the
+  draft head a checkpoint ships (the `mtp_file` its config names, or the
+  `mtp.*` tensors in its shards) and verifies its drafts in one forward
+  per cycle. Greedy requests decoding alone get up to three drafts per
+  cycle (`--max-draft-tokens` caps that); everything else - several rows
+  at once, sampling, a request with repetition penalties, a thinking
+  budget about to act - decodes plainly through the same path; a logit
+  bias is applied to every verified position, so a request with one still
+  speculates. Every committed token is the model's own argmax over the
+  verify forward; a rejected draft is taken back from the attention caches
+  by a trim and from the recurrent layers by redoing their recurrence over
+  the accepted prefix. Against plain decoding that is the same output up
+  to the rounding of kernels running at another width (bit-identical in
+  bf16 in every measured case, 2026-09-24; in float32 a logit tie can fall
+  the other way). Without the flag nothing changes; a checkpoint that
+  bundles a head says so at start.
+  `/health.speculative` reports the proposer, the depth, cycles, drafted
+  and accepted tokens and the plain steps taken instead. Measured on a
+  27B hybrid with 8-bit KV, one request: 2.1x tokens per second at depth 3
+  (2026-09-19, M4 Pro).
+- The head's RMSNorm weights are all shifted by +1 at load, the (1 + w)
+  convention of the checkpoint against mlx's w; a per-tensor guess by the
+  mean leaves three of the seven unshifted and costs ~14 points of draft
+  acceptance.
+
+### Changed
+- The tiled quantized attention runs from 64 query tokens on rather than
+  from two: a speculative verify of four tokens paid +40 ms per step at
+  32k context on the tiles (2026-09-19, M4 Pro, Qwen3.8-27B, 8-bit KV).
+
+## [0.1.0a3] - 2026-09-19
+
+### Added
 - `/health` reports `memory: {active, peak, cache}` in bytes from the Metal
   allocator (`mx.get_active_memory`, `get_peak_memory`, `get_cache_memory`).
   Process RSS does not include these buffers, so the full-precision transient

@@ -78,7 +78,8 @@ worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,
 `tiled SDPA` - `models/base.py`, `scaled_dot_product_attention`: with a
 quantized cache, the tiled attention from the optiq part below runs whenever
 it supports the shape (4/8 bit, group 32/64/128, fp16/bf16 queries, causal or
-no mask); the stock path stays for everything else.
+no mask, a prefill's worth of query tokens - the threshold is that part's);
+the stock path stays for everything else.
 
 `packed K/V without a cache` - `models/base.py`, `scaled_dot_product_attention`
 and `_packed_layout`: a layer that shares another layer's cache (Gemma 4's
@@ -106,6 +107,32 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 `generate_step` with `quantized_kv_start = len(prompt) - 1` to the bit at
 8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
 is stored quantized).
+
+`generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
+one constructor argument, `generation_batch`, the class built at the move to
+decoding (`PromptProcessingBatch.generate`) and for the empty batch. Upstream
+names `GenerationBatch` there; the engine hands in
+`mlx_beam.engine.speculative.SpeculativeGenerationBatch`, which decodes
+several tokens per call when a proposer drafts them and plainly otherwise.
+Nothing about the plain path changed: with the argument left out the
+default is upstream's class. Tests: `tests/test_speculative.py`.
+
+`recurrent stash` - `models/qwen3_5.py`, `models/qwen3_next.py`,
+`GatedDeltaNet.__call__`: when the layer's cache carries a `stash` attribute
+that is not None, the layer stores what a partial rollback needs - the conv
+input, the state before the call, the projected and normalised `q`, `k`,
+`v`, `a`, `b`, the mask and the kernel flag. The speculative verify arms
+the stash before its forward over the drafts and, when the target rejects
+some of them, redoes the recurrence over the accepted prefix from the stash
+(`speculative.rollback_recurrent`) instead of the whole model; attention
+caches trim. The kernel advances one token at a time, so the replayed
+state is exactly the verify's own state after the accepted prefix (bit for
+bit, measured 2026-09-24); a separate forward of just those tokens may
+differ by the rounding of its projections at another width - the contract
+in `speculative.py`. Without the attribute the layer runs as upstream.
+Tests: `tests/test_speculative.py` (`test_committed_tokens_equal_plain_greedy`
+with nothing, everything and a ragged mix accepted;
+`test_rollback_on_metal_matches_a_shorter_forward` on the Metal kernels).
 
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
@@ -210,9 +237,12 @@ support check next to it; `install`/`uninstall` and the module-level
 original dropped. The chunk width is an argument (`n_chunk`, default 512).
 Three changes to the kernel itself: it accepts the bool masks the batch
 caches build (per-row left padding; the original only knew "causal", so it
-never ran on the batch path), it is used for prefill only (one query token
-is one matmul on the stock path), and the running max, sum and output
-accumulate in float32 across tiles - fp16 stops resolving the sum past a
-few thousand tokens. Tests: `test_tiled_sdpa_matches_stock`,
+never ran on the batch path), it runs from `MIN_TILED_QUERIES` (64) query
+tokens on rather than from two - the original switched at one, and a
+speculative verify of four tokens paid +40 ms per step at 32k context on
+the tiles against the stock path (2026-09-19, M4 Pro, Qwen3.8-27B, 8-bit
+KV) - and the running max, sum and output accumulate in float32 across
+tiles - fp16 stops resolving the sum past a few thousand tokens. Tests:
+`test_tiled_sdpa_matches_stock`,
 `test_tiled_sdpa_matches_stock_with_a_batch_mask`,
 `test_prefill_takes_the_tiled_path`.

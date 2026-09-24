@@ -27,6 +27,8 @@ That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, 
 
 Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`, `--prompt-cache-size`, `--chat-template`, …). Token limits say what they count: `--max-context` (prompt plus generated, a hard cap), `--max-prompt-tokens` (prompt, a hard cap), `--max-completion-tokens` (generated, the default a request may override), `--max-reasoning-tokens` (the think block; closed by force at the budget) and `--min-response-tokens` (what the answer keeps after the block). `beam serve --help` lists them all with their units.
 
+`--draft-model bundled` turns on speculative decoding with the draft head the checkpoint ships (Qwen3.5/3.8 packs carry one): a greedy request decoding alone gets up to three tokens per model call, each one the model's own argmax over the verify forward - the same output as plain decoding up to kernel rounding at another width (bit-identical in bf16 in every measured case). Several requests at once, sampling, and requests with repetition penalties decode plainly; `/health.speculative` shows cycles, drafted and accepted tokens.
+
 Requests may use the names other servers taught clients: `max_tokens`, `thinking_token_budget`, `reasoning: {effort, max_tokens}`, `enable_thinking`, `reasoning_effort`. The model's thinking is returned in `reasoning` (`--reasoning-field` switches to `reasoning_content`, both, or none), counted in `usage.completion_tokens_details.reasoning_tokens`, and flagged there when a limit cut it (`thinking_truncated`, `response_truncated`).
 
 ## What sets it apart
@@ -56,7 +58,7 @@ Existing MLX servers either stop at the basics or grow things that have no place
 | OpenAI-compatible server, continuous batching, quantized KV cache | done, text only |
 | Prefix cache with recurrent-state checkpoints | done, RAM tier |
 | Reasoning budget, request defaults, sampling controls | done |
-| Multi-token prediction in the batch | planned |
+| Multi-token prediction | done for one request at a time (greedy); in the batch and under sampling planned |
 | Vision, structured output | planned, as extras |
 | Expert streaming from SSD | planned |
 
