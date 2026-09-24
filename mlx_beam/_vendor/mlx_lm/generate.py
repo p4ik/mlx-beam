@@ -1086,11 +1086,15 @@ class PromptProcessingBatch:
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
         max_tokens: Optional[List[int]] = None,
+        generation_batch=None,
     ):
         self.model = model
         self.uids = uids
         self.prompt_cache = _merge_caches(caches)
         self.tokens = tokens if tokens is not None else [[] for _ in uids]
+        # The class that decodes after the prompt: the caller may hand in a
+        # subclass (mlx-beam's speculative batch); VENDORED.md, generation batch.
+        self.generation_batch = generation_batch or GenerationBatch
 
         self.prefill_step_size = prefill_step_size
         self.samplers = samplers if samplers is not None else []
@@ -1131,6 +1135,7 @@ class PromptProcessingBatch:
         new_batch.prompt_cache = copy.deepcopy(self.prompt_cache)
         new_batch.tokens = list(self.tokens)
         new_batch.prefill_step_size = self.prefill_step_size
+        new_batch.generation_batch = self.generation_batch
         new_batch.samplers = list(self.samplers)
         new_batch.fallback_sampler = self.fallback_sampler
         new_batch.logits_processors = list(self.logits_processors)
@@ -1228,7 +1233,7 @@ class PromptProcessingBatch:
             c.quantized() if hasattr(c, "quantized") else c for c in self.prompt_cache
         ]
 
-        generation = GenerationBatch(
+        generation = self.generation_batch(
             self.model,
             self.uids,
             last_token,
@@ -1256,6 +1261,7 @@ class PromptProcessingBatch:
         model: nn.Module,
         fallback_sampler: Sampler,
         prefill_step_size: int = 2048,
+        generation_batch=None,
     ):
         return cls(
             model=model,
@@ -1268,6 +1274,7 @@ class PromptProcessingBatch:
             logits_processors=[],
             max_tokens=[],
             stop_sequences=[],
+            generation_batch=generation_batch,
         )
 
 
@@ -1563,6 +1570,7 @@ class BatchGenerator:
         decode_share: float = 0.5,
         max_kv_size: Optional[int] = None,
         stream=None,
+        generation_batch=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1570,6 +1578,7 @@ class BatchGenerator:
         self.logits_processors = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
+        self.generation_batch = generation_batch or GenerationBatch
         # A model call cannot be interrupted, so its width is the wait a
         # newcomer sees. 512 ran at 125 tok/s against 114 for 2048 on a
         # 27B GDN hybrid (2026-09-13, M4 Pro 64 GB); VENDORED.md, scheduler.
@@ -1591,8 +1600,9 @@ class BatchGenerator:
             self.model,
             self.sampler,
             prefill_step_size=prefill_step_size,
+            generation_batch=self.generation_batch,
         )
-        self._generation_batch = GenerationBatch.empty(self.model, self.sampler)
+        self._generation_batch = self.generation_batch.empty(self.model, self.sampler)
         self._unprocessed_sequences = deque()
         self._currently_processing = []
         self._prefill_turn = False
@@ -1822,6 +1832,7 @@ class BatchGenerator:
             logits_processors=logits_processors,
             stop_sequences=stop_sequences,
             max_tokens=max_tokens,
+            generation_batch=self.generation_batch,
         )
 
     def _next(self):

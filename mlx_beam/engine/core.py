@@ -34,7 +34,8 @@ from mlx_beam.engine.request import (
     SamplingParams,
     TokenEvent,
 )
-from mlx_beam.engine.sampling import SamplerPool, top_logprobs
+from mlx_beam.engine.sampling import SamplerPool, is_greedy, top_logprobs
+from mlx_beam.engine.speculative import SpeculativeGenerationBatch, Speculator
 from mlx_beam.engine.thinking import (
     ContextTooLong,
     ThinkingBudget,
@@ -65,6 +66,12 @@ def own_recurrent_state(caches: list) -> None:
 
 class QueueFull(RuntimeError):
     """More requests are waiting than --max-queued allows; try again later."""
+
+
+# Draft depth of a cycle at this stage: three held the best gain for one row
+# on a 27B (2.1x, p1..p3 0.87/0.79/0.74; 2026-09-19, M4 Pro). A regulator
+# picks below the cap later; until then the cap only lowers this.
+FIXED_DRAFT_DEPTH = 3
 
 
 def _model_args(model: Any) -> list:
@@ -154,10 +161,24 @@ class Engine:
         max_context: int | None = None,
         max_prompt_tokens: int | None = None,
         max_queued: int | None = None,
+        proposer: Any = None,
+        max_draft_tokens: int = 3,
     ):
         self.model = model
         self.model_key = model_key
         self.kv_policy = kv_policy or KVPolicy()
+        # Speculative decoding: a proposer drafts, the verify cycle in
+        # SpeculativeGenerationBatch checks. Depth is fixed at this stage;
+        # the flag is a cap (measured 2.1x at depth 3 for one row, 19.09.).
+        self.speculator: Speculator | None = None
+        if proposer is not None:
+            if max_draft_tokens < 1:
+                raise ValueError("max_draft_tokens must be at least 1")
+            proposer.depth = min(FIXED_DRAFT_DEPTH, max_draft_tokens)
+            self.speculator = Speculator(proposer, proposer.depth, self._may_speculate)
+        # uid -> the row is greedy and carries no logits processor beyond
+        # its thinking budget (checked per cycle for inertness).
+        self._spec_rows: dict[int, bool] = {}
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -396,6 +417,17 @@ class Engine:
         with self._lock:
             self._cancelled.add(request_id)
 
+    def _may_speculate(self, uid: int, tokens: int) -> bool:
+        """Whether a cycle of `tokens` may run for the row now: it was admitted
+        greedy without processors, and its thinking budget, if any, cannot
+        act within the cycle - the verify applies no processor, so one that
+        would have forced or masked a token inside the block must not be
+        skipped over."""
+        if not self._spec_rows.get(uid, False):
+            return False
+        thinking = self._budgets.get(uid)
+        return thinking is None or thinking.inert_for(tokens)
+
     def _death_message(self) -> str:
         if self._error is not None:
             return f"engine worker died: {self._error!r}"
@@ -445,6 +477,10 @@ class Engine:
             },
             "prompt_cache": self.prefix_store.describe(),
             "sampling": self._samplers.describe(),
+            # None: no proposer configured, every row decodes plainly.
+            "speculative": (
+                self.speculator.describe() if self.speculator is not None else None
+            ),
         }
 
     # -- the worker -------------------------------------------------------
@@ -472,6 +508,7 @@ class Engine:
         self._bookkeeping.clear()
         self._stride.clear()
         self._budgets.clear()
+        self._spec_rows.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -535,6 +572,12 @@ class Engine:
         self._stride[uid] = []
         if thinking is not None:
             self._budgets[uid] = thinking
+        if self.speculator is not None:
+            # Greedy, and nothing but the budget touches the logits: the
+            # verify reproduces plain decoding only under that condition.
+            self._spec_rows[uid] = is_greedy(req.sampling) and all(
+                p is thinking for p in processors
+            )
         if self._prompt_cache_bytes:
             # Stored prefixes yield to the caches of running requests.
             room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
@@ -624,6 +667,7 @@ class Engine:
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
+            self._forget_row(u)
             got = partial.get(u)
             if got is None:
                 continue
@@ -645,6 +689,11 @@ class Engine:
             except Exception:  # noqa: BLE001 - a lost partial is no failure
                 traceback.print_exc()
 
+    def _forget_row(self, uid: int) -> None:
+        self._spec_rows.pop(uid, None)
+        if self.speculator is not None:
+            self.speculator.proposer.drop(uid)
+
     def _warmup(self, gen: BatchGenerator) -> None:
         cache = make_request_cache(self.model, self.kv_policy)
         (uid,) = gen.insert([list(self.warmup_tokens)], max_tokens=[1], caches=[cache])
@@ -653,10 +702,40 @@ class Engine:
             if any(r.uid == uid and r.finish_reason for r in generated):
                 break
         self._applied_caches = describe_caches(cache)
+        if self.speculator is not None:
+            # One verify cycle through the model with the configured KV
+            # layout: a head or a cache layer the path cannot carry fails
+            # here, not on the first client request.
+            spec_cache = make_request_cache(self.model, self.kv_policy)
+            (uid,) = gen.insert(
+                [list(self.warmup_tokens)],
+                max_tokens=[self.speculator.depth + 2],
+                caches=[spec_cache],
+            )
+            self._spec_rows[uid] = True
+            cycles = self.speculator.cycles
+            while True:
+                _, generated = gen.next()
+                if any(r.uid == uid and r.finish_reason for r in generated):
+                    break
+            self._forget_row(uid)
+            if self.speculator.cycles == cycles:
+                raise RuntimeError(
+                    "the speculative warm-up ran no verify cycle; the proposer "
+                    "drafted nothing"
+                )
+            self.speculator.checked = True
         self._last_step = time.monotonic()
 
     def _loop(self) -> None:
-        gen = BatchGenerator(self.model, stop_tokens=[], **self._gen_args)
+        batch_class = (
+            SpeculativeGenerationBatch.bound(self.speculator)
+            if self.speculator is not None
+            else None
+        )
+        gen = BatchGenerator(
+            self.model, stop_tokens=[], generation_batch=batch_class, **self._gen_args
+        )
         self._gen = gen
         try:
             self._warmup(gen)
@@ -761,6 +840,7 @@ class Engine:
                     if r.finish_reason is not None:
                         del self._live[r.uid]
                         self._budgets.pop(r.uid, None)
+                        self._forget_row(r.uid)
         finally:
             gen.close()
             self._gen = None

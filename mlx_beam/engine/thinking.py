@@ -243,6 +243,24 @@ class ThinkingBudget:
     def in_reasoning(self) -> bool:
         return self._state == "reasoning"
 
+    def inert_for(self, tokens: int) -> bool:
+        """The processor leaves the next `tokens` logits alone whatever they
+        turn out to be: no force queued, no opener masked, and `tokens` more
+        counted tokens cannot arm the force or the mask. A speculative cycle
+        may then verify that many tokens without calling it."""
+        if self._block or self._pos < len(self._queue):
+            return False
+        limit = self.limits.max_tokens
+        if limit is None:
+            return True
+        # Every token could count; arming and the mask both trigger from
+        # `reasoning_tokens` at these distances (see _maybe_arm, _gate_opener).
+        reach = self.reasoning_tokens + tokens
+        return (
+            reach < limit - 1 - self._close_counted
+            and limit - reach >= 2 + self._close_counted
+        )
+
     def _is_forced(self, token: int) -> bool:
         """Once armed, the tokens after the free one are the queue's - unless
         the free token itself began the end marker, then the model's own
