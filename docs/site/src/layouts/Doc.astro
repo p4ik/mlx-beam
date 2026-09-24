@@ -1,0 +1,54 @@
+---
+import "@fontsource-variable/archivo/standard.css";
+import "../styles/global.css";
+
+const { frontmatter } = Astro.props;
+const repo = "https://github.com/p4ik/mlx-beam";
+const base = import.meta.env.BASE_URL.replace(/\/$/, "");
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{frontmatter.title} · mlx-beam</title>
+    <meta name="description" content={frontmatter.description} />
+    <meta name="theme-color" content="#000000" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="wrap">
+        <a class="brand" href={`${base}/`}>
+          <span class="name">mlx-beam</span>
+          <span class="expands">Batched Engine for Apple Metal</span>
+        </a>
+        <nav>
+          <a href={`${base}/`}>Home</a>
+          <a href={`${base}/configuration/`}>Configuration</a>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="doc">
+        <div class="wrap">
+          <h1>{frontmatter.title}</h1>
+          <p class="lead">{frontmatter.description}</p>
+          <slot />
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p>Apache-2.0. Vendored components keep their own licenses.</p>
+        <nav>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -7,6 +7,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- A configuration page on the site: the `beam serve` flags as tables
+  generated from the parser (CI fails when the page is stale), the request
+  fields with their ranges, what a checkpoint may bring along, and the
+  order in which flag, checkpoint and request win. `--host`, `--port` and
+  `--log-level` gained the help text they lacked.
 - `/health` reports `memory: {active, peak, cache}` in bytes from the Metal
   allocator (`mx.get_active_memory`, `get_peak_memory`, `get_cache_memory`).
   Process RSS does not include these buffers, so the full-precision transient

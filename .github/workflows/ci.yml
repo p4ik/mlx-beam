@@ -17,6 +17,8 @@ jobs:
       - run: uvx pre-commit run --all-files --show-diff-on-failure
       - name: Vendored parts match their pinned upstream except the listed changes
         run: python3 tools/vendor_diff.py
+      - name: The configuration page matches the serve parser
+        run: python3 tools/gen_config_reference.py --check
 
   test-apple-silicon:
     # macos-15 runners are Apple silicon (M-series): real MLX, tiny models.
