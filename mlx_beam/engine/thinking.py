@@ -253,13 +253,10 @@ class ThinkingBudget:
         limit = self.limits.max_tokens
         if limit is None:
             return True
-        # Every token could count; arming and the mask both trigger from
-        # `reasoning_tokens` at these distances (see _maybe_arm, _gate_opener).
-        reach = self.reasoning_tokens + tokens
-        return (
-            reach < limit - 1 - self._close_counted
-            and limit - reach >= 2 + self._close_counted
-        )
+        # Every token could count. The force arms at `limit - 1 - close`
+        # (_maybe_arm) and the opener mask at `limit - 2 - close` from the
+        # other side (_gate_opener): the same bound, written once.
+        return self.reasoning_tokens + tokens < limit - 1 - self._close_counted
 
     def _is_forced(self, token: int) -> bool:
         """Once armed, the tokens after the free one are the queue's - unless

@@ -7,7 +7,14 @@ longest prefix of drafts the target's own argmax reproduces is committed,
 plus the target's token after it; everything the forward wrote past that
 point is rolled back - attention caches trim, recurrent layers redo their
 recurrence over the accepted prefix from what the layer stashed. Greedy only:
-the committed tokens are exactly what plain decoding would have produced.
+every committed token is the target's own argmax over the verify forward.
+Against plain decoding, one token per forward, that agrees up to the
+rounding of kernels that run at a different width: in bf16 the two were
+bit-identical in every measured case (recurrent layers, Metal, head dims 32
+and 128, 2026-09-24), in float32 the projections of a four-token forward
+differ from a one-token forward by ~1e-8, so a logit tie can fall the other
+way. Nothing here can close that gap: the inputs of every layer already
+come from the wider forward below it.
 
 Rows speculate one at a time (measured: a batch of four gains under 1.2x on
 this hardware without a small-M kernel, 2026-09-19), greedy, without logits
@@ -84,8 +91,11 @@ def rollback_recurrent(cache: ArraysCache, keep: int, total: int) -> None:
     """Put a recurrent layer back to the state after `keep` of the `total`
     tokens the last forward ran, from what the layer stashed: the conv window
     is a slice of the conv input, the delta-rule state is the recurrence over
-    the kept prefix - the same kernel, so the state is what a forward of just
-    those tokens would have left."""
+    the kept prefix. Exact with respect to that forward: the kernel advances
+    one token at a time, so the state equals the forward's own state after
+    `keep` tokens (bit for bit, measured 2026-09-24). A separate forward of
+    just those tokens can differ by its projections' rounding at another
+    width; see the module docstring."""
     stash = cache.stash
     if not stash:
         raise RollbackUnsupported(

@@ -10,7 +10,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_beam._vendor.mlx_lm.models import qwen3_5
+from mlx_beam._vendor.mlx_lm.models import qwen3_5, qwen3_next
+from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_beam.engine import Engine, EngineDead, GenerationRequest
 from mlx_beam.engine.proposer import (
     BundledHeadProposer,
@@ -19,8 +20,10 @@ from mlx_beam.engine.proposer import (
     shift_norms,
 )
 from mlx_beam.engine.request import SamplingParams
+from mlx_beam.engine.speculative import rollback_recurrent
 from mlx_beam.engine.thinking import ReasoningLimits
 from tests.test_engine import TINY_QWEN35_WRAPPED
+from tests.test_vendor_mlx_lm import TINY_HYBRID
 
 
 def tiny_qwen35(seed=0):
@@ -399,28 +402,44 @@ def test_random_head_keeps_plain_greedy_output(tmp_path):
 
 
 def test_head_history_holds_exactly_the_confirmed_pairs(tmp_path):
-    """The head's KV cache after each call: the confirmed pairs, never the
-    chained draft entries the target rejected."""
+    """The head's KV cache after each cycle: the confirmed pairs and nothing
+    else - offset and contents equal a cache fed those pairs alone, whatever
+    the chained draft entries the target rejected held in between."""
     model = tiny_qwen35()
     path = synthetic_head_checkpoint(tmp_path, model, "beam")
     head, info = load_bundled_head(model, path)
     proposer = BundledHeadProposer(model, head, 3, info)
+    reference = [KVCache()]  # fed the confirmed pairs only, one cycle at a time
     hidden = mx.random.normal((1, 1, 32))
     drafts = proposer.propose(7, hidden, mx.array([5], dtype=mx.uint32))
     mx.eval(drafts)
     assert drafts.shape == (3,)
     cache = proposer._cache[7][0]
     assert cache.offset == 3  # the pair (hidden, 5) and two chained entries
+    mx.eval(head(hidden, mx.array([[5]]), proposer._embed, reference))
     # two drafts held: the chained entries go, the two pairs wait for the next call
-    proposer.commit(
-        7, mx.random.normal((1, 2, 32)), [int(drafts[0].item()), int(drafts[1].item())]
-    )
-    assert cache.offset == 1
+    confirmed = mx.random.normal((1, 2, 32))
+    held = [int(drafts[0].item()), int(drafts[1].item())]
+    proposer.commit(7, confirmed, held)
+    assert cache.offset == 1 == reference[0].offset
     drafts = proposer.propose(7, hidden, mx.array([9], dtype=mx.uint32))
     mx.eval(drafts)
     assert cache.offset == 1 + 2 + 1 + 2  # pairs so far, the new pair, two chained
+    mx.eval(
+        head(
+            mx.concatenate([confirmed, hidden], axis=1),
+            mx.array([held + [9]]),
+            proposer._embed,
+            reference,
+        )
+    )
     proposer.commit(7, mx.random.normal((1, 0, 32)), [])
-    assert cache.offset == 4
+    assert cache.offset == 4 == reference[0].offset
+    for got, want in (
+        (cache.keys, reference[0].keys),
+        (cache.values, reference[0].values),
+    ):
+        assert mx.array_equal(got[..., :4, :], want[..., :4, :])
     proposer.drop(7)
     assert 7 not in proposer._cache and proposer.describe()["rows_with_history"] == 0
 
@@ -444,3 +463,55 @@ def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):
     args.draft_model = "bundled"
     proposer = proposer_from_args(args, model, path, log)
     assert proposer.kind == "mtp" and proposer.depth == 3
+
+
+# -- the recurrent rollback on the real kernels ------------------------------
+
+
+def gdn_layer(family: str, head_dim: int, dtype):
+    """One gated-delta layer of either family with a key width the Metal
+    kernel takes (the suite's tiny models use 16, which runs the ops path)."""
+    mx.random.seed(91)
+    if family == "qwen3_5":
+        cfg = dict(TINY_QWEN35_WRAPPED["text_config"])
+        cfg.update(linear_key_head_dim=head_dim, linear_value_head_dim=32)
+        layer = qwen3_5.GatedDeltaNet(qwen3_5.TextModelArgs(**cfg))
+    else:
+        cfg = dict(TINY_HYBRID)
+        cfg.update(linear_key_head_dim=head_dim, linear_value_head_dim=32)
+        layer = qwen3_next.Qwen3NextGatedDeltaNet(qwen3_next.ModelArgs(**cfg))
+    layer.set_dtype(dtype)
+    layer.eval()
+    mx.eval(layer.parameters())
+    return layer
+
+
+@pytest.mark.exactness
+@pytest.mark.skipif(not mx.metal.is_available(), reason="the Metal kernels")
+@pytest.mark.parametrize("family", ["qwen3_5", "qwen3_next"])
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("keep", [1, 2, 3])
+def test_rollback_on_metal_matches_a_shorter_forward(family, head_dim, dtype, keep):
+    """A four-token verify rolled back to `keep` tokens against a forward of
+    just those tokens from the same state. Bit for bit where both run the
+    same kernels (bf16 everywhere; float32 from two tokens on, where the
+    projections take the GEMM path on both sides); at one token in float32
+    the projections come from GEMV and differ by ~1e-8, which the rollback
+    cannot undo - measured 2026-09-24, the contract in speculative.py."""
+    layer = gdn_layer(family, head_dim, dtype)
+    x = mx.random.normal((1, 9, 32)).astype(dtype)
+    spec, plain = ArraysCache(2), ArraysCache(2)
+    mx.eval(layer(x[:, :5], cache=spec), layer(x[:, :5], cache=plain))
+    spec.stash = {}
+    mx.eval(layer(x[:, 5:], cache=spec))
+    assert spec.stash["use_kernel"] and spec.stash["k"].shape[-1] == head_dim
+    rollback_recurrent(spec, keep, 4)
+    spec.stash = None
+    mx.eval(layer(x[:, 5 : 5 + keep], cache=plain))
+    mx.eval(*spec.cache, *plain.cache)
+    for got, want in zip(spec.cache, plain.cache, strict=True):
+        g, w = got.astype(mx.float32), want.astype(mx.float32)
+        assert mx.allclose(g, w, atol=1e-5, rtol=1e-4)
+        if keep > 1 or dtype == mx.bfloat16:
+            assert mx.array_equal(got, want)
