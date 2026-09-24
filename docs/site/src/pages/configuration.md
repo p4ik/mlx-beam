@@ -76,6 +76,15 @@ Used when the client sends nothing; a flag beats the model's generation_config.j
 | `--prefill-slice` | integer | `512` | prompt tokens a prefill runs before decode gets a turn |
 | `--decode-share` | `SHARE` | `0.5` | share of the worker's time decode keeps while a prefill runs (0-1) |
 
+### Speculative decoding
+
+Off unless asked; a checkpoint that bundles a draft head says so at start.
+
+| Flag | Value | Default | What it does |
+|---|---|---|---|
+| `--draft-model` | text | — | the proposer that drafts tokens for the verify pass: 'bundled' takes the draft head the checkpoint ships (config.json mtp_file, or mtp.* tensors in the shards); a repo or path for an external drafter is not supported yet |
+| `--max-draft-tokens` | integer | `3` | cap on the drafts verified per cycle (default: 3, the fixed depth at this stage; a lower value lowers it) |
+
 ### Prompt cache
 
 | Flag | Value | Default | What it does |
@@ -120,5 +129,6 @@ The engine reads standard MLX checkpoints, and a checkpoint can carry settings o
 - **`generation_config.json`** - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty` and `frequency_penalty` become the server's sampling defaults, below the flags and above mlx-lm's own; `do_sample: false` means greedy.
 - **The chat template** in `tokenizer_config.json` or `chat_template.jinja` - the think and tool markers the engine watches for are inferred from the template that actually renders; `--chat-template` replaces it, `--use-default-chat-template` gives a model without one a plain ChatML template.
 - **A KV profile** - a quantized package may ship a bits-per-layer list (`[{"layer_idx": 3, "bits": 4, "group_size": 64}, …]`) or an object (`{"bits": 4, "group_size": 64, "layers": {"3": 8}, "prefill": "quantized"}`); the engine does not read it on its own, `--kv-config` points at the file. Listed layers take their bits, the rest follow `--kv-bits`; a profile's `prefill` yields to `--kv-prefill`.
+- **A draft head** - the file `mtp_file` in `config.json` names, or the `mtp.*` tensors in the shards. It is used only with `--draft-model bundled`; started without the flag, a checkpoint that bundles one says so. Its quantization comes from `config.json` (`mtplx_mtp_quantization`, or `beam.mtp.quantization`), else the head is quantized to 4 bits at load; its norm weights are shifted by +1 unless `beam.mtp.norm_convention` is `mlx`.
 
-What the engine built from all of this is in `/health`: the KV layout layer by layer under `kv.applied`, the batching and cache settings, and every request default with its source.
+What the engine built from all of this is in `/health`: the KV layout layer by layer under `kv.applied`, the batching and cache settings, the draft head and its counters under `speculative`, and every request default with its source.
