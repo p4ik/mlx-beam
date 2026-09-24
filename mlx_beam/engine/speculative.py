@@ -11,8 +11,9 @@ the committed tokens are exactly what plain decoding would have produced.
 
 Rows speculate one at a time (measured: a batch of four gains under 1.2x on
 this hardware without a small-M kernel, 2026-09-19), greedy, without logits
-processors other than an inert thinking budget; everything else decodes
-plainly through the same class, so no request is refused for it.
+processors other than a logit bias (applied to every verify position) and
+an inert thinking budget; everything else decodes plainly through the same
+class, so no request is refused for it.
 """
 
 from __future__ import annotations
@@ -41,12 +42,19 @@ class Speculator:
         proposer: Proposer,
         depth: int,
         eligible: Callable[[int, int], bool],
+        logit_bias: Callable[
+            [int], tuple[mx.array, mx.array] | None
+        ] = lambda uid: None,
     ):
         self.proposer = proposer
         self.depth = depth
         # eligible(uid, tokens_this_cycle): greedy, no logits processor that
         # could act within the cycle.
         self.eligible = eligible
+        # logit_bias(uid): (indices, values) of the row's additive bias, the
+        # one processor a verify can apply itself - it has no state and no
+        # context, so every position gets the same add as a plain step does.
+        self.logit_bias = logit_bias
         self.cycles = 0
         self.plain_steps = 0
         self.drafted = 0
@@ -245,6 +253,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         recurrent = self._arm()
         try:
             hidden, logits = self._forward(inputs)
+            bias = spec.logit_bias(uid)
+            if bias is not None:
+                # The same scatter-add mlx-lm's processor does on one row.
+                indices, values = bias
+                logits = logits.at[:, :, indices].add(values)
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             sampled = mx.argmax(logprobs, axis=-1)  # (1, 1 + k)
             mx.eval(sampled, drafts)

@@ -207,11 +207,35 @@ def test_non_greedy_and_processed_rows_decode_plainly():
                 GenerationRequest(
                     [3, 7, 11],
                     max_tokens=6,
-                    sampling=SamplingParams(logit_bias={2: -5.0}),
+                    sampling=SamplingParams(repetition_penalty=1.3),
                 )
             )
         )
         assert engine.speculator.cycles == before
+
+
+def test_logit_bias_row_speculates_and_matches_plain():
+    """A bias is stateless: the verify adds it to every position, so a row
+    with one still speculates and still equals its plain transcript."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        first = collect(plain.submit(GenerationRequest(prompt, max_tokens=4)))
+        bias = SamplingParams(logit_bias={first[1]: -100.0, first[2]: 3.0})
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=16, sampling=bias))
+        )
+    assert truth != first[:4] or first[1] != truth[1]
+    oracle = OracleProposer(lambda call: 3)
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(truth)
+        before = engine.speculator.cycles
+        out = collect(
+            engine.submit(GenerationRequest(prompt, max_tokens=16, sampling=bias))
+        )
+        assert out == truth
+        assert engine.speculator.cycles > before
 
 
 def test_thinking_budget_row_speculates_while_inert():

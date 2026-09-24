@@ -170,15 +170,19 @@ class Engine:
         # Speculative decoding: a proposer drafts, the verify cycle in
         # SpeculativeGenerationBatch checks. Depth is fixed at this stage;
         # the flag is a cap (measured 2.1x at depth 3 for one row, 19.09.).
+        # uid -> the row is greedy and carries no logits processor beyond a
+        # logit bias and its thinking budget (checked per cycle for inertness).
+        self._spec_rows: dict[int, bool] = {}
+        # uid -> (indices, values) of the row's logit bias, for the verify.
+        self._spec_bias: dict[int, tuple[mx.array, mx.array]] = {}
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
                 raise ValueError("max_draft_tokens must be at least 1")
             proposer.depth = min(FIXED_DRAFT_DEPTH, max_draft_tokens)
-            self.speculator = Speculator(proposer, proposer.depth, self._may_speculate)
-        # uid -> the row is greedy and carries no logits processor beyond
-        # its thinking budget (checked per cycle for inertness).
-        self._spec_rows: dict[int, bool] = {}
+            self.speculator = Speculator(
+                proposer, proposer.depth, self._may_speculate, self._spec_bias.get
+            )
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -509,6 +513,7 @@ class Engine:
         self._stride.clear()
         self._budgets.clear()
         self._spec_rows.clear()
+        self._spec_bias.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -573,11 +578,21 @@ class Engine:
         if thinking is not None:
             self._budgets[uid] = thinking
         if self.speculator is not None:
-            # Greedy, and nothing but the budget touches the logits: the
-            # verify reproduces plain decoding only under that condition.
-            self._spec_rows[uid] = is_greedy(req.sampling) and all(
-                p is thinking for p in processors
+            # Greedy, and nothing but a logit bias and the budget touches the
+            # logits: the verify applies the bias itself and skips an inert
+            # budget; a penalty reads the context per step and would need
+            # the per-position replay a later stage brings.
+            p = req.sampling
+            penalised = any(
+                x
+                for x in (p.repetition_penalty, p.presence_penalty, p.frequency_penalty)
             )
+            self._spec_rows[uid] = is_greedy(p) and not penalised
+            if p.logit_bias:
+                self._spec_bias[uid] = (
+                    mx.array(list(p.logit_bias.keys())),
+                    mx.array(list(p.logit_bias.values())),
+                )
         if self._prompt_cache_bytes:
             # Stored prefixes yield to the caches of running requests.
             room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
@@ -691,6 +706,7 @@ class Engine:
 
     def _forget_row(self, uid: int) -> None:
         self._spec_rows.pop(uid, None)
+        self._spec_bias.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
