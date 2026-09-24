@@ -413,3 +413,62 @@ footer nav {
     width: 100%;
   }
 }
+
+/* Documentation pages (layouts/Doc.astro): prose with tables. */
+.doc {
+  padding-top: 3rem;
+}
+
+.doc h1 {
+  font-size: 2rem;
+  margin: 0 0 0.5rem;
+}
+
+.doc .lead {
+  margin: 0 0 2rem;
+}
+
+.doc h2 {
+  margin: 2.5rem 0 0.75rem;
+}
+
+.doc h3 {
+  margin: 1.75rem 0 0.5rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.doc p,
+.doc li {
+  color: var(--text-soft);
+  max-width: 72ch;
+}
+
+.doc code {
+  font-size: 0.9em;
+  color: var(--text);
+}
+
+.doc table {
+  max-width: none;
+  font-size: 0.93rem;
+  margin: 0.5rem 0 1rem;
+}
+
+.doc th {
+  text-align: left;
+  padding: 0.5rem 0.75rem 0.5rem 0;
+  color: var(--text-dim);
+  font-weight: 500;
+  border-bottom: 1px solid rgba(102, 0, 0, 0.55);
+}
+
+.doc td {
+  padding: 0.55rem 0.75rem 0.55rem 0;
+  vertical-align: top;
+}
+
+.doc td:first-child {
+  white-space: nowrap;
+}

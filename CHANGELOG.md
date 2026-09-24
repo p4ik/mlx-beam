@@ -31,6 +31,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   convention of the checkpoint against mlx's w; a per-tensor guess by the
   mean leaves three of the seven unshifted and costs ~14 points of draft
   acceptance.
+- A configuration page on the site: the `beam serve` flags as tables
+  generated from the parser (CI fails when the page is stale), the request
+  fields with their ranges, what a checkpoint may bring along, and the
+  order in which flag, checkpoint and request win. `--host`, `--port` and
+  `--log-level` gained the help text they lacked.
 
 ### Changed
 - The tiled quantized attention runs from 64 query tokens on rather than

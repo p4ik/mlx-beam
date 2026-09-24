@@ -79,8 +79,8 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="where a chat completion carries the model's thinking: the field "
         "name(s), or none to leave the think markers in the content",
     )
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--host", default="127.0.0.1", help="address to listen on")
+    p.add_argument("--port", type=int, default=8000, help="TCP port to listen on")
     p.add_argument(
         "--allowed-origins",
         nargs="+",
@@ -222,6 +222,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     batching.add_argument(
         "--decode-share",
         type=lambda v: _unit_interval(v, "--decode-share"),
+        metavar="SHARE",
         default=0.5,
         help="share of the worker's time decode keeps while a prefill runs (0-1)",
     )
@@ -266,6 +267,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         default="INFO",
         type=str.upper,
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        help="how much the server log says",
     )
 
 
