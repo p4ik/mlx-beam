@@ -125,11 +125,14 @@ input, the state before the call, the projected and normalised `q`, `k`,
 the stash before its forward over the drafts and, when the target rejects
 some of them, redoes the recurrence over the accepted prefix from the stash
 (`speculative.rollback_recurrent`) instead of the whole model; attention
-caches trim. The kernel is the same per-token loop either way, so the
-state equals a forward of just the accepted tokens. Without the attribute
-the layer runs as upstream. Tests: `tests/test_speculative.py`
-(`test_committed_tokens_equal_plain_greedy` with nothing, everything and a
-ragged mix accepted).
+caches trim. The kernel advances one token at a time, so the replayed
+state is exactly the verify's own state after the accepted prefix (bit for
+bit, measured 2026-09-24); a separate forward of just those tokens may
+differ by the rounding of its projections at another width - the contract
+in `speculative.py`. Without the attribute the layer runs as upstream.
+Tests: `tests/test_speculative.py` (`test_committed_tokens_equal_plain_greedy`
+with nothing, everything and a ragged mix accepted;
+`test_rollback_on_metal_matches_a_shorter_forward` on the Metal kernels).
 
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
