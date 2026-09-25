@@ -52,7 +52,9 @@ def test_learns_from_calls_that_move_the_peak_and_cuts_to_what_fits():
 
 
 def test_smoothing_and_unknown_readers():
-    mem = Memory(active=0, peak=0, free=None)
+    # recommended=0: no device size known - on a Mac the default would read
+    # the device's own working set and there would be a ceiling after all.
+    mem = Memory(active=0, peak=0, free=None, recommended=0)
     v = mem.valve()
     v.width(100)
     mem.peak = 1_000

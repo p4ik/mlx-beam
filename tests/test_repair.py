@@ -4,6 +4,8 @@ reported; what no rung makes valid comes back as text."""
 
 import json
 
+import pytest
+
 from mlx_beam._vendor.mlx_lm.tool_parsers import json_tools
 from mlx_beam.api import repair
 from mlx_beam.api.text import ToolCallParser
@@ -105,3 +107,19 @@ def test_validate_and_coerce_directly():
     assert args == {"days": 2, "flag": True} and len(actions) == 2
     assert repair.repair_json_text('{"a": [1, 2,') == '{"a": [1, 2]}'
     assert repair.repair_json_text('{"a": "unterminated') == '{"a": "unterminated"}'
+
+
+@pytest.mark.parametrize(
+    "value", ["say True now", "a,}b", "None of it", 'quoted \\" inside, }', "x' y"]
+)
+def test_a_repair_leaves_string_contents_alone(value):
+    """The mending is syntax only: a Python literal or a comma before a
+    closing bracket inside a string is content, and a tool that writes
+    files gets it as the model wrote it."""
+    raw = json.dumps({"name": "weather", "arguments": {"city": value}})
+    calls, unparsed = parse(raw[:-1] + ",}")  # a trailing comma to repair
+    assert calls and not unparsed
+    assert calls[0]["repair_actions"] == ["json repaired"]
+    assert json.loads(calls[0]["function"]["arguments"])["city"] == value
+    assert repair.repair_json_text('{"a": "unterminated') == '{"a": "unterminated"}'
+    assert repair.repair_json_text('{"a": "') == '{"a": ""}'

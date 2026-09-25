@@ -138,37 +138,68 @@ _TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 _PY_LITERAL = re.compile(r"(?<![\w\"'])(True|False|None)(?![\w\"'])")
 
 
-def repair_json_text(text: str) -> str:
-    """The usual defects of model JSON mended, in the text as a whole (the
-    dialect's markers stay where they are): a code fence, Python's
-    literals, single-quoted strings and keys, a trailing comma, braces or
-    brackets left open at the end."""
-    out = _FENCE.sub("", text)
-    out = _PY_LITERAL.sub(
-        lambda m: {"True": "true", "False": "false", "None": "null"}[m.group(1)], out
-    )
-    if "'" in out and '"' not in out:
-        out = out.replace("'", '"')
-    out = _TRAILING_COMMA.sub(r"\1", out)
-    stack = []
+def _segments(text: str) -> list[tuple[str, bool]]:
+    """The text cut into (segment, inside a string) pieces by JSON's own
+    string rules - quotes and backslash escapes - so a repair can touch the
+    syntax and leave every string's content as it came."""
+    out: list[tuple[str, bool]] = []
+    start = 0
     in_string = False
     escaped = False
-    for ch in out:
+    for i, ch in enumerate(text):
         if in_string:
             if escaped:
                 escaped = False
             elif ch == "\\":
                 escaped = True
             elif ch == '"':
+                out.append((text[start : i + 1], True))
+                start = i + 1
                 in_string = False
         elif ch == '"':
+            if i > start:
+                out.append((text[start:i], False))
+            start = i
             in_string = True
-        elif ch in "{[":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]" and stack and stack[-1] == ch:
-            stack.pop()
-    if in_string:
-        out += '"'
+    if start < len(text):
+        out.append((text[start:], in_string))
+    return out
+
+
+def repair_json_text(text: str) -> str:
+    """The usual defects of model JSON mended, in the syntax only - the
+    dialect's markers stay where they are and a string's content is never
+    touched: a code fence, Python's literals, single-quoted strings and
+    keys, a trailing comma, braces or brackets left open at the end."""
+    out = _FENCE.sub("", text)
+    if "'" in out and '"' not in out:
+        out = out.replace("'", '"')
+    pieces = _segments(out)
+    mended = []
+    for segment, in_string in pieces:
+        if not in_string:
+            segment = _PY_LITERAL.sub(
+                lambda m: {"True": "true", "False": "false", "None": "null"}[
+                    m.group(1)
+                ],
+                segment,
+            )
+            segment = _TRAILING_COMMA.sub(r"\1", segment)
+        mended.append(segment)
+    out = "".join(mended)
+    stack = []
+    for segment, in_string in pieces:
+        if in_string:
+            continue
+        for ch in segment:
+            if ch in "{[":
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]" and stack and stack[-1] == ch:
+                stack.pop()
+    if pieces and pieces[-1][1]:
+        last = pieces[-1][0]
+        if len(last) == 1 or not last.endswith('"'):
+            out += '"'  # a string left open at the end
     # A comma left dangling before the closing we add.
     out = re.sub(r",\s*$", "", out) if stack else out
     out += "".join(reversed(stack))

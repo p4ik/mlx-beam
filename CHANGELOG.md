@@ -43,8 +43,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - A repair ladder for tool calls: the parser's own reading, validated
   against the tool's declared schema; when the parser refuses, a reading
   of the text with the usual defects of model JSON mended (a code fence,
-  Python's literals, single quotes, a trailing comma, braces left open);
-  when the schema objects, values coerced where they plainly are the
+  Python's literals, single quotes, a trailing comma, braces left open -
+  in the syntax only, a string's content is never touched); when the
+  schema objects, values coerced where they plainly are the
   declared type written another way ("42" for an integer, "true" for a
   boolean, a JSON text for an object). Every rung is validated again,
   nothing is invented, what a rung did is the call's `repair_actions`,

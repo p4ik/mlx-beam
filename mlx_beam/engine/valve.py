@@ -30,7 +30,9 @@ FREE_MEMORY_TTL_S = 1.0
 
 def _free_memory_darwin() -> int | None:
     try:
-        text = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=2).stdout
+        text = subprocess.run(
+            ["vm_stat"], capture_output=True, text=True, timeout=2
+        ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     page = 4096
@@ -77,6 +79,8 @@ class PrefillValve:
         self._peak = peak
         self._free = free
         self._clock = clock
+        # None: ask the device; 0: known to be unknown (nothing to hold
+        # against on that side, the free reading alone decides).
         if recommended is None:
             recommended = mx.device_info().get("max_recommended_working_set_size")
         self.recommended = recommended
@@ -104,7 +108,9 @@ class PrefillValve:
         known - then the valve lets every call through."""
         held = self._active()
         free = self._free_now()
-        candidates = [c for c in (self.recommended, None if free is None else held + free) if c]
+        candidates = [
+            c for c in (self.recommended, None if free is None else held + free) if c
+        ]
         self.last_ceiling = min(candidates) if candidates else None
         return self.last_ceiling
 
