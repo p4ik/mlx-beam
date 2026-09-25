@@ -23,7 +23,7 @@ from mlx_beam import __version__
 from mlx_beam.api import chat, completions, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
-from mlx_beam.api.reasoning import renderer_reasoning_keys
+from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
 from mlx_beam.engine import (
     ContextTooLong,
     Engine,
@@ -78,6 +78,9 @@ class Served:
             "chat": bool(getattr(t, "has_chat_template", True)),
             "tools": bool(getattr(t, "has_tool_calling", False)),
             "thinking": bool(getattr(t, "has_thinking", False)),
+            # What the template does with reasoning_effort, measured at
+            # load: the kwarg it reads, whether it checks the word, the set.
+            "effort": effort_capability(t).describe(),
             "vision": False,
             "audio": False,
         }
@@ -130,6 +133,7 @@ class Served:
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
         h["reasoning"] = self.reasoning_markers()
+        h["reasoning"]["effort"] = effort_capability(self.tokenizer).describe()
         h["tools"] = self.tool_markers()
         h["api"] = {
             "reasoning_field": self.reasoning_field,

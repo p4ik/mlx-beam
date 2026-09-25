@@ -11,6 +11,7 @@ import pytest
 from mlx_beam._vendor.mlx_lm import tokenizer_utils as tu
 from mlx_beam._vendor.mlx_lm.tool_parsers import atem, harmony
 from mlx_beam.api import chat
+from mlx_beam.api.reasoning import effort_capability
 from mlx_beam.api.text import TextAssembler, initial_state
 from mlx_beam.engine.request import TokenEvent
 from mlx_beam.engine.thinking import ReasoningLimits, ThinkingBudget
@@ -49,7 +50,9 @@ class FakeHF:
         back = {i: t for t, i in self._vocab.items()}
         return " ".join(back.get(i, "?") for i in ids)
 
-    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kw):
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tokenize=True, **kw
+    ):
         # The template rendered by jinja2 as transformers would render it.
         from jinja2 import Environment
 
@@ -187,7 +190,9 @@ def run(tok, pieces, tools=None, tools_enabled=True):
     calls = []
     # The stop token (the last piece, an EOS) is never text.
     for i in range(len(pieces) + 1):
-        d = asm.feed(TokenEvent(i, -0.1, finish_reason="stop" if i == len(pieces) else None))
+        d = asm.feed(
+            TokenEvent(i, -0.1, finish_reason="stop" if i == len(pieces) else None)
+        )
         content += d.content
         reasoning += d.reasoning
         calls += d.tool_calls
@@ -259,7 +264,14 @@ def test_muse_stream_routes_self_user_and_a_tool_recipient():
         '<atem:parameter name="days">3</atem:parameter>\n'
         "</atem:invoke>\n</atem:function_calls>"
     )
-    pieces = [" to=", "get_weather", "<|message|>", block[:20], block[20:60], block[60:]]
+    pieces = [
+        " to=",
+        "get_weather",
+        "<|message|>",
+        block[:20],
+        block[20:60],
+        block[60:],
+    ]
     content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces, TOOLS)
     assert content == "" and reasoning == ""
     assert calls[0]["function"]["name"] == "get_weather"
@@ -325,3 +337,29 @@ def test_budget_forces_the_whole_close_sequence():
     assert tracker.reasoning_tokens == 4 and tracker.thinking_truncated
     assert steps.forced[:10] == [False] * 4 + [True] * 6
     assert not any(steps.forced[10:]) and not tracker.in_reasoning
+
+
+def test_effort_is_passed_through_by_templates_that_do_not_check():
+    """gpt-oss writes `Reasoning: <word>` into the system prompt, Muse
+    `Reasoning strength: <word>` from another kwarg; neither refuses a
+    word, so the client's word goes in unchanged and no set is claimed."""
+    cap = effort_capability(HARMONY)
+    assert cap.describe() == {
+        "source": "template",
+        "kwarg": "reasoning_effort",
+        "validates": False,
+    }
+    cap = effort_capability(MUSE)
+    assert cap.kwarg == "reasoning_strength" and not cap.validates
+    messages = [{"role": "user", "content": "hi"}]
+    for tok, kwarg, line in (
+        (HARMONY, "reasoning_effort", "Reasoning: max\n"),
+        (MUSE, "reasoning_strength", "Reasoning strength: max."),
+    ):
+        req = chat.parse_chat_request(
+            {"messages": messages, "reasoning_effort": "max"}, "m"
+        )
+        chat.build_prompt(tok, req)
+        assert req.template_kwargs[kwarg] == "max"
+        text = tok.apply_chat_template(messages, tokenize=False, **req.template_kwargs)
+        assert line in text

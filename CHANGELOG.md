@@ -19,6 +19,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   false` opens the answer in the prompt, since their templates have no
   switch. `/health.reasoning` names the family and its markers,
   `/health.tools` the parser.
+- The reasoning effort follows what the loaded template does with it,
+  measured at load: the kwarg it reads (`reasoning_effort`,
+  `reasoning_strength`, ...), whether it checks the word, and the set it
+  accepts, reported under `/health.reasoning.effort` and in each model's
+  `capabilities.effort` in `/v1/models`. A template that checks gets the
+  client's word when it is in the set, else the nearest rung it accepts;
+  one that takes the word unchecked gets it as sent (the vocabulary such
+  models were trained on); one without the kwarg gets nothing. Before,
+  every word was mapped onto one template's three names.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is

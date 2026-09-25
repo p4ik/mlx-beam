@@ -20,12 +20,15 @@ from mlx_beam.api.errors import (
     unsupported,
 )
 from mlx_beam.api.reasoning import (
+    EFFORT_KWARGS,
     effort_candidates,
+    effort_capability,
     is_effort_rejection,
-    map_effort,
     mirror_reasoning,
+    normalise_effort,
     read_aliases,
     renderer_reasoning_keys,
+    translate_effort,
 )
 from mlx_beam.api.text import (
     TextAssembler,
@@ -254,8 +257,12 @@ def parse_chat_request(
     level, thinking = parse_thinking(aliases)
     if thinking is not None:
         template_kwargs["enable_thinking"] = thinking
+    # The effort word reaches the template in build_prompt, translated to
+    # what the loaded template takes (effort_capability), above a server
+    # default; an explicit chat_template_kwargs entry goes through as written.
     if level is not None:
-        template_kwargs["reasoning_effort"] = level
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
     template_kwargs.update(object_field(body, "chat_template_kwargs"))
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
@@ -280,12 +287,12 @@ def parse_chat_request(
 
 
 def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
-    """(template level, enable_thinking) from the resolved aliases: an effort
-    of none switches thinking off, a level asks for it."""
+    """(effort word, enable_thinking) from the resolved aliases: an effort
+    of none switches thinking off, a word asks for it."""
     thinking = aliases.get("enable_thinking")
     if "reasoning_effort" not in aliases:
         return None, thinking
-    level = map_effort(aliases["reasoning_effort"])
+    level = normalise_effort(aliases["reasoning_effort"])
     if level is None:
         return None, False if thinking is None else thinking
     return level, thinking
@@ -298,6 +305,16 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
+    cap = effort_capability(tokenizer)
+    effort_kwarg = cap.kwarg or "reasoning_effort"
+    if req.reasoning_effort and cap.kwarg and effort_kwarg not in kwargs:
+        # The client's word, as this template takes it: unchanged when it
+        # does not check, the nearest rung it accepts when it does; a
+        # template without the kwarg gets nothing.
+        value = translate_effort(req.reasoning_effort, cap)
+        if value is not None:
+            kwargs[effort_kwarg] = value
+            req.template_kwargs[effort_kwarg] = value
 
     def render(**extra):
         return tokenizer.apply_chat_template(
@@ -307,7 +324,7 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             **{**kwargs, **extra},
         )
 
-    level = kwargs.get("reasoning_effort")
+    level = kwargs.get(effort_kwarg)
     try:
         tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
@@ -315,12 +332,15 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             raise ApiError(
                 f"the chat template rejected the messages: {e}", param="messages"
             ) from None
-        # The template knows the levels but not this name: climb the ladder
-        # and remember the rung that rendered, so every re-render agrees.
+        # The template rejects this word after all (it answers differently
+        # with tools in the context, say): climb the ladder and remember
+        # the rung that rendered, so every re-render agrees.
         tokens = None
-        for candidate in effort_candidates(level)[1:]:
+        rungs = list(effort_candidates(level)[1:])
+        rungs += [w for w in cap.levels if w not in rungs and w != level]
+        for candidate in rungs:
             try:
-                tokens = render(reasoning_effort=candidate)
+                tokens = render(**{effort_kwarg: candidate})
             except Exception as e2:  # noqa: BLE001
                 if not is_effort_rejection(e2):
                     raise ApiError(
@@ -328,12 +348,12 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
                         param="messages",
                     ) from None
                 continue
-            req.template_kwargs["reasoning_effort"] = candidate
+            req.template_kwargs[effort_kwarg] = candidate
             break
         if tokens is None:
             raise ApiError(
-                f"the chat template accepts none of the reasoning_effort levels "
-                f"{', '.join(effort_candidates(level))}: {e}",
+                f"the chat template accepts none of the {effort_kwarg} levels "
+                f"{', '.join([level, *rungs])}: {e}",
                 param="reasoning_effort",
             ) from None
     if not tokens:
