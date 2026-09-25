@@ -28,6 +28,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   the accepted tokens again. Before, a store entry longer than the window
   was usable only as an exact match, and a full window ended the
   speculative path with an error that took the engine down.
+- `--exact-verify`: `positions` runs the verify one token per forward and
+  stops at the first rejected draft - exact by construction at plain
+  decoding's cost, the reference; `kernels` runs the block forward through
+  projections and attention that keep single-row arithmetic (kernels
+  vendored from mlx-vlm, MIT) and keeps them only when the warm-up finds
+  them bit-equal to single forwards on this machine, else falls back to
+  the block verify and says so. In every mode `/health.speculative.exact`
+  reports the warm-up width check: does the block forward give the same
+  logits as single forwards here (`block_equals_positions`,
+  `max_abs_logit_diff`, `argmax_equal`).
 - The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
   what a partial rollback needs, the rollback replays the selective scan
   over the accepted prefix, bit for bit against a forward of those tokens.

@@ -19,6 +19,7 @@ from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
+from mlx_beam.engine import exact
 from mlx_beam.engine.kv import (
     KVPolicy,
     describe_caches,
@@ -41,7 +42,11 @@ from mlx_beam.engine.request import (
     TokenEvent,
 )
 from mlx_beam.engine.sampling import SamplerPool, is_greedy, top_logprobs
-from mlx_beam.engine.speculative import SpeculativeGenerationBatch, Speculator
+from mlx_beam.engine.speculative import (
+    SpeculativeGenerationBatch,
+    Speculator,
+    width_check,
+)
 from mlx_beam.engine.thinking import (
     ContextTooLong,
     ThinkingBudget,
@@ -169,6 +174,7 @@ class Engine:
         max_queued: int | None = None,
         proposer: Any = None,
         max_draft_tokens: int = 3,
+        exact_verify: str = "off",
     ):
         self.model = model
         self.model_key = model_key
@@ -189,6 +195,18 @@ class Engine:
             self.speculator = Speculator(
                 proposer, proposer.depth, self._may_speculate, self._spec_bias.get
             )
+            if exact_verify not in ("off", "positions", "kernels"):
+                raise ValueError(
+                    f"exact_verify must be off, positions or kernels, got {exact_verify!r}"
+                )
+            # "positions": the reference mode, one forward per token (plain
+            # decoding's cost, exact by construction); "kernels": the block
+            # through the exact projections, kept only if the warm-up check
+            # finds it bit-equal; "off": the block verify, whose width check
+            # /health reports either way.
+            self.speculator.mode = "block" if exact_verify == "off" else exact_verify
+            if exact_verify == "kernels":
+                self._exact_installed = exact.install(model)
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -747,6 +765,24 @@ class Engine:
                     "the speculative warm-up ran no verify cycle; the proposer "
                     "drafted nothing"
                 )
+            spec = self.speculator
+            probe = (list(self.warmup_tokens), spec.depth + 1)
+            spec.exact = width_check(self.model, self.kv_policy, *probe)
+            if spec.mode == "kernels":
+                kernels = width_check(self.model, self.kv_policy, *probe, exact=True)
+                kernels["installed"] = self._exact_installed
+                if kernels["block_equals_positions"]:
+                    spec.exact = kernels
+                else:
+                    # Not bit-equal here: the block verify it is, and health
+                    # says why the kernels are not in use.
+                    kernels["fallback"] = "block"
+                    kernels["reason"] = (
+                        "the exact kernels are not bit-equal on this machine"
+                    )
+                    spec.exact = kernels
+                    spec.mode = "block"
+                    exact.uninstall(self.model)
         self._last_step = time.monotonic()
 
     def _loop(self) -> None:

@@ -34,6 +34,7 @@ from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, BatchRotatingKVCac
 from mlx_beam._vendor.mlx_lm.models.gated_delta import gated_delta_update
 from mlx_beam._vendor.mlx_lm.models.ssm import ssm_update
 from mlx_beam._vendor.mlx_lm.sample_utils import greedy_sampler
+from mlx_beam.engine.exact import exact_forward
 from mlx_beam.engine.proposer import Proposer, trunk
 
 
@@ -63,6 +64,17 @@ class Speculator:
         # one processor a verify can apply itself - it has no state and no
         # context, so every position gets the same add as a plain step does.
         self.logit_bias = logit_bias
+        # "block": one forward over the k+1 tokens (the fast path);
+        # "kernels": the same block through the exact projections and
+        # per-query attention (mlx_beam.engine.exact), checked at warm-up
+        # against single forwards and dropped to "block" when not bit-equal;
+        # "positions": one forward per token, stopping at the first
+        # rejected draft - exact by construction, plain decoding's cost, the
+        # reference the other two are measured against.
+        self.mode = "block"
+        # The warm-up's width check: the block forward against single
+        # forwards from the same state, logits compared bit for bit.
+        self.exact: dict | None = None
         self.cycles = 0
         self.plain_steps = 0
         self.drafted = 0
@@ -72,6 +84,8 @@ class Speculator:
         return {
             "proposer": self.proposer.describe(),
             "depth": self.depth,
+            "mode": self.mode,
+            "exact": self.exact,
             "cycles": self.cycles,
             "plain_steps": self.plain_steps,
             "drafted": self.drafted,
@@ -153,6 +167,47 @@ def rollback_recurrent(cache: ArraysCache, keep: int, total: int) -> None:
         raise RollbackUnsupported(f"recurrent stash of kind {kind!r} has no replay")
     cache[1] = state
     cache.advance(-(total - keep))
+
+
+def width_check(
+    model, policy, prompt: list[int], width: int, exact: bool = False
+) -> dict:
+    """Does a forward over `width` tokens give the same logits as `width`
+    forwards of one token from the same state? On Metal the answer is no
+    for the quantized matmul from two rows on (measured 2026-09-25); this
+    is the evidence /health carries for the block verify, and what the
+    kernel path (`exact=True`) is held to. Fresh caches under the policy,
+    the warm-up prompt prefilled, then the last `width` tokens of it again
+    as the probe."""
+    import copy
+
+    from mlx_beam.engine.kv import make_request_cache
+
+    probe = (prompt * width)[-width:]
+    cache_block = make_request_cache(model, policy)
+    mx.eval(model(mx.array([prompt]), cache=cache_block))
+    cache_single = copy.deepcopy(cache_block)
+    if exact:
+        with exact_forward():
+            block = model(mx.array([probe]), cache=cache_block)
+    else:
+        block = model(mx.array([probe]), cache=cache_block)
+    singles = mx.concatenate(
+        [model(mx.array([[t]]), cache=cache_single) for t in probe], axis=1
+    )
+    mx.eval(block, singles)
+    diff = mx.abs(block.astype(mx.float32) - singles.astype(mx.float32)).max()
+    return {
+        "width": width,
+        "path": "kernels" if exact else "block",
+        "block_equals_positions": bool(mx.array_equal(block, singles).item()),
+        "max_abs_logit_diff": float(diff.item()),
+        "argmax_equal": bool(
+            mx.array_equal(
+                mx.argmax(block, axis=-1), mx.argmax(singles, axis=-1)
+            ).item()
+        ),
+    }
 
 
 class SpeculativeGenerationBatch(GenerationBatch):
@@ -293,6 +348,61 @@ class SpeculativeGenerationBatch(GenerationBatch):
                 )
         return recurrent
 
+    def _logprobs(self, uid: int, logits: mx.array) -> mx.array:
+        bias = self.speculator.logit_bias(uid)
+        if bias is not None:
+            # The same scatter-add mlx-lm's processor does on one row.
+            indices, values = bias
+            logits = logits.at[:, :, indices].add(values)
+        return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    def _cycle_by_position(self, uid, y, lp_y, drafts, k):
+        """The verify one token at a time: feed y, read the model's token;
+        feed the draft only while it is that token. Nothing rejected ever
+        enters a cache, so nothing rolls back - the same forwards plain
+        decoding runs, and the same bytes (the check mode)."""
+        spec = self.speculator
+        drafts_l = drafts.tolist()
+        tokens = [int(y.item()), *drafts_l]
+        hiddens, logprob_rows = [], []
+        m = 0
+        for j, token in enumerate(tokens):
+            hidden, logits = self._forward(mx.array([[token]], dtype=y.dtype))
+            logprobs = self._logprobs(uid, logits)
+            nxt = int(mx.argmax(logprobs[0, -1]).item())
+            hiddens.append(hidden)
+            logprob_rows.append(logprobs[0, -1])
+            if j < k and nxt == drafts_l[j]:
+                m += 1
+            else:
+                break
+        spec.cycles += 1
+        spec.drafted += k
+        spec.accepted += m
+        hidden = mx.concatenate(hiddens, axis=1)  # (1, m + 1, H)
+        emitted = [(tokens[0], lp_y)] + [
+            (drafts_l[i], logprob_rows[i]) for i in range(m)
+        ]
+        responses, finish = self._emit(emitted)
+        sampled = mx.array([[int(mx.argmax(r).item()) for r in logprob_rows]])
+        return self._finish_cycle(
+            uid, responses, finish, sampled, logprob_rows, hidden, m, drafts_l
+        )
+
+    def _emit(self, emitted):
+        """Cut the cycle's tokens short at the row's own limits."""
+        responses, finish = [], None
+        for token, lp in emitted:
+            self._num_tokens[0] += 1
+            if self._num_tokens[0] >= self.max_tokens[0]:
+                finish = "length"
+            if self._matchers[0].advance(token):
+                finish = "stop"
+            responses.append((token, lp, finish))
+            if finish is not None:
+                break
+        return responses, finish
+
     def _cycle(self):
         spec = self.speculator
         uid = self.uids[0]
@@ -304,15 +414,16 @@ class SpeculativeGenerationBatch(GenerationBatch):
         if k == 0:
             return None
         inputs = mx.concatenate([y, drafts])[None]  # (1, 1 + k)
+        if spec.mode == "positions":
+            return self._cycle_by_position(uid, y, lp_y, drafts, k)
         recurrent = self._arm()
         try:
-            hidden, logits = self._forward(inputs)
-            bias = spec.logit_bias(uid)
-            if bias is not None:
-                # The same scatter-add mlx-lm's processor does on one row.
-                indices, values = bias
-                logits = logits.at[:, :, indices].add(values)
-            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            if spec.mode == "kernels":
+                with exact_forward():
+                    hidden, logits = self._forward(inputs)
+            else:
+                hidden, logits = self._forward(inputs)
+            logprobs = self._logprobs(uid, logits)
             sampled = mx.argmax(logprobs, axis=-1)  # (1, 1 + k)
             mx.eval(sampled, drafts)
             sampled_l, drafts_l = sampled[0].tolist(), drafts.tolist()
@@ -326,17 +437,8 @@ class SpeculativeGenerationBatch(GenerationBatch):
             # order, each cut short by the row's own limits.
             emitted: list[tuple[int, mx.array]] = [(int(y.item()), lp_y)]
             emitted += [(drafts_l[i], logprobs[0, i]) for i in range(m)]
-            responses, e, finish = [], 0, None
-            for token, lp in emitted:
-                e += 1
-                self._num_tokens[0] += 1
-                if self._num_tokens[0] >= self.max_tokens[0]:
-                    finish = "length"
-                if self._matchers[0].advance(token):
-                    finish = "stop"
-                responses.append((token, lp, finish))
-                if finish is not None:
-                    break
+            responses, finish = self._emit(emitted)
+            e = len(responses)
             total = 1 + k
             if e < total:
                 for i, c in enumerate(self.prompt_cache):
@@ -350,6 +452,24 @@ class SpeculativeGenerationBatch(GenerationBatch):
             for c in recurrent:
                 c.stash = None
             self._window_states = {}
+        return self._finish_cycle(
+            uid,
+            responses,
+            finish,
+            sampled,
+            [logprobs[0, i] for i in range(m + 1)],
+            hidden,
+            m,
+            drafts_l,
+        )
+
+    def _finish_cycle(
+        self, uid, responses, finish, sampled, logprob_rows, hidden, m, drafts_l
+    ):
+        """Book the cycle: committed tokens into the row, the token after the
+        accepted prefix as the next cycle's start, the proposer told what
+        held. `logprob_rows[i]` is the row at position i, i in 0..m."""
+        spec = self.speculator
         committed = [t for t, _, _ in responses]
         self.tokens[0].extend(committed)
         if self.logits_processors and self.logits_processors[0]:
@@ -359,7 +479,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
             # The target's token after the accepted prefix is the next
             # cycle's start; the hidden state that produced it drafts from.
             self._next_tokens = sampled[:, m]
-            self._next_logprobs = [logprobs[0, m]]
+            self._next_logprobs = [logprob_rows[m]]
             self._hidden_slot = hidden[:, m : m + 1, :]
             mx.async_eval(self._next_tokens, self._next_logprobs, self._hidden_slot)
             spec.proposer.commit(uid, hidden[:, :m, :], drafts_l[:m])

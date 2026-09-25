@@ -269,19 +269,40 @@ def test_system_prefix_is_reused_across_the_boundary(name):
     assert out == solo
 
 
+@pytest.mark.parametrize("mode", ["block", "positions", "kernels"])
 @pytest.mark.parametrize("name", list(CLASSES))
-def test_speculative_verify_matches_plain_greedy(name):
+def test_speculative_verify_matches_plain_greedy(name, mode):
     """Drafts right and wrong across a prompt longer than the window: every
     committed token is the plain greedy token, the rejected drafts are taken
-    back from sliding, recurrent and plain layers alike."""
+    back from sliding, recurrent and plain layers alike. The `positions`
+    mode never feeds a rejected draft and rolls nothing back; it is the
+    reference the block mode is measured against."""
     model = tiny(name)
     prompt = SYSTEM + A
     n = 12
     truth = plain(model, prompt, n)
     oracle = OracleProposer(lambda call: [0, 3, 1, 2, 0, 1][call % 6])
-    engine = run_speculative(model, oracle)
+    engine = run_speculative(
+        model, oracle, exact_verify="off" if mode == "block" else mode
+    )
     with engine:
         oracle.start(truth)
         out = collect(engine.submit(GenerationRequest(prompt, max_tokens=n)))
+        spec = engine.health()["speculative"]
     assert out == truth
-    assert engine.speculator.describe()["cycles"] > 0
+    assert spec["cycles"] > 0
+    assert set(spec["exact"]) >= {
+        "width",
+        "block_equals_positions",
+        "max_abs_logit_diff",
+        "argmax_equal",
+    }
+    if mode == "kernels":
+        # The tiny models are not quantized, so nothing gets swapped and the
+        # exact path is the per-query attention alone; either the check
+        # holds and the mode stays, or it falls back and says so.
+        assert spec["mode"] in ("kernels", "block")
+        if spec["mode"] == "block":
+            assert spec["exact"]["fallback"] == "block" and spec["exact"]["reason"]
+    else:
+        assert spec["mode"] == mode

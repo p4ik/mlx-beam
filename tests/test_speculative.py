@@ -646,3 +646,51 @@ def test_window_rollback_matches_a_shorter_feed(keep, fill):
     assert mx.array_equal(
         got_v[..., -min(8, fill + keep) :, :], want_v[..., -min(8, fill + keep) :, :]
     )
+
+
+# -- the exact verify: class swap, context, width check -----------------------
+
+
+def test_exact_install_swaps_the_quantized_projections_and_back():
+    import mlx.nn as nn
+
+    from mlx_beam.engine import exact
+    from tests.test_model_classes import tiny
+
+    model = tiny("gpt_oss")
+    nn.quantize(model, group_size=32, bits=8)
+    mx.eval(model.parameters())
+    counts = exact.install(model)
+    assert counts["linear"] > 0 and counts["switch"] > 0
+    kinds = {type(m).__name__ for _, m in model.named_modules()}
+    assert "ExactQuantizedLinear" in kinds and "QuantizedLinear" not in kinds
+    x = mx.array([[3, 7, 11, 13]])
+    # Outside the context the swapped classes run the stock path: same bytes.
+    before = model(x)
+    exact.uninstall(model)
+    kinds = {type(m).__name__ for _, m in model.named_modules()}
+    assert "ExactQuantizedLinear" not in kinds and "QuantizedLinear" in kinds
+    assert mx.array_equal(before, model(x))
+
+
+def test_width_check_reports_the_probe_and_the_kernel_path():
+    from mlx_beam.engine import KVPolicy, exact
+    from mlx_beam.engine.speculative import width_check
+    from tests.test_model_classes import tiny
+
+    model = tiny("mistral3")
+    plain = width_check(model, KVPolicy(), [3, 7, 11, 13, 17, 19, 23, 29], 4)
+    assert plain["width"] == 4 and plain["path"] == "block"
+    assert set(plain) >= {
+        "block_equals_positions",
+        "max_abs_logit_diff",
+        "argmax_equal",
+    }
+    exact.install(model)
+    kernels = width_check(
+        model, KVPolicy(), [3, 7, 11, 13, 17, 19, 23, 29], 4, exact=True
+    )
+    assert kernels["path"] == "kernels"
+    # Per-position projections and per-query attention: exact by construction
+    # where no Metal kernel is involved (the CPU here).
+    assert kernels["block_equals_positions"] is True

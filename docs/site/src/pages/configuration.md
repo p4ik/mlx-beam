@@ -83,6 +83,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 | Flag | Value | Default | What it does |
 |---|---|---|---|
 | `--draft-model` | text | — | the proposer that drafts tokens for the verify pass: 'bundled' takes the draft head the checkpoint ships (the package manifest's parts.mtp, config.json mtp_file, or mtp.* tensors in the shards); a repo or path for an external drafter is not supported yet |
+| `--exact-verify` | `off` / `kernels` / `positions` | `off` | how the verify runs: 'off' checks the k+1 drafts in one forward (the fast path; /health.speculative.exact says whether that forward gives the same logits as one-token forwards on this machine); 'kernels' runs that forward through projections and attention that keep single-row arithmetic for a block (vendored from mlx-vlm) and keeps them only if the warm-up finds them bit-equal, else falls back to 'off' and says so; 'positions' feeds one token per forward and stops at the first rejected draft - exact by construction at plain decoding's cost, the reference for the other two |
 | `--max-draft-tokens` | integer | `3` | cap on the drafts verified per cycle (default: 3, the fixed depth at this stage; a lower value lowers it) |
 
 ### Prompt cache

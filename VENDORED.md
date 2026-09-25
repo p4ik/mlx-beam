@@ -117,6 +117,12 @@ several tokens per call when a proposer drafts them and plainly otherwise.
 Nothing about the plain path changed: with the argument left out the
 default is upstream's class. Tests: `tests/test_speculative.py`.
 
+`exact verify` - `models/base.py`, `scaled_dot_product_attention`: with
+`EXACT_PER_QUERY` set (by `mlx_beam.engine.exact.exact_forward`) a block of
+L queries is attended one query at a time with its own mask row, so the
+quantized KV path sums the way plain decoding does; off, the function is
+upstream's.
+
 `recurrent stash` - `models/qwen3_5.py`, `models/qwen3_next.py`,
 `GatedDeltaNet.__call__`: when the layer's cache carries a `stash` attribute
 that is not None, the layer stores what a partial rollback needs - the conv
@@ -254,3 +260,38 @@ tiles - fp16 stops resolving the sum past a few thousand tokens. Tests:
 `test_tiled_sdpa_matches_stock`,
 `test_tiled_sdpa_matches_stock_with_a_batch_mask`,
 `test_prefill_takes_the_tiled_path`.
+
+## mlx-vlm
+
+Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, the PyPI wheel
+0.7.1 (`tools/vendor.toml`, part `mlx-vlm`). Two files only,
+`mlx_beam/_vendor/mlx_vlm/`:
+
+- `quantized_verifier.py` (`models/quantized_verifier.py` upstream): Metal
+  kernels for quantized projections that give, for a block of T rows, the
+  bytes T single-row calls give (affine 4/5/8 bit, group 32/64/128, plus
+  fixed-format and MoE variants), and the native per-position fallback
+  `_exact_time_batch`.
+- `exact_speculative_verify.py`: the dense GEMV block kernel, kept with its
+  neighbour; not called yet.
+
+### Local changes
+
+`switch import` - `quantized_verifier.py` imports `QuantizedSwitchLinear`
+from the vendored mlx-lm instead of mlx-vlm's own module; the class is the
+same one mlx-lm serves. Nothing else changed.
+
+### Where it is used
+
+`mlx_beam/engine/exact.py`: inside `exact_forward()` every
+`nn.QuantizedLinear` of the model (its class swapped to a subclass of ours at
+start, the instance and its weights untouched) projects through
+`optimized_affine_linear`, falling back to `_exact_time_batch`; the vendored
+`base.scaled_dot_product_attention` attends one query at a time under the
+same switch (`EXACT_PER_QUERY`, the `exact verify` change to `base.py`).
+The engine measures at warm-up whether that is bit-equal to single forwards
+(`speculative.width_check`) and keeps the block verify otherwise, saying so
+in `/health.speculative.exact`. Tests: `tests/test_speculative.py`
+(`test_exact_install_…`, `test_width_check_…`), the `kernels` mode of
+`tests/test_model_classes.py`. The Metal kernels themselves run on Apple
+silicon only; the CPU suite exercises the fallback path.

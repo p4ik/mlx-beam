@@ -118,6 +118,12 @@ def _packed_layout(queries, keys):
     return packed.shape[-1] * 32 // head_dim, head_dim // scales.shape[-1]
 
 
+# Set by mlx_beam.engine.exact for the duration of an exact forward: a
+# block of L queries is attended one query at a time, so the quantized KV
+# path sums like plain decoding does (VENDORED.md, exact verify).
+EXACT_PER_QUERY = False
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -127,6 +133,21 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    L = queries.shape[2]
+    if EXACT_PER_QUERY and L > 1 and mask is not None:
+        S = (keys[0] if isinstance(keys, (tuple, list)) else keys).shape[2]
+        rows = []
+        for i in range(L):
+            if isinstance(mask, mx.array):
+                row = mask[..., i : i + 1, :]
+            else:  # "causal": query i of the block sees the keys up to its own
+                row = (mx.arange(S) <= S - L + i)[None, None, None, :]
+            rows.append(
+                scaled_dot_product_attention(
+                    queries[:, :, i : i + 1], keys, values, cache, scale, row, sinks
+                )
+            )
+        return mx.concatenate(rows, axis=2)
     if hasattr(cache, "bits"):
         bits, group_size = cache.bits, cache.group_size
     elif isinstance(keys, (tuple, list)):
