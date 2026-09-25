@@ -13,6 +13,7 @@ the draft then agrees with the target exactly when both argmaxes agree.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -24,6 +25,8 @@ import mlx.nn as nn
 from mlx_beam._vendor.mlx_lm.models.base import create_attention_mask
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache
 from mlx_beam.package import part, read_manifest, verify_part_file
+
+logger = logging.getLogger("beam.proposer")
 
 
 class Proposer(Protocol):
@@ -472,17 +475,35 @@ class BundledHeadProposer:
         )
         return self.head(h_in, t_in, self._embed, cache), cache
 
+    def _rope(self):
+        """The head's rotary module, for keys that must change position."""
+        return getattr(getattr(self.head.layers[0], "self_attn", None), "rope", None)
+
+    def _windowed(self, keys, values):
+        """The last HEAD_HISTORY pairs of a restored history, as a head that
+        started at the window would hold them: the kept keys carry their
+        old positions, so each is rotated back by the count dropped - the
+        cache resumes at the window's length and the relative positions
+        stay what they were. Without a rotary module to do that with,
+        nothing is dropped (a wrong position is worse than a long history)."""
+        dropped = keys.shape[2] - HEAD_HISTORY
+        if dropped <= 0:
+            return keys, values
+        rope = self._rope()
+        if rope is None:
+            logger.warning("head history kept whole: no rotary module to rewind it")
+            return keys, values
+        kept = keys[:, :, -HEAD_HISTORY:, :]
+        # One position per row, so the rotation is the same -dropped for all.
+        rewound = rope(kept.reshape(-1, 1, kept.shape[-1]), offset=-dropped)
+        return rewound.reshape(kept.shape), values[:, :, -HEAD_HISTORY:, :]
+
     def begin(self, uid, prompt_len, snapshot):
         self.drop(uid)
         self._prompt_len[uid] = prompt_len
         if snapshot is not None:
             keys, values, tail = snapshot
-            if keys.shape[2] > HEAD_HISTORY:
-                # The window applies to a restored history as to a primed
-                # one: the last HEAD_HISTORY pairs (their positions are in
-                # the keys already, the head attends over what is there).
-                keys = keys[:, :, -HEAD_HISTORY:, :]
-                values = values[:, :, -HEAD_HISTORY:, :]
+            keys, values = self._windowed(keys, values)
             cache = KVCache()
             # Distinct array objects: the store's copy must not see the
             # in-place writes the cache makes from here on.

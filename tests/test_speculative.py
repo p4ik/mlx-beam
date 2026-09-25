@@ -968,6 +968,41 @@ def test_history_window_and_queue_cap(tmp_path, monkeypatch):
         assert not proposer._pending
 
 
+def test_a_restored_history_past_the_window_keeps_its_relative_positions(
+    monkeypatch,
+):
+    """A stored history longer than HEAD_HISTORY is cut to the window on
+    restore. The kept keys carry their old rotary positions; the cache
+    resumes at the window's length, so they are rotated back by the count
+    dropped - the next pair then sees them at the distances it would from
+    a head that started at the window."""
+    from mlx_beam.engine import proposer as mod
+
+    monkeypatch.setattr(mod, "HEAD_HISTORY", 4)
+    model = tiny_qwen35()
+    args = model.language_model.args
+    head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
+    mx.eval(head.parameters())
+    prop = mod.BundledHeadProposer(model, head, 3, {})
+    h = mx.random.normal((1, 8, args.hidden_size))
+    ids = mx.array([[3, 7, 11, 13, 5, 9, 2, 8]])
+    mx.eval(prop._feed(0, h, ids)[0])
+    snapshot = prop.snapshot(0)
+    assert snapshot[0].shape[2] == 8
+    prop.begin(1, 9, snapshot)
+    assert prop._cache[1][0].offset == 4
+    # A one-layer head's keys depend on each pair alone: a head fed the
+    # last four pairs from scratch is the reference.
+    prop.begin(2, 9, None)
+    mx.eval(prop._feed(2, h[:, -4:], ids[:, -4:])[0])
+    next_h = mx.random.normal((1, 1, args.hidden_size))
+    next_t = mx.array([[6]])
+    got = prop._feed(1, next_h, next_t)[0]
+    want = prop._feed(2, next_h, next_t)[0]
+    mx.eval(got, want)
+    assert mx.allclose(got, want, atol=1e-5, rtol=1e-4).item()
+
+
 def nextn_checkpoint(tmp_path, model, form_in_manifest="glm_nextn"):
     """A tiny GLM checkpoint whose NextN layer sits in `mtp/weights.safetensors`
     under the checkpoint's own names (`model.layers.<N>.*`, experts one by

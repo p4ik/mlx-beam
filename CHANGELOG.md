@@ -80,7 +80,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and at the end of a row is stored beside the prefix-cache entry, and a
   conversation that continues, or a request that shares the system block,
   resumes it from there. Prompts longer than 8192 tokens are primed from
-  their last 8192 positions on. `/health.speculative.proposer` counts
+  their last 8192 positions on, and a stored history longer than that is
+  cut to its last 8192 pairs on restore with their rotary positions
+  rewound, as a head that started at the window would hold them. `/health.speculative.proposer` counts
   `primed_pairs` and `histories_restored`. Measured before on the 27B
   head: 2.39 against 2.23 tokens per cycle with and without the prompt
   primed.
