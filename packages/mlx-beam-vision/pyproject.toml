@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mlx-beam-vision"
+dynamic = ["version"]
+description = "Vision towers for mlx-beam: images in the prompt, served by the checkpoint's own tower."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.11"
+authors = [{ name = "the mlx-beam contributors" }]
+keywords = ["mlx", "apple-silicon", "vlm", "vision", "inference"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "mlx-beam",
+  "mlx>=0.32; sys_platform == 'darwin'",
+  "transformers>=5.7",
+  "pillow>=10",
+  "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mlx[cpu]>=0.32; sys_platform == 'linux'"]
+
+# What mlx-beam looks for: one provider, dispatching by model type.
+[project.entry-points."mlx_beam.modalities"]
+vision = "mlx_beam_vision.provider"
+
+[project.urls]
+Homepage = "https://p4ik.github.io/mlx-beam/"
+Repository = "https://github.com/p4ik/mlx-beam"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = "../..", local_scheme = "no-local-version", version_scheme = "guess-next-dev" }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "mlx_beam_vision/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mlx_beam_vision"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["mlx_beam_vision", "tests", "README.md", "LICENSE", "NOTICE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

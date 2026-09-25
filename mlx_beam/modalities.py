@@ -89,7 +89,9 @@ def load_frontend(model, model_path, config: dict, tokenizer) -> Frontend | None
                 continue
             frontend = provider.load(model, model_path, config, tokenizer)
         except Exception as e:  # noqa: BLE001 - one provider's failure is its own
-            logger.warning("modality provider %s: %s", getattr(provider, "__name__", provider), e)
+            logger.warning(
+                "modality provider %s: %s", getattr(provider, "__name__", provider), e
+            )
             continue
         logger.info("modality: %s", frontend.describe())
         return frontend

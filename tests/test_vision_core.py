@@ -52,9 +52,15 @@ class FakeFrontend:
         tokens, spans = [2], []
         it = iter(images)
         for m in messages:
-            tokens.append({"system": 5, "user": 6, "assistant": 7, "tool": 8}[m["role"]])
+            tokens.append(
+                {"system": 5, "user": 6, "assistant": 7, "tool": 8}[m["role"]]
+            )
             content = m.get("content") or ""
-            parts = content if isinstance(content, list) else [{"type": "text", "text": content}]
+            parts = (
+                content
+                if isinstance(content, list)
+                else [{"type": "text", "text": content}]
+            )
             for part in parts:
                 if part["type"] == "text":
                     tokens += self._tok.encode(part["text"])
@@ -91,7 +97,9 @@ def reference(model, tokens, spans, n):
     def hook(i, x):
         for s in spans:
             if i < len(s.deepstack):
-                x[0, s.start : s.end, :] = x[0, s.start : s.end, :] + s.deepstack[i].astype(x.dtype)
+                x[0, s.start : s.end, :] = x[0, s.start : s.end, :] + s.deepstack[
+                    i
+                ].astype(x.dtype)
         return x
 
     out = lm_head(inner(ids, cache=cache, input_embeddings=h, layer_hook=hook))
@@ -109,9 +117,18 @@ def png(seed: int) -> Image:
 
 
 def request(front, images, text="w1", n=6):
-    messages = [{"role": "user", "content": [{"type": "text", "text": text}] + [{"type": "image"}] * len(images)}]
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": text}]
+            + [{"type": "image"}] * len(images),
+        }
+    ]
     built = front.build(messages, images, {})
-    return GenerationRequest(built.tokens, max_tokens=n, spans=tuple(built.spans)), built
+    return (
+        GenerationRequest(built.tokens, max_tokens=n, spans=tuple(built.spans)),
+        built,
+    )
 
 
 def test_prefill_embeds_the_spans_like_a_direct_forward():
@@ -121,7 +138,10 @@ def test_prefill_embeds_the_spans_like_a_direct_forward():
     req, built = request(front, [img])
     with Engine(model) as engine:
         out = [e.token for e in engine.submit(req)]
-        plain = [e.token for e in engine.submit(GenerationRequest(built.tokens, max_tokens=6))]
+        plain = [
+            e.token
+            for e in engine.submit(GenerationRequest(built.tokens, max_tokens=6))
+        ]
     assert out == reference(model, built.tokens, built.spans, 6)
     assert out != plain  # the placeholders' own embeddings give another text
 
@@ -139,7 +159,12 @@ def test_prefill_in_slices_and_beside_a_text_row():
         b = engine.submit(GenerationRequest([3, 7, 11, 13, 5, 9], max_tokens=6))
         out_a = [e.token for e in a]
         out_b = [e.token for e in b]
-        solo_b = [e.token for e in engine.submit(GenerationRequest([3, 7, 11, 13, 5, 9], max_tokens=6))]
+        solo_b = [
+            e.token
+            for e in engine.submit(
+                GenerationRequest([3, 7, 11, 13, 5, 9], max_tokens=6)
+            )
+        ]
     assert out_a == reference(model, built.tokens, built.spans, 6)
     assert out_b == solo_b
 
@@ -152,7 +177,9 @@ def test_the_store_keys_on_the_image_digest():
         req2, built2 = request(front, [png(4)])
         assert built1.tokens == built2.tokens  # same placeholders
         assert req1.cache_key != req2.cache_key
-        assert all(k < 0 for k in req1.cache_key[built1.spans[0].start : built1.spans[0].end])
+        assert all(
+            k < 0 for k in req1.cache_key[built1.spans[0].start : built1.spans[0].end]
+        )
         first = engine.submit(req1)
         [e.token for e in first]
         assert first.prompt_cached == 0
@@ -172,7 +199,10 @@ def test_api_decodes_data_urls_and_refuses_the_rest():
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "w1"},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{data}"},
+                    },
                 ],
             }
         ]
@@ -182,8 +212,20 @@ def test_api_decodes_data_urls_and_refuses_the_rest():
     assert exc.value.code == "extra_not_installed"
     req = chat.parse_chat_request(body, "m", vision=True)
     assert len(req.images) == 1 and req.images[0].media_type == "image/png"
-    assert req.messages[0]["content"] == [{"type": "text", "text": "w1"}, {"type": "image"}]
-    remote = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://x/y.png"}}]}]}
+    assert req.messages[0]["content"] == [
+        {"type": "text", "text": "w1"},
+        {"type": "image"},
+    ]
+    remote = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+                ],
+            }
+        ]
+    }
     with pytest.raises(ApiError, match="only data: URLs"):
         chat.parse_chat_request(remote, "m", vision=True)
     tok = StubTokenizer()
@@ -220,7 +262,12 @@ def test_served_reports_the_frontend_and_the_registry_finds_a_provider():
 
     modalities.register(Provider)
     try:
-        assert modalities.load_frontend(model, None, {"model_type": "qwen3_5"}, tok).name == "fake"
-        assert modalities.load_frontend(model, None, {"model_type": "llama"}, tok) is None
+        assert (
+            modalities.load_frontend(model, None, {"model_type": "qwen3_5"}, tok).name
+            == "fake"
+        )
+        assert (
+            modalities.load_frontend(model, None, {"model_type": "llama"}, tok) is None
+        )
     finally:
         modalities._registered.remove(Provider)

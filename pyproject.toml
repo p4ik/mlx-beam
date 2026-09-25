@@ -38,9 +38,15 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pre-commit>=4",
+  "import-linter>=2",
   # CPU build of MLX so the tests run on Linux too (Apple silicon stays the reference).
   "mlx[cpu]>=0.32; sys_platform == 'linux'",
 ]
+# The extra is the installation selector for the package that serves images
+# (packages/mlx-beam-vision in this repository, its own project on PyPI).
+# The core never imports it: it is found through the entry-point group
+# mlx_beam.modalities.
+vision = ["mlx-beam-vision"]
 
 [project.scripts]
 beam = "mlx_beam.cli:main"
@@ -82,7 +88,7 @@ profile = "black"
 [tool.ruff]
 line-length = 88
 target-version = "py311"
-extend-exclude = ["mlx_beam/_vendor"]
+extend-exclude = ["mlx_beam/_vendor", "packages/*/*/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]
@@ -91,3 +97,21 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["exactness: bit-exact comparisons on tiny models (Apple silicon only)"]
+
+# One workspace: the core and the packages beside it are developed and
+# tested together; on PyPI each is its own project.
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+mlx-beam-vision = { workspace = true }
+
+# The boundary the extra promises: the core knows no tower. Checked in CI.
+[tool.importlinter]
+root_packages = ["mlx_beam", "mlx_beam_vision"]
+
+[[tool.importlinter.contracts]]
+name = "the core never imports the vision package"
+type = "forbidden"
+source_modules = ["mlx_beam"]
+forbidden_modules = ["mlx_beam_vision"]
