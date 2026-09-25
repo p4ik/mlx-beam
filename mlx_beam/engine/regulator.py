@@ -31,6 +31,9 @@ HEAD_SHARE = 0.056
 PRIOR_ACCEPTANCE = (0.87, 0.79, 0.74, 0.66)
 # Cycles between probes of a neighbouring depth, so its cost stays current.
 PROBE_EVERY = 32
+# Cycles between one measured plain step, so the cost the cycles are held
+# against is the plain step at the current context, not the warm-up's.
+PLAIN_EVERY = 64
 
 
 class Regulator:
@@ -88,18 +91,24 @@ class Regulator:
     def choose(self) -> int:
         """The depth for the next cycle: 0 while parked, else the depth with
         the best expected rate - with a probe of a neighbour now and then so
-        its cost does not go stale."""
+        its cost does not go stale, and a measured plain step now and then
+        so the plain cost follows the context the cycles run in."""
         if self.fixed is not None:
             self.depth = self.fixed
             return self.fixed
         if self.parked:
             return 0
         if self.plain_cost is None:
-            self.depth = self.cap  # nothing measured yet: the cap, and measure
-            return self.depth
+            # Nothing measured yet: one plain step first, the price every
+            # cycle is held against; the cap follows and measures itself.
+            self.depth = 0
+            return 0
+        self._cycles += 1
+        if self._cycles % PLAIN_EVERY == 0:
+            self.depth = 0
+            return 0
         rates = {k: self.rate(k) for k in range(1, self.cap + 1)}
         best = max(rates, key=lambda k: rates[k])
-        self._cycles += 1
         if self._cycles % PROBE_EVERY == 0:
             neighbours = [k for k in (best - 1, best + 1) if 1 <= k <= self.cap]
             if neighbours:
@@ -107,11 +116,44 @@ class Regulator:
         self.depth = best
         return best
 
+    def skipped(self) -> None:
+        """The chosen cycle did not run (the row was not eligible): the
+        choice does not count as a cycle for the probe and plain cadence."""
+        if self._cycles > 0:
+            self._cycles -= 1
+
+    def reset(self) -> None:
+        """Forget what the warm-up measured: its cycles ran cold (first
+        shapes, kernels compiled on the way) over a prompt of a few tokens,
+        and its acceptance is one greedy row's - none of it is this
+        machine's steady state. The priors come back; the first real cycles
+        measure."""
+        self.acceptance = [
+            PRIOR_ACCEPTANCE[min(i, len(PRIOR_ACCEPTANCE) - 1)] for i in range(self.cap)
+        ]
+        self._seen = [0] * self.cap
+        self.plain_cost = None
+        self.cycle_cost = {}
+        self.depth = self.cap
+        self.losses = 0
+        self.parked = False
+        self.cooldown = 0
+        self._next_cooldown = COOLDOWN_MIN
+        self.parks = 0
+        self.tokens_saved = 0
+        self._cycles = 0
+
     # -- observations -----------------------------------------------------------
 
-    def observe_cycle(self, k: int, accepted: int, seconds: float) -> None:
-        """A cycle at depth k committed `accepted` drafts in `seconds`."""
+    def observe_cycle(
+        self, k: int, accepted: int, seconds: float, rejected: bool = True
+    ) -> None:
+        """A cycle over k drafts committed `accepted` of them in `seconds`;
+        `rejected` says the position after the accepted ones was compared
+        and refused (false when the row's limit ended the cycle first)."""
         for i in range(k):
+            if i >= accepted and not rejected:
+                break  # never compared: no verdict for this position
             held = 1.0 if i < accepted else 0.0
             if self._seen[i] == 0:
                 self.acceptance[i] = held

@@ -32,7 +32,6 @@ from mlx_beam._vendor.mlx_lm.models import base
 from mlx_beam._vendor.mlx_lm.models.switch_layers import QuantizedSwitchLinear
 from mlx_beam._vendor.mlx_vlm.quantized_verifier import (
     _exact_time_batch,
-    exact_quantized_switch_linear,
     optimized_affine_linear,
     supports_quantization,
 )
@@ -44,18 +43,17 @@ _ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 @contextmanager
 def exact_forward():
-    """Every projection and attention inside runs in its exact form."""
+    """Every projection and attention inside runs in its exact form. The
+    module flag the vendored attention reads is restored to what it was,
+    so a nested or a concurrent use does not switch it off underneath."""
     token = _ACTIVE.set(True)
+    before = base.EXACT_PER_QUERY
     base.EXACT_PER_QUERY = True
     try:
         yield
     finally:
         _ACTIVE.reset(token)
-        base.EXACT_PER_QUERY = False
-
-
-def active() -> bool:
-    return _ACTIVE.get()
+        base.EXACT_PER_QUERY = before
 
 
 class ExactQuantizedLinear(nn.QuantizedLinear):
@@ -115,6 +113,3 @@ def uninstall(model) -> None:
             module.__class__ = nn.QuantizedLinear
         elif type(module) is ExactQuantizedSwitchLinear:
             module.__class__ = QuantizedSwitchLinear
-
-
-_ = exact_quantized_switch_linear  # kept importable for the MoE path's callers

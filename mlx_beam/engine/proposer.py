@@ -146,8 +146,6 @@ class NextNHead(nn.Module):
     `deepseek_mtp.py`; the paper writes the pair the other way round) -
     to be held against acceptance on the real package."""
 
-    form = "glm_nextn"
-
     def __init__(self, args, layer_class, own_embed: bool, own_head: bool):
         super().__init__()
         self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -434,10 +432,30 @@ class BundledHeadProposer:
         old_h, old_t = self._pending.get(uid, ([], []))
         hs, ts = old_h + hs, old_t + ts
         if len(ts) > PENDING_CAP:
-            self._cache.pop(uid, None)
-            hs = [mx.concatenate(hs, axis=1)[:, -PENDING_CAP:, :]]
-            ts = ts[-PENDING_CAP:]
+            # Long plain runs (a row beside others): the queue goes into the
+            # head now, in one call, so the history stays whole - throwing
+            # the cache away would cost a third of the acceptance later.
+            self._pending[uid] = (hs, ts)
+            self._flush(uid)
+            return
         self._pending[uid] = (hs, ts)
+
+    def _flush(self, uid: int):
+        """The queued pairs into the head in one call; nothing pending after."""
+        hs, ts = self._pending.pop(uid, ([], []))
+        if not ts:
+            return None
+        cache = self._cache.get(uid)
+        if cache is None:
+            cache = self._cache[uid] = [KVCache()]
+        out = self.head(
+            mx.concatenate(hs, axis=1),
+            mx.array([ts], dtype=mx.int32),
+            self._embed,
+            cache,
+        )
+        mx.eval(out, *cache[0].state)
+        return out
 
     def _feed(self, uid: int, hidden: mx.array, tokens: mx.array):
         """Queued pairs first, then these: one head call, its output the
@@ -459,6 +477,12 @@ class BundledHeadProposer:
         self._prompt_len[uid] = prompt_len
         if snapshot is not None:
             keys, values, tail = snapshot
+            if keys.shape[2] > HEAD_HISTORY:
+                # The window applies to a restored history as to a primed
+                # one: the last HEAD_HISTORY pairs (their positions are in
+                # the keys already, the head attends over what is there).
+                keys = keys[:, :, -HEAD_HISTORY:, :]
+                values = values[:, :, -HEAD_HISTORY:, :]
             cache = KVCache()
             # Distinct array objects: the store's copy must not see the
             # in-place writes the cache makes from here on.
@@ -511,7 +535,13 @@ class BundledHeadProposer:
             )
         keys, values = cache[0].keys_and_values()
         tail = self._tail.get(uid)
-        arrays = [mx.contiguous(keys), mx.contiguous(values), tail]
+        # Contiguous copies: the tail is a slice of a whole prefill chunk's
+        # hidden state, which would otherwise stay alive in the store.
+        arrays = [
+            mx.contiguous(keys),
+            mx.contiguous(values),
+            None if tail is None else mx.contiguous(tail),
+        ]
         mx.eval(*[a for a in arrays if a is not None])
         return arrays
 

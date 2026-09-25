@@ -613,21 +613,31 @@ class Engine:
             # engine's own stream, both exact draws from the same
             # distribution.
             p = req.sampling
-            if is_greedy(p):
-                coupling = None
-            elif isinstance(sampler, SeededSampler):
-                coupling = sampler
-            else:
-                coupling = SeededSampler(
-                    p, seed=int(mx.random.randint(0, 2**62).item())
+            try:
+                if is_greedy(p):
+                    coupling = None
+                elif isinstance(sampler, SeededSampler):
+                    coupling = sampler
+                else:
+                    coupling = SeededSampler(
+                        p, seed=int(mx.random.randint(0, 2**62).item())
+                    )
+                self._spec_coupling[uid] = coupling
+                # The head's history over the prompt: resumed from the store
+                # when it has one at the position the prefill starts, primed
+                # over the rest by the prefill.
+                self.speculator.proposer.begin(
+                    uid, len(req.tokens), carried.get(covered, {}).get(HEAD)
                 )
-            self._spec_coupling[uid] = coupling
-            # The head's history over the prompt: resumed from the store
-            # when it has one at the position the prefill starts, primed
-            # over the rest by the prefill.
-            self.speculator.proposer.begin(
-                uid, len(req.tokens), carried.get(covered, {}).get(HEAD)
-            )
+            except Exception as e:  # noqa: BLE001 - this row's, not the worker's
+                # Admitted a moment ago: take it back before anything runs.
+                gen.remove([uid])
+                self._live.pop(uid, None)
+                self._bookkeeping.pop(uid, None)
+                self._stride.pop(uid, None)
+                self._budgets.pop(uid, None)
+                self._forget_row(uid)
+                stream.put(e)
 
     def _checkpoint(
         self, gen: BatchGenerator, uid: int, position: int, windows: bool = True
@@ -763,6 +773,7 @@ class Engine:
             _, generated = gen.next()
             if any(r.uid == uid and r.finish_reason for r in generated):
                 break
+        self._forget_row(uid)
         self._applied_caches = describe_caches(cache)
         if self.speculator is not None:
             # One verify cycle through the model with the configured KV
@@ -790,9 +801,19 @@ class Engine:
             probe = (list(self.warmup_tokens), spec.depth + 1)
             spec.exact = width_check(self.model, self.kv_policy, *probe)
             if spec.mode == "kernels":
+                # Every width a cycle can run (2 .. cap + 1): the kernels are
+                # chosen by width, one that is exact at the cap may not be
+                # at a shallower depth the regulator picks.
                 kernels = width_check(self.model, self.kv_policy, *probe, exact=True)
                 kernels["installed"] = self._exact_installed
-                if kernels["block_equals_positions"]:
+                widths = {}
+                for width in range(2, spec.depth + 2):
+                    r = width_check(
+                        self.model, self.kv_policy, probe[0], width, exact=True
+                    )
+                    widths[width] = r["block_equals_positions"]
+                kernels["widths"] = widths
+                if all(widths.values()):
                     spec.exact = kernels
                 else:
                     # Not bit-equal here: the block verify it is, and health
@@ -804,6 +825,9 @@ class Engine:
                     spec.exact = kernels
                     spec.mode = "block"
                     exact.uninstall(self.model)
+            # The warm-up's measurements are cold (first shapes, a prompt of
+            # a few tokens): the regulator starts over from its priors.
+            spec.regulator.reset()
         self._last_step = time.monotonic()
 
     def _loop(self) -> None:

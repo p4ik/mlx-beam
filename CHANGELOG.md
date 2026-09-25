@@ -140,6 +140,25 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   exact everywhere.
 
 ### Fixed
+- The depth regulator measures a plain step every 64 cycles, so the cost
+  the cycles are held against is the plain step at the current context
+  rather than the warm-up's; it starts over after the warm-up (whose
+  cycles ran cold over a few tokens) and takes one plain step first. A
+  cycle the row was not eligible for no longer counts, the acceptance is
+  learned from the drafts actually made, and a position the row's limit
+  cut before it was compared is not booked as a refusal.
+- The draft head's history stays whole when a row decodes plainly for
+  long beside others: the queued pairs go into the head as the queue
+  fills instead of restarting the history from the queue alone. A history
+  restored from the store is cut to the same window as a primed one. The
+  hidden-state tail kept for a store snapshot is a contiguous copy, not a
+  slice that held a whole prefill chunk alive. The warm-up row leaves the
+  head's tables.
+- `--exact-verify kernels` checks every width a cycle can run (2 to the
+  cap plus one), not only the widest, before it trusts the kernels;
+  `exact_forward` restores the attention flag it found.
+- A proposer or sampler that fails at admission fails that request, not
+  the worker.
 - The per-position verify (`--exact-verify positions`) checks the row's
   stop and length limits on each token before it feeds the next: nothing
   past the cut enters the caches, the stored entry is exactly what was

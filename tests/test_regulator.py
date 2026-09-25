@@ -49,11 +49,13 @@ def test_expected_tokens_and_rates_follow_the_chain():
     assert reg.choose() == 1
 
 
-def test_nothing_measured_runs_the_cap_and_measures():
+def test_nothing_measured_takes_a_plain_step_then_the_cap():
     reg = Regulator(3)
     assert reg.cost(1) is None and reg.rate(1) is None
-    assert reg.choose() == 3
+    # The price every cycle is held against comes first, then the cap.
+    assert reg.choose() == 0
     reg.observe_plain(0.010)
+    assert reg.choose() == 3
     reg.observe_cycle(3, 2, 0.012)
     assert reg.plain_cost == 0.010 and reg.cycle_cost == {3: 0.012}
     # First observation sets a position, later ones smooth it; the chain

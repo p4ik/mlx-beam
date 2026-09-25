@@ -15,13 +15,13 @@ draw - no residual distribution, no draft probabilities: the noise does not
 depend on the logits, so the committed token at every position has exactly
 the target's distribution whatever was drafted (measured against
 Leviathan/Chen under the production sampler: within 0.005, 2026-09-19).
-Against plain decoding, one token per forward, that agrees up to the
-rounding of kernels that run at a different width: in bf16 the two were
-bit-identical in every measured case (recurrent layers, Metal, head dims 32
-and 128, 2026-09-24), in float32 the projections of a four-token forward
-differ from a one-token forward by ~1e-8, so a logit tie can fall the other
-way. Nothing here can close that gap: the inputs of every layer already
-come from the wider forward below it.
+Against plain decoding, one token per forward, the block verify agrees up
+to the rounding of kernels that run at a different width (on Metal the
+quantized matmul from two rows on, the multi-query attention; the warm-up
+width check in /health says whether this machine rounds the same). The two
+exact modes close that gap: `positions` runs one forward per token and is
+exact by construction, `kernels` runs the block through per-row kernels and
+keeps them only where its own check finds them bit-equal (exact.py).
 
 Rows speculate one at a time (measured: a batch of four gains under 1.2x on
 this hardware without a small-M kernel, 2026-09-19). Logits processors run
@@ -125,7 +125,7 @@ def rollback_window(cache, before: tuple, keep: int, total: int) -> None:
     kept_keys = cache.keys[..., n - total : n - total + keep, :]
     kept_values = cache.values[..., n - total : n - total + keep, :]
     cache.state = before
-    if keep:
+    if keep:  # a cycle always keeps y; a direct caller may keep nothing
         cache.update_and_fetch(mx.contiguous(kept_keys), mx.contiguous(kept_values))
 
 
@@ -245,8 +245,9 @@ class SpeculativeGenerationBatch(GenerationBatch):
     # -- the plain step, with the hidden state kept ---------------------------
 
     def _forward(self, inputs: mx.array):
-        """(post-norm hidden, logits): the model's own two halves, called
-        one after the other - the same ops as the model's __call__."""
+        """(post-norm hidden, logits): the model's two halves called one after
+        the other, the head with the model's own logit post-processing
+        (`trunk`, held to the model's forward at warm-up by `check_head`)."""
         hidden = self._inner(inputs, cache=self.prompt_cache)
         return hidden, self._lm_head(hidden)
 
@@ -353,15 +354,24 @@ class SpeculativeGenerationBatch(GenerationBatch):
             return super().next()
         spec = self.speculator
         k = spec.regulator.choose()
-        if k == 0 or not spec.eligible(self.uids[0], k + 1):
+        if k == 0:
+            return self._plain(measure=True)
+        if not spec.eligible(self.uids[0], k + 1):
+            spec.regulator.skipped()
             return self._plain(measure=True)
         tic = time.perf_counter()
-        accepted = spec.accepted
+        accepted, drafted = spec.accepted, spec.drafted
+        self._compared = True
         responses = self._cycle(k)
         if responses is None:
+            spec.regulator.skipped()
             return self._plain(measure=True)
+        # What the proposer actually drafted, not the depth asked for.
         spec.regulator.observe_cycle(
-            k, spec.accepted - accepted, time.perf_counter() - tic
+            spec.drafted - drafted,
+            spec.accepted - accepted,
+            time.perf_counter() - tic,
+            rejected=self._compared,
         )
         return responses
 
@@ -457,10 +467,13 @@ class SpeculativeGenerationBatch(GenerationBatch):
             finish = self._limit(token)
             responses.append((token, lp_y if j == 0 else logprob_rows[j - 1], finish))
             if finish is not None:
+                # Ended by the row's limit: draft j was never compared.
+                self._compared = j >= k
                 break
             if j < k and int(nxt.item()) == drafts_l[j]:
                 m += 1
             else:
+                self._compared = j < k
                 break
         spec.cycles += 1
         spec.drafted += k
@@ -524,6 +537,8 @@ class SpeculativeGenerationBatch(GenerationBatch):
             m = 0
             while m < k and sampled_l[m] == drafts_l[m]:
                 m += 1
+            # All k held: no position was refused; else draft m was.
+            self._compared = m < k
             spec.cycles += 1
             spec.drafted += k
             spec.accepted += m

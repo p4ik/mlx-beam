@@ -86,7 +86,9 @@ class OracleProposer:
         right = self.plan(self.calls)
         drafts = []
         for i in range(self.depth if depth is None else depth):
-            true = seq[pos + 1 + i] if pos + 1 + i < len(seq) else 0
+            if pos + 1 + i >= len(seq):
+                break  # the script ends here: nothing to draft beyond it
+            true = seq[pos + 1 + i]
             drafts.append(true if i < right else (true + 1) % 64)
         return mx.array(drafts, dtype=mx.uint32)
 
@@ -192,11 +194,18 @@ def test_health_reports_the_cycle_counters():
     with engine:
         h = engine.health()["speculative"]
         assert h["proposer"]["kind"] == "oracle" and h["max_depth"] == 3
-        assert 1 <= h["depth"] <= 3
         assert h["cycles"] >= 1 and h["parked"] is False
         reg = h["regulator"]
-        assert reg["cost_ms"]["plain"] is not None and reg["cost_ms"]["cycle"]
+        # After the warm-up the regulator starts over: nothing measured,
+        # the priors in place, the cap as the depth to come.
+        assert reg["cost_ms"]["plain"] is None and not reg["cost_ms"]["cycle"]
         assert len(reg["acceptance_by_position"]) == 3 and reg["reason"] is None
+        oracle.start(plain_transcript(model, [3, 7, 11], 12))
+        collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=12)))
+        reg = engine.health()["speculative"]["regulator"]
+        # One plain step measured first, then cycles at the cap.
+        assert reg["cost_ms"]["plain"] is not None and reg["cost_ms"]["cycle"]
+        assert 1 <= reg["depth"] <= 3
 
 
 def test_finish_inside_a_block_trims_the_block():
@@ -952,7 +961,11 @@ def test_history_window_and_queue_cap(tmp_path, monkeypatch):
         oa, _ = collect(sa), collect(sb)
         entry = engine.prefix_store._trie.get(engine.model_key, [3, 7, 11] + oa)
         keys, _, _ = entry.checkpoints[3 + len(oa)][HEAD]
-        assert keys.shape[2] <= 3 + 1
+        # Two rows decode plainly, the queue fills past the cap and goes
+        # into the head as it fills: the history stays whole (the prompt's
+        # pairs and every plain step's), nothing pending, nothing dropped.
+        assert keys.shape[2] == 3 + len(oa) - 1
+        assert not proposer._pending
 
 
 def nextn_checkpoint(tmp_path, model, form_in_manifest="glm_nextn"):
