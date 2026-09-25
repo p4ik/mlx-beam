@@ -122,7 +122,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   parts as `data:` URLs (nothing is fetched; a base64 payload may be
   wrapped in lines); an image request goes through the same effort
   ladder and template checks as text, and a processor's refusal is the
-  client's 400. What serves the images is a separate package found
+  client's 400. The frontend says where the assistant's own turn begins
+  in the prompt, so a think marker inside a user message beside an image
+  is text, not an open block. What serves the images is a separate package found
   through the entry-point group `mlx_beam.modalities`; without one the
   core answers image input with a 400 that says what is missing and
   points at `/health.vision`. A frontend states what it needs of the

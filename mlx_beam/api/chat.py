@@ -65,6 +65,11 @@ class ChatRequest:
     min_response_tokens: int | None = None
     max_prompt_tokens: int | None = None
     template_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Where the assistant's own turn begins in the prompt (set by
+    # build_prompt): the marker search that seeds the reasoning state looks
+    # only from here - a `<think>` or a ` to=` inside a user message is
+    # text, not an open block.
+    assistant_start: int = 0
     # Images in the order their parts appear in the messages, and the
     # spans the frontend built for them (set by build_prompt).
     images: list[Image] = field(default_factory=list)
@@ -366,6 +371,7 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
         if req.images:
             built = frontend.build(req.messages, req.images, {**kwargs, **extra})
             req.spans = list(built.spans)
+            req.assistant_start = built.assistant_start
             return built.tokens
         return tokenizer.apply_chat_template(
             req.messages,

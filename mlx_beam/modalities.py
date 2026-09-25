@@ -46,10 +46,13 @@ class Image:
 @dataclass
 class Built:
     """A frontend's result: the prompt's token ids with the placeholders
-    expanded, and the image spans by position."""
+    expanded, the image spans by position, and where the assistant's own
+    turn begins in the tokens (0 when the frontend cannot tell: the whole
+    prompt is then searched for an open think block)."""
 
     tokens: list[int]
     spans: list[ImageSpan] = field(default_factory=list)
+    assistant_start: int = 0
 
 
 class Frontend(Protocol):

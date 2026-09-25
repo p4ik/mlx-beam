@@ -67,11 +67,13 @@ def pixels(grid):
 
 class Rendered(str):
     """What the fake template renders: a str for the frontend's BOS check
-    (a real processor renders text), carrying the messages the fake
-    tokenizer reads."""
+    and assistant-frame probe (a real processor renders text), carrying
+    the messages the fake tokenizer reads. The generation prompt is the
+    frame `<gen>`, one token (7) in the fake's ids."""
 
-    def __new__(cls, messages, with_bos):
-        self = super().__new__(cls, "<bos>..." if with_bos else "...")
+    def __new__(cls, messages, with_bos, generation_prompt=True):
+        base = "<bos>..." if with_bos else "..."
+        self = super().__new__(cls, base + ("<gen>" if generation_prompt else ""))
         self.messages = messages
         return self
 
@@ -82,6 +84,9 @@ class FakeProcessor:
 
     class Tok:
         bos_token = "<bos>"
+
+        def encode(self, text, add_special_tokens=True):
+            return [7] if text == "<gen>" else [9] * len(text)
 
     tokenizer = Tok()
 
@@ -96,7 +101,7 @@ class FakeProcessor:
         self, messages, tokenize=False, add_generation_prompt=True, **kw
     ):
         self.template_kwargs.append(kw)
-        return Rendered(messages, self.with_bos)
+        return Rendered(messages, self.with_bos, add_generation_prompt)
 
     def __call__(self, text, images=None, return_tensors="np", **kw):
         self.calls.append(kw)
@@ -178,6 +183,9 @@ def test_frontend_builds_spans_and_caches_by_digest():
     built = front.build(messages, [a, b], {})
     assert [(s.start, s.end) for s in built.spans] == [(3, 7), (7, 10)]
     assert built.tokens[3:10] == [TOWER_CONFIG["image_token_id"]] * 7
+    # The assistant's frame is the last token; the search for an open
+    # think block starts there, not in the user's text.
+    assert built.assistant_start == len(built.tokens) - 1
     assert built.spans[0].digest == a.digest and built.spans[1].deepstack[1].shape == (
         3,
         32,
@@ -217,7 +225,9 @@ def test_frontend_guards_the_prompt_and_the_pixels():
     ]
     front.build(messages, [png(1)], {"enable_thinking": False})
     assert proc.calls == [{"add_special_tokens": False}]
-    assert proc.template_kwargs == [{"enable_thinking": False}]
+    # Rendered twice per build: with the generation prompt and, for the
+    # assistant-frame probe, without - the same kwargs both times.
+    assert proc.template_kwargs == [{"enable_thinking": False}] * 2
     front.chat_template = "{{ messages }}"
     front.build(messages, [png(1)], {})
     assert proc.template_kwargs[-1] == {"chat_template": "{{ messages }}"}

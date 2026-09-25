@@ -79,7 +79,9 @@ class FakeFrontend:
                     )
                     tokens += [PAD] * K
         tokens.append(7)
-        return Built(tokens, spans)
+        # The assistant's frame is the last token: the reasoning state is
+        # searched from there, not from the user's text.
+        return Built(tokens, spans, assistant_start=len(tokens) - 1)
 
     def describe(self):
         return {"provider": "fake", "tower": "none"}
@@ -238,6 +240,7 @@ def test_api_decodes_data_urls_and_refuses_the_rest():
     gen = chat.to_generation_request(tok, req, frontend=front)
     assert len(gen.spans) == 1 and gen.boundaries == [] and gen.system_end is None
     assert gen.tokens[gen.spans[0].start : gen.spans[0].end] == [PAD] * K
+    assert req.assistant_start == len(gen.tokens) - 1
 
 
 def test_served_reports_the_frontend_and_the_registry_finds_a_provider():

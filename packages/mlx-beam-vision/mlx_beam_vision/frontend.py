@@ -155,7 +155,31 @@ class VisionFrontend:
                     )
                 )
                 off += n
-        return Built(ids, spans)
+        return Built(ids, spans, self._assistant_start(messages, kwargs, text, ids))
+
+    def _assistant_start(self, messages, kwargs: dict, text, ids: list[int]) -> int:
+        """Where the generation prompt begins in `ids`: the template
+        rendered without it is a prefix of `text`, and the frame that
+        follows tokenizes on its own (it opens with a marker or a line
+        break). No processor call, no image: the frame's ids are matched
+        against the prompt's tail, and 0 - the whole prompt - is the answer
+        whenever they do not match or the template will not render."""
+        tok = getattr(self.processor, "tokenizer", None)
+        if tok is None or not isinstance(text, str):
+            return 0
+        try:
+            without = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, **kwargs
+            )
+        except Exception:  # noqa: BLE001 - the template's business
+            return 0
+        if not isinstance(without, str) or not text.startswith(without):
+            return 0
+        frame = tok.encode(text[len(without) :], add_special_tokens=False)
+        n = len(frame)
+        if not n or n > len(ids) or ids[-n:] != [int(t) for t in frame]:
+            return 0
+        return len(ids) - n
 
     def _encode(self, images: Sequence[Image], processed: dict) -> list:
         """Every image's features: from the cache by digest, else one tower
