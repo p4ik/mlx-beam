@@ -113,6 +113,17 @@ a:hover {
   color: var(--text);
 }
 
+.top nav a[aria-current="page"] {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 0.35em;
+  text-decoration-thickness: 1px;
+}
+
+.top nav a.external span {
+  color: var(--text-dim);
+}
+
 /* hero: the wall the beam lights from below */
 .hero {
   position: relative;

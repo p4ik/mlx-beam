@@ -4,7 +4,7 @@ title: Configuration
 description: Where a running server takes its values from - the command line, the request, the checkpoint - and which one wins.
 ---
 
-A value reaches the engine at one of three points: when the server starts (flags), with each request (body fields), or from the checkpoint itself (what the model ships). The rule between them is short: **a flag beats the checkpoint, and a request beats both** where a request may say anything at all. Hard caps only go one way - a request may lower `--max-prompt-tokens`, never raise it, and `--max-context` never exceeds the model's own window. `/health` reports every default together with its source (`flag`, `generation_config.json`, `mlx-lm`), so what is in effect is never a guess.
+A value reaches the engine at one of three points: when the server starts (flags), with each request (body fields), or from the checkpoint itself (what the model ships). The rule between them is short: **a flag beats the checkpoint, and a request beats both** where a request may say anything at all. Hard caps only go one way - a request may lower `--max-prompt-tokens`, never raise it, and `--max-context` never exceeds the model's own window. `/health` reports every default together with its source (`flag`, `generation_config.json`, `mlx-lm`, or `mlx-beam` for the two reasoning defaults the engine sets itself), so what is in effect is never a guess.
 
 ## Start: `beam serve` flags
 
@@ -40,7 +40,7 @@ Every value counts tokens; each one counts a different set.
 
 | Flag | Value | Default | What it does |
 |---|---|---|---|
-| `--max-context` | integer | — | prompt plus generated tokens, a hard cap: a request over it is a 400 (default: the model's own context length) |
+| `--max-context` | integer | — | prompt plus generated tokens, a hard cap: a prompt whose reserve does not fit is a 400, a larger max_tokens is served capped at what the context holds (default: the model's own context length) |
 | `--max-prompt-tokens` | integer | — | prompt tokens, a hard cap below the context: a longer prompt is a 400; a request's max_prompt_tokens may only lower it |
 | `--max-completion-tokens` | integer | — | generated tokens when the client sends no max_tokens / max_completion_tokens / max_output_tokens; the request overrides (mlx-lm: --max-tokens, default 512) |
 | `--max-reasoning-tokens` | integer | — | reasoning tokens (what usage.reasoning_tokens counts) when the client sends no max_reasoning_tokens; the think block is closed by force at the budget (default: unbounded) |
@@ -82,7 +82,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 
 | Flag | Value | Default | What it does |
 |---|---|---|---|
-| `--draft-model` | text | — | the proposer that drafts tokens for the verify pass: 'bundled' takes the draft head the checkpoint ships (config.json mtp_file, or mtp.* tensors in the shards); a repo or path for an external drafter is not supported yet |
+| `--draft-model` | text | — | the proposer that drafts tokens for the verify pass: 'bundled' takes the draft head the checkpoint ships (the package manifest's parts.mtp, config.json mtp_file, or mtp.* tensors in the shards); a repo or path for an external drafter is not supported yet |
 | `--max-draft-tokens` | integer | `3` | cap on the drafts verified per cycle (default: 3, the fixed depth at this stage; a lower value lowers it) |
 
 ### Prompt cache
@@ -90,7 +90,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 | Flag | Value | Default | What it does |
 |---|---|---|---|
 | `--prompt-cache-size` | integer | `16` | stored prefixes: a number of entries, not a size in bytes |
-| `--prompt-cache-bytes` | integer | — | RAM budget in bytes for the stored prefixes (default: unlimited); stored prefixes yield to the caches of running requests |
+| `--prompt-cache-bytes` | integer | — | RAM budget in bytes for the stored prefixes (default: unlimited); the store's own limit, separate from the caches of running requests |
 
 <!-- /generated -->
 
@@ -127,8 +127,9 @@ Refused, and said so in the error: `n` above 1, `best_of`, `suffix` (insertion),
 The engine reads standard MLX checkpoints, and a checkpoint can carry settings of its own:
 
 - **`generation_config.json`** - `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`, `presence_penalty` and `frequency_penalty` become the server's sampling defaults, below the flags and above mlx-lm's own; `do_sample: false` means greedy.
-- **The chat template** in `tokenizer_config.json` or `chat_template.jinja` - the think and tool markers the engine watches for are inferred from the template that actually renders; `--chat-template` replaces it, `--use-default-chat-template` gives a model without one a plain ChatML template.
-- **A KV profile** - a quantized package may ship a bits-per-layer list (`[{"layer_idx": 3, "bits": 4, "group_size": 64}, …]`) or an object (`{"bits": 4, "group_size": 64, "layers": {"3": 8}, "prefill": "quantized"}`); the engine does not read it on its own, `--kv-config` points at the file. Listed layers take their bits, the rest follow `--kv-bits`; a profile's `prefill` yields to `--kv-prefill`.
-- **A draft head** - the file `mtp_file` in `config.json` names, or the `mtp.*` tensors in the shards. It is used only with `--draft-model bundled`; started without the flag, a checkpoint that bundles one says so. Its quantization comes from `config.json` (`mtplx_mtp_quantization`, or `beam.mtp.quantization`), else the head is quantized to 4 bits at load; its norm weights are shifted by +1 unless `beam.mtp.norm_convention` is `mlx`.
+- **The chat template** in `tokenizer_config.json` or `chat_template.jinja` - the tool-call markers the engine watches for are inferred from the template that actually renders, the think markers from the model's vocabulary; `--chat-template` replaces the template, `--use-default-chat-template` gives a model without one a plain ChatML template.
+- **A KV profile** - a quantized package may ship a bits-per-layer list (`[{"layer_idx": 3, "bits": 4, "group_size": 64}, …]`) or an object (`{"bits": 4, "group_size": 64, "layers": {"3": 8}, "prefill": "quantized"}`); the engine does not read it on its own, `--kv-config` points at the file. Listed layers take their bits, the rest follow `--kv-bits`. The prefill mode comes from the object's own `prefill`, else - when the file is the one the package manifest names (`parts.kv_config`, by path or by SHA-256) - from the mode the package was measured with; `--kv-prefill` beats both.
+- **A draft head** - the file the package manifest names under `parts.mtp` (checked against its SHA-256), else the file `mtp_file` in `config.json` names, else the `mtp.*` tensors in the shards. It is used only with `--draft-model bundled`; started without the flag, a checkpoint that bundles one says so. Its bits and group size come from the manifest, else from `mtplx_mtp_quantization` in `config.json`, else the head is quantized to 4 bits at load; its norm weights are shifted by +1 unless the manifest's `norm_convention` is `mlx`.
+- **A package manifest** - a checkpoint in the B.E.A.M. package layout names it in `config.json` (`extras.manifest`, normally `extras/manifest.json`); its `parts` describe the draft head and the KV profile above, each with the file and its SHA-256. A plain checkpoint has none and every reader uses its own defaults.
 
 What the engine built from all of this is in `/health`: the KV layout layer by layer under `kv.applied`, the batching and cache settings, the draft head and its counters under `speculative`, and every request default with its source.

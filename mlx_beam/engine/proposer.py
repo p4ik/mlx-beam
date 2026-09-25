@@ -18,6 +18,7 @@ import mlx.nn as nn
 
 from mlx_beam._vendor.mlx_lm.models.base import create_attention_mask
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache
+from mlx_beam.package import part, read_manifest, verify_part_file
 
 
 class Proposer(Protocol):
@@ -129,11 +130,15 @@ def _strip(k: str) -> str:
 
 
 def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
-    """Where a checkpoint keeps its MTP head: the file `mtp_file` names in
-    config.json (our layout `mtp/weights.safetensors`, optiq's
+    """Where a checkpoint keeps its MTP head: the package manifest's
+    `parts.mtp.file` (checked against its SHA-256), else the file `mtp_file`
+    names in config.json (`mtp/weights.safetensors`, optiq's
     `optiq/mtp.safetensors`), else the shards that hold `mtp.*` tensors
     (a base checkpoint). Returns (files, config)."""
     config = json.loads((model_path / "config.json").read_text())
+    mtp = part(read_manifest(model_path), "mtp")
+    if mtp and mtp.get("file"):
+        return [verify_part_file(model_path, "mtp", mtp)], config
     named = config.get("mtp_file")
     if named:
         file = model_path / named
@@ -154,11 +159,13 @@ def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
 
 def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
     """The head from the checkpoint's own tensors, quantized as the pack says
-    (`mtplx_mtp_quantization`, or the layout's `beam.mtp`), else int4/64;
-    norms shifted unless the layout's manifest says they already are."""
+    (the manifest's `parts.mtp`, or `mtplx_mtp_quantization`), else int4/64;
+    norms shifted unless the manifest says they already are (`norm_convention`
+    `mlx`)."""
     text = getattr(model, "language_model", model)
     args = text.args
     files, config = bundled_head_files(model_path)
+    manifest = part(read_manifest(model_path), "mtp") or {}
     weights: dict = {}
     for file in files:
         raw = mx.load(str(file))
@@ -167,8 +174,11 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         raise ValueError(f"{files[0]} holds no mtp.* tensors")
     layer_class = type(text.model.layers[args.full_attention_interval - 1])
     head = MTPHead(args, layer_class)
-    manifest = (config.get("beam") or {}).get("mtp") or {}
-    quant = config.get("mtplx_mtp_quantization") or manifest.get("quantization") or {}
+    quant = (
+        {k: manifest[k] for k in ("bits", "group_size") if k in manifest}
+        or config.get("mtplx_mtp_quantization")
+        or {}
+    )
     packed = "layers.0.self_attn.k_proj.scales" in weights
     if packed:
         # The packed width says the bits: K / (32 / bits) uint32 per row.
@@ -197,6 +207,10 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         "group_size": group_size,
         "prequantized": packed,
         "norms_shifted": manifest.get("norm_convention", "hf") != "mlx",
+        # Where the bits and norm convention came from: the package's
+        # manifest, verified by hash, or the loader's own defaults.
+        "manifest": bool(manifest),
+        "verified": bool(manifest.get("sha256")),
     }
 
 

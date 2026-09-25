@@ -7,11 +7,46 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- A checkpoint in the package layout is read through its manifest:
+  `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
+  head's file, bits, group size and norm convention, and the file is
+  checked against the manifest's SHA-256 before it is loaded - a head whose
+  bytes differ from what the package was measured with is refused. A
+  plain checkpoint keeps the old paths (`mtp_file`, `mtp.*` in the shards)
+  and the loader's defaults.
+- The KV prefill mode a package measured for its own profile
+  (`parts.kv_config.prefill.mode` in the manifest) applies when
+  `--kv-config` names that file, by path or by SHA-256; the profile's own
+  `prefill` and `--kv-prefill` still win. `/health.kv.prefill_source` says
+  `manifest` when it came from there.
+- The site's pages share one navigation; the current page is marked and
+  links that leave the site say so.
+
+### Changed
+- `--prompt-cache-bytes` is the store's own limit: the caches of running
+  requests no longer count against it, so a parallel request cannot push a
+  stored conversation out. The budget bounds what the store holds, nothing
+  else.
+- The README and the site describe what is built in the present tense and
+  name what is planned as planned; vision and audio are a package of their
+  own (`pip install mlx-beam[vision]`), structured output and GGUF extras
+  with a guard. The `extra_not_installed` message names the install line.
+- Versions between tags count towards the release they are heading for
+  (`0.1.0a5.devN` after `v0.1.0a4`) instead of the next minor; the rolling
+  `dev` GitHub release follows every merge to `main`, titled with version
+  and date; a tag is refused without its changelog section.
+- `--max-context` help text: only a prompt whose reserve does not fit is a
+  400, a larger `max_tokens` is served capped.
+
+## [0.1.0a4] - 2026-09-25
+
+### Added
 - Speculative decoding, first stage: `--draft-model bundled` loads the
   draft head a checkpoint ships (the `mtp_file` its config names, or the
   `mtp.*` tensors in its shards) and verifies its drafts in one forward
   per cycle. Greedy requests decoding alone get up to three drafts per
-  cycle (`--max-draft-tokens` caps that); everything else - several rows
+  cycle, four tokens with the one the model samples after them
+  (`--max-draft-tokens` caps the drafts); everything else - several rows
   at once, sampling, a request with repetition penalties, a thinking
   budget about to act - decodes plainly through the same path; a logit
   bias is applied to every verified position, so a request with one still

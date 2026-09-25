@@ -1,32 +1,35 @@
 ---
 import "@fontsource-variable/archivo/standard.css";
 import "../styles/global.css";
+import Header from "../components/Header.astro";
 
 const repo = "https://github.com/p4ik/mlx-beam";
 const install = `uv tool install mlx-beam\nbeam doctor`;
 
+// The same list as the README's "What sets it apart": present tense only
+// for what is built, planned things say so.
 const built = [
-  { title: "Robust prefix cache", text: "RAM and SSD tiers, checkpoints for hybrid models. Survives model swaps and restarts." },
-  { title: "Expert streaming", text: "Mixture-of-experts models larger than memory. Residency configurable, from minimal RAM to fully resident." },
-  { title: "No bloat", text: "The core is the token path. Vision, audio, conversion, structured output and tool-call repair are optional extras." },
-  { title: "Batched MTP", text: "Multi-token prediction stays on with many requests at once." },
-  { title: "Batched vision", text: "Images go through the same scheduler; no request waits behind a picture." },
+  { title: "Robust prefix cache", text: "Trie-backed store with its own byte budget, checkpoints for hybrid models, partial hits cut back to the last usable boundary. An SSD tier that survives restarts is planned." },
   { title: "No stalls", text: "A short request beside a long prefill answers in seconds." },
-  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion." },
+  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion. Quantized after the prefill by default; from the first token for profiles measured that way." },
+  { title: "Multi-token prediction", text: "The checkpoint's own draft head, verified exactly. On today for one greedy request at a time; in the batch and under sampling planned." },
   { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request." },
   { title: "Responses API", text: "Next to chat completions, stateless." },
+  { title: "No bloat", text: "The core is the token path and the API formats. Vision and audio come as their own package, structured output and GGUF as extras with a guard. Expert streaming for models larger than memory is planned." },
 ];
 
 
-const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
+const features = ["Robust prefix cache", "Exact speculative decoding", "No bloat"];
 
 const status = [
   { piece: "CLI, packaging, CI", state: "built", built: true },
   { piece: "Vendored mlx-lm base", state: "built", built: true },
-  { piece: "OpenAI server with continuous batching", state: "built", built: true },
+  { piece: "OpenAI server with continuous batching, quantized KV cache", state: "built", built: true },
   { piece: "Prefix cache with recurrent-state checkpoints, RAM tier", state: "built", built: true },
+  { piece: "Multi-token prediction, one greedy request at a time", state: "built", built: true },
   { piece: "Prefix cache SSD tier", state: "planned", built: false },
-  { piece: "Multi-token prediction in the batch", state: "planned", built: false },
+  { piece: "Multi-token prediction in the batch and under sampling", state: "planned", built: false },
+  { piece: "Vision, structured output", state: "planned", built: false },
   { piece: "Expert streaming from SSD", state: "planned", built: false },
 ];
 ---
@@ -38,28 +41,12 @@ const status = [
     <title>mlx-beam</title>
     <meta
       name="description"
-      content="A light, modular inference engine for Apple silicon, built on MLX: robust prefix cache with SSD tier, expert streaming, no bloat."
+      content="A light, modular inference engine for Apple silicon, built on MLX: robust prefix cache, exact speculative decoding, no bloat."
     />
     <meta name="theme-color" content="#000000" />
   </head>
   <body>
-    <header class="top">
-      <div class="wrap">
-        <a class="brand" href="./">
-          <span class="name">mlx-beam</span>
-          <span class="expands">Batched Engine for Apple Metal</span>
-        </a>
-        <nav>
-          <a href="#how">How</a>
-          <a href="#what">What</a>
-          <a href="#why">Why</a>
-          <a href="#where">Where</a>
-          <a href="configuration/">Configuration</a>
-          <a href={repo}>GitHub</a>
-          <a href={`${repo}/blob/main/CHANGELOG.md`}>Changelog</a>
-        </nav>
-      </div>
-    </header>
+    <Header />
 
     <main>
       <section class="hero">
@@ -119,8 +106,8 @@ const status = [
             inference engine: a built-in game, a cloud path that arrives with an update. The ones we ran
             daily also had bugs where it matters most: prefix cache, batching under load, vision.
             B.E.A.M. keeps the core to the token path and fixes those paths at the source. Everything
-            else is an extra you choose to install; nothing ever ships in the core that you did not ask
-            for.
+            else is a package or an extra you choose to install; nothing ever ships in the core that you
+            did not ask for.
           </p>
         </div>
       </section>

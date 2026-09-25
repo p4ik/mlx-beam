@@ -113,8 +113,9 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     limits.add_argument(
         "--max-context",
         type=int,
-        help="prompt plus generated tokens, a hard cap: a request over it is a "
-        "400 (default: the model's own context length)",
+        help="prompt plus generated tokens, a hard cap: a prompt whose reserve "
+        "does not fit is a 400, a larger max_tokens is served capped at what "
+        "the context holds (default: the model's own context length)",
     )
     limits.add_argument(
         "--max-prompt-tokens",
@@ -233,9 +234,9 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     spec.add_argument(
         "--draft-model",
         help="the proposer that drafts tokens for the verify pass: 'bundled' takes "
-        "the draft head the checkpoint ships (config.json mtp_file, or mtp.* "
-        "tensors in the shards); a repo or path for an external drafter is not "
-        "supported yet",
+        "the draft head the checkpoint ships (the package manifest's parts.mtp, "
+        "config.json mtp_file, or mtp.* tensors in the shards); a repo or path "
+        "for an external drafter is not supported yet",
     )
     spec.add_argument(
         "--max-draft-tokens",
@@ -255,7 +256,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "--prompt-cache-bytes",
         type=int,
         help="RAM budget in bytes for the stored prefixes (default: unlimited); "
-        "stored prefixes yield to the caches of running requests",
+        "the store's own limit, separate from the caches of running requests",
     )
     p.add_argument(
         "--trust-remote-code",
@@ -371,6 +372,34 @@ def kv_policy_from_args(args):
         raise SystemExit(f"kv policy: {e}") from None
 
 
+def policy_with_package_prefill(policy, args, model_path: Path, log):
+    """The prefill mode a package measured for its own kv_config
+    (`parts.kv_config.prefill.mode` in the manifest) applies when that is the
+    profile in use - the file --kv-config names is the manifest's, by path or
+    by SHA-256 - and neither the file nor a flag said otherwise."""
+    from dataclasses import replace
+
+    from mlx_beam.package import part, read_manifest, sha256_of
+
+    if policy.prefill_source != "default" or not args.kv_config:
+        return policy
+    entry = part(read_manifest(model_path), "kv_config") or {}
+    mode = (entry.get("prefill") or {}).get("mode")
+    if not mode or not entry.get("file"):
+        return policy
+    ours = Path(args.kv_config)
+    theirs = model_path / entry["file"]
+    same = ours.resolve() == theirs.resolve() or (
+        bool(entry.get("sha256")) and sha256_of(ours) == entry["sha256"]
+    )
+    if not same:
+        return policy
+    log.info(
+        "kv prefill %r from the package manifest (measured for %s)", mode, entry["file"]
+    )
+    return replace(policy, prefill=mode, prefill_source="manifest")
+
+
 def proposer_from_args(args, model, model_path: Path, log):
     """The proposer `--draft-model` names, or None. A checkpoint that ships
     a head but was started without the flag gets a hint, not a default."""
@@ -418,8 +447,9 @@ def serve(args) -> int:
     # Flags are checked before minutes of loading are spent on a typo.
     policy = kv_policy_from_args(args)
     log.info("loading %s", args.model)
-    # Handed to the tokenizer at load, so the think and tool markers are
-    # inferred from the template that will actually render.
+    # Handed to the tokenizer at load: the tool markers are inferred from
+    # the template that will actually render (the think markers come from
+    # the vocabulary).
     template = chat_template_from_args(args)
     tokenizer_config = {"chat_template": template} if template else {}
     model, tokenizer = load(
@@ -435,6 +465,11 @@ def serve(args) -> int:
     model_path = (
         Path(args.model) if Path(args.model).exists() else hf_repo_to_path(args.model)
     )
+    try:
+        policy = policy_with_package_prefill(policy, args, model_path, log)
+    except (OSError, ValueError) as e:
+        log.error("package manifest: %s", e)
+        return 3
     try:
         proposer = proposer_from_args(args, model, model_path, log)
     except (OSError, ValueError) as e:

@@ -38,8 +38,11 @@ def unsupported(what: str, param: str | None = None) -> ApiError:
 
 
 def missing_extra(feature: str, extra: str) -> ApiError:
+    """The feature lives outside the core: vision and audio in their own
+    package, structured output behind a guard - each installed by name."""
     return ApiError(
-        f"{feature} needs the '{extra}' extra, which is not installed",
+        f"{feature} needs the '{extra}' extra, which is not installed "
+        f"(pip install mlx-beam[{extra}])",
         code="extra_not_installed",
     )
 

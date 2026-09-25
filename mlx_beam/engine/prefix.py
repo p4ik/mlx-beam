@@ -332,11 +332,6 @@ class PrefixStore:
             model, key = victim
             self._nbytes -= self._trie.pop(model, key).nbytes
 
-    def trim_to_bytes(self, n_bytes: int) -> None:
-        while self._nbytes > max(0, n_bytes) and len(self):
-            model, key = self._pop_victim()
-            self._nbytes -= self._trie.pop(model, key).nbytes
-
     def describe(self) -> dict:
         s = self.stats
         return {

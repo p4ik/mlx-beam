@@ -252,3 +252,68 @@ def test_kv_prefill_comes_from_the_flag_the_profile_or_the_default(tmp_path):
     bad.write_text('{"bits": 8, "prefill": "later"}')
     with pytest.raises(SystemExit, match="prefill"):
         kv_policy_from_args(serve_args("--kv-config", str(bad)))
+
+
+def test_kv_prefill_from_the_package_manifest_only_for_its_own_kv_config(tmp_path):
+    """A package's manifest says which prefill mode its kv_config was measured
+    with; that applies when the served profile is that file (by path or by
+    hash), not to another profile and not over a flag or the file's own word."""
+    import logging
+
+    from mlx_beam.cli import kv_policy_from_args, policy_with_package_prefill
+    from mlx_beam.package import sha256_of
+
+    pkg = tmp_path / "pkg"
+    (pkg / "extras").mkdir(parents=True)
+    listed = pkg / "extras" / "kv_config.json"
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 64}]')
+    (pkg / "config.json").write_text(
+        json.dumps(
+            {"model_type": "llama", "extras": {"manifest": "extras/manifest.json"}}
+        )
+    )
+    (pkg / "extras" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "beam",
+                "version": 1,
+                "parts": {
+                    "kv_config": {
+                        "file": "extras/kv_config.json",
+                        "sha256": sha256_of(listed),
+                        "prefill": {"mode": "quantized", "measured": "2026-09-18"},
+                    }
+                },
+            }
+        )
+    )
+    log = logging.getLogger("beam-test")
+
+    args = serve_args("--kv-bits", "8", "--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "manifest")
+
+    # The same bytes under another path are the same profile.
+    copy = tmp_path / "elsewhere.json"
+    copy.write_text(listed.read_text())
+    args = serve_args("--kv-bits", "8", "--kv-config", str(copy))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "manifest")
+
+    # Another profile was not measured; the flag beats the manifest.
+    other = tmp_path / "other.json"
+    other.write_text('[{"layer_idx": 5, "bits": 8, "group_size": 64}]')
+    args = serve_args("--kv-bits", "8", "--kv-config", str(other))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+    args = serve_args("--kv-config", str(listed), "--kv-prefill", "exact")
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "flag")
+
+    # A plain checkpoint has no manifest; nothing changes.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text('{"model_type": "llama"}')
+    args = serve_args("--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, plain, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")

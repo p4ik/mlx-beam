@@ -205,9 +205,7 @@ class Engine:
         # Waiting requests beyond this are refused at once instead of queued.
         self.max_queued = max_queued
         self._rejected_queue_full = 0
-        self._budget_warned_at = 0.0
         self.vocab_size = model_vocab_size(model)
-        self._prompt_cache_bytes = prompt_cache_bytes
         self._dead = False
         # Our names on the outside (mlx-lm's server flags), the generator's
         # keyword names on the inside.
@@ -592,19 +590,6 @@ class Engine:
                 self._spec_bias[uid] = (
                     mx.array(list(p.logit_bias.keys())),
                     mx.array(list(p.logit_bias.values())),
-                )
-        if self._prompt_cache_bytes:
-            # Stored prefixes yield to the caches of running requests.
-            room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
-            self.prefix_store.trim_to_bytes(room)
-            if room < 0 and time.monotonic() - self._budget_warned_at > 60:
-                self._budget_warned_at = time.monotonic()
-                logger.warning(
-                    "prompt cache budget %d bytes is below the caches of the "
-                    "running requests (%d bytes): nothing can be stored until "
-                    "they finish",
-                    self._prompt_cache_bytes,
-                    gen.prompt_cache_nbytes,
                 )
 
     def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:

@@ -1,10 +1,10 @@
 """POST /v1/responses: the Responses format as a stateless translator.
 
 Items in, items out. What Responses adds on top of chat completions stays
-out on purpose: no stored state (``previous_response_id`` and
+out of the core on purpose: no stored state (``previous_response_id`` and
 ``conversation`` are refused with the instruction to send the full input)
 and no hosted tools (``function`` tools only; every other tool type is
-refused). Both are extras, never a silent no-op.
+refused). Both are services, not formats; a refusal, never a silent no-op.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import (
     ApiError,
     bool_field,
+    missing_extra,
     object_field,
     text_field,
     unsupported,
@@ -63,9 +64,7 @@ def _content_text(content: Any, item_index: int) -> str | None:
         if kind in ("input_text", "output_text", "text"):
             texts.append(text_field(part, "text", f"input[{item_index}]"))
         elif kind in ("input_image",):
-            raise ApiError(
-                "image input needs the 'vision' extra", code="extra_not_installed"
-            )
+            raise missing_extra("image input", "vision")
         elif kind in ("input_audio", "input_file"):
             raise unsupported(f"input part {kind}", "input")
         else:
@@ -204,9 +203,7 @@ def parse_responses_request(
         raise unsupported("n > 1", "n")
     text_format = object_field(object_field(body, "text"), "format", "text").get("type")
     if text_format not in (None, "text"):
-        raise ApiError(
-            "text.format needs the 'structured' extra", code="extra_not_installed"
-        )
+        raise missing_extra("text.format", "structured")
     tool_choice = body.get("tool_choice", "auto")
     if tool_choice not in ("auto", "none"):
         raise unsupported("tool_choice other than auto or none", "tool_choice")

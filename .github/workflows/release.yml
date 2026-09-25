@@ -1,19 +1,26 @@
 name: Release
 
-# Publishes to PyPI through Trusted Publishing (no token in the repo).
-#   - a tag v* (v0.2.0, v0.2.0rc1, v0.2.0a1): the tagged commit must be on
-#     main or on a release-* branch (patch releases for an older minor); the
-#     tests run again on Apple silicon before anything is uploaded.
-#   - workflow_dispatch on main or a release-* branch: a .dev build of that
-#     branch (0.2.0.devN on main, 0.1.1.devN on release-0.1; N = commits
-#     since the last tag) for a lab test.
-# Installers skip pre-releases unless asked. The `pypi` environment can add
-# a required reviewer in the repository settings.
-# After the upload the same files go to a GitHub release: the tag's own for
-# v*, a rolling `dev` release for dispatches (no digit in the tag name, so
-# hatch-vcs never counts it as a version).
+# Three triggers, three outcomes:
+#   - a tag v* (v0.1.0, v0.1.0rc1, v0.1.0a1): the tagged commit must be on
+#     main or on a release-* branch (patch releases for an older minor), the
+#     tests run again on Apple silicon, CHANGELOG.md must carry a section for
+#     the version; then PyPI (Trusted Publishing, no token in the repo) and a
+#     GitHub release of the tag.
+#   - a push to main (every squash-merge): build only, and the rolling `dev`
+#     GitHub release is replaced with the wheel and sdist of that commit,
+#     titled with its version and date. Nothing goes to PyPI.
+#   - workflow_dispatch on main or a release-* branch: the .dev build of that
+#     branch goes to PyPI for a lab test that pins it, and to the `dev`
+#     release. Only on request: while the project has no final release,
+#     installers resolve to the newest pre-release, .dev included.
+# Versions come from hatch-vcs: an untagged commit is <next>.devN (0.1.0a5.devN
+# after v0.1.0a4), N = commits since the tag. The `pypi` environment can add a
+# required reviewer in the repository settings. The `dev` release has no
+# digit in its tag name, so hatch-vcs never counts it as a version.
+
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -42,9 +49,16 @@ jobs:
             main|release-*) ;;
             *) echo "::error::.dev builds are published from main or release-* only, not $GITHUB_REF_NAME"; exit 1;;
           esac
+      - name: A tag needs its section in CHANGELOG.md
+        if: github.ref_type == 'tag'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -qE "^## \[$version\]" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## [$version]' section - turn [Unreleased] into it in the last PR before the tag"; exit 1; }
 
   test:
     needs: verify
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -59,8 +73,13 @@ jobs:
       - run: uv run pytest -q
 
   build:
-    needs: test
+    # A push to main was tested in its pull request; a tag or a dispatch is
+    # tested again above before anything leaves the repository.
+    needs: [verify, test]
+    if: always() && needs.verify.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -69,9 +88,11 @@ jobs:
       - run: uv build
       - run: ls -l dist/
       - name: The built version must match the trigger
+        id: version
         run: |
           built=$(ls dist/*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
           echo "built version: $built"
+          echo "version=$built" >> "$GITHUB_OUTPUT"
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
               case "$built" in
@@ -79,8 +100,10 @@ jobs:
                 *) echo "::error::dispatch builds publish .dev versions only; main is at a release tag ($built) - push the tag instead"; exit 1;;
               esac;;
             push)
-              test "$built" = "${GITHUB_REF_NAME#v}" \
-                || { echo "::error::tag $GITHUB_REF_NAME does not match the built version $built"; exit 1; };;
+              if [ "$GITHUB_REF_TYPE" = tag ]; then
+                test "$built" = "${GITHUB_REF_NAME#v}" \
+                  || { echo "::error::tag $GITHUB_REF_NAME does not match the built version $built"; exit 1; }
+              fi;;
           esac
       - uses: actions/upload-artifact@v7
         with:
@@ -89,6 +112,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -101,30 +125,45 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
-    needs: publish
+    needs: [build, publish]
+    if: always() && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
       - name: Release for a tag, prerelease when the version has a, b or rc
-        if: github.event_name == 'push'
+        if: github.ref_type == 'tag'
         run: |
-          case "$GITHUB_REF_NAME" in
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
             *a[0-9]*|*b[0-9]*|*rc[0-9]*) pre=--prerelease;;
             *) pre=;;
           esac
+          # The tag's own section of the changelog, up to the next heading.
+          awk -v v="$version" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" --notes "" $pre
-      - name: Rolling dev release for a dispatch
-        if: github.event_name == 'workflow_dispatch'
+            --title "$GITHUB_REF_NAME" --notes-file notes.md $pre
+      - name: Rolling dev release for main and for a dispatch
+        if: github.ref_type != 'tag'
+        env:
+          BUILT: ${{ needs.build.outputs.version }}
         run: |
-          built=$(ls dist/*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
+          built="$BUILT"
+          date=$(date -u +%Y-%m-%d)
+          {
+            echo "Untagged build of \`${GITHUB_SHA::7}\` on \`$GITHUB_REF_NAME\`, $date - version \`$built\`."
+            echo
+            echo "Since the last tag ([Unreleased] in CHANGELOG.md):"
+            echo
+            awk 'index($0, "## [Unreleased]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md
+          } > notes.md
           gh release delete dev --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
           gh release create dev dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-            --title "dev $built" --notes "" --prerelease
+            --title "dev $built · $date" --notes-file notes.md --prerelease

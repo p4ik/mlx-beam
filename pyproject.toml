@@ -57,10 +57,11 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # PyPI refuses local labels (+g<hash>); .dev builds from main must be uploadable.
 local_scheme = "no-local-version"
-# main counts towards the next minor (0.1.0 -> 0.2.0.devN); a release-* branch
-# counts towards the next patch (0.1.1.devN). Measured 2026-09-14 against the
-# three schemes; the default would count 0.1.1.devN on main.
-version_scheme = "release-branch-semver"
+# An untagged commit counts towards the release it is heading for: after
+# v0.1.0a4 the tree is 0.1.0a5.devN, after v0.1.0rc1 0.1.0rc2.devN, after
+# v0.1.0 0.1.1.devN (measured 2026-09-25 with setuptools-scm's meta()). The
+# release-branch-semver scheme used before jumped to 0.2.0.devN after every tag.
+version_scheme = "guess-next-dev"
 
 [tool.hatch.build.hooks.vcs]
 version-file = "mlx_beam/_version.py"
