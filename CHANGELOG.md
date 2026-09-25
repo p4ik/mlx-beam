@@ -37,9 +37,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   the block verify and says so. In every mode `/health.speculative.exact`
   reports the warm-up width check: does the block forward give the same
   logits as single forwards here (`block_equals_positions`,
-  `max_abs_logit_diff`, `argmax_equal`). On Metal (mlx 0.32.2) the kernel
-  path does not pass its own check yet and the fallback is what runs;
-  `positions` is the mode that is exact there.
+  `max_abs_logit_diff`, `argmax_equal`), for every width a cycle can run.
+  `positions` checks the row's stop and length limits on each token
+  before it feeds the next, so nothing past the cut enters the caches,
+  and hands the penalties the tokens fed earlier in the cycle, as a plain
+  step would. On Metal (mlx 0.32.2) the kernel path does not pass its own
+  check yet and the fallback is what runs; `positions` is the mode that
+  is exact there.
 - The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
   what a partial rollback needs, the rollback replays the selective scan
   over the accepted prefix, bit for bit against a forward of those tokens.
@@ -50,8 +54,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   / `user` to the content, a recipient naming a tool to a tool call. Tool
   parsers for both (`harmony`: the JSON body of a commentary message;
   `atem`: the `<atem:invoke>` block, values typed by the tool's schema).
-  A thinking budget closes the block the way these families do - by
-  opening the answer - and forces the whole sequence; `enable_thinking:
+  A thinking budget counts from the label the family names as reasoning
+  (the answer's channel opens no block) and closes the block the way
+  these families do - by opening the answer - forcing the whole sequence; `enable_thinking:
   false` opens the answer in the prompt, since their templates have no
   switch. A recipient marker (` to=`) is read only where the family puts
   one - right after `<|start|>assistant` - so the same characters inside
@@ -101,7 +106,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `/metrics` in Prometheus' text format from the same counters `/health`
   reports (`mlx_beam_*`: requests, tokens, seconds, memory, the prefix
   store, tool-call rungs, the speculator), plus the four `vllm:` names
-  dashboards read most.
+  dashboards read most; each metric's `# HELP` and `# TYPE` once, as the
+  exposition format requires.
 - `/v1/models` entries carry `context_length` and `max_model_len` (the
   context the engine serves), `max_completion_tokens` (the default a
   request may override), `input_modalities`, `owned_by: mlx-beam` and the
@@ -177,7 +183,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   probed now and then. A cycle that commits fewer tokens than its cost in
   plain steps is a loss; sixteen in a row park the proposer for a
   cooldown of plain steps that doubles each time (128 to 4096) until a
-  cycle wins again. `/health.speculative` reports the current `depth`
+  cycle wins again. The plain step is measured again every 64 cycles, in
+  the context the row is in by then, and the regulator starts over after
+  the warm-up (whose cycles ran cold over a few tokens); a cycle the row
+  was not eligible for does not count, the acceptance is learned from the
+  drafts actually made. `/health.speculative` reports the current `depth`
   (the cap as `max_depth`) and under `regulator` the acceptance by
   position, the costs, the rates, the tokens saved, `parked` with the
   reason and the cooldown left.
@@ -256,27 +266,20 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   after (golden transcript), the suite is unchanged.
 - The `forced` flag of a token now covers the whole forced close, the part
   after the end marker included (a line break, or the answer's opener).
-- The thinking budget of a label family (Harmony, Muse) counts from the
-  label, not the opener: `<|start|>assistant<|channel|>final` is the
-  answer, and only a label the family names as reasoning starts the
-  budget.
 - A request's `reasoning_effort` word lifts a server-side
   `enable_thinking: false` when the request says nothing about thinking
   itself (the client asked for effort, so it wants the reasoning);
   `reasoning_effort: null` in a request clears the server's default word.
   Where a request and a server default disagree, the request wins.
-- `/metrics` writes a metric's `# HELP` and `# TYPE` once, before its
-  first sample, as the exposition format requires; a metric with a
-  label per value used to repeat the pair, which its readers reject.
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing
   else.
 - The README and the site describe what is built in the present tense and
-  name what is planned as planned; vision and audio will be a package of
-  their own, structured output and GGUF extras with a guard - none of them
-  in this release, and the `extra_not_installed` message says so instead
-  of suggesting an install line that would do nothing.
+  name what is planned as planned: structured output and GGUF come as
+  extras with a guard, audio joins the vision package - and the
+  `extra_not_installed` message says so instead of suggesting an install
+  line that would do nothing.
 - Versions between tags count towards the release they are heading for
   (`0.1.0a5.devN` after `v0.1.0a4`) instead of the next minor; the rolling
   `dev` GitHub release follows every merge to `main`, titled with version
@@ -290,33 +293,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   exact everywhere.
 
 ### Fixed
-- The depth regulator measures a plain step every 64 cycles, so the cost
-  the cycles are held against is the plain step at the current context
-  rather than the warm-up's; it starts over after the warm-up (whose
-  cycles ran cold over a few tokens) and takes one plain step first. A
-  cycle the row was not eligible for no longer counts, the acceptance is
-  learned from the drafts actually made, and a position the row's limit
-  cut before it was compared is not booked as a refusal.
-- The draft head's history stays whole when a row decodes plainly for
-  long beside others: the queued pairs go into the head as the queue
-  fills instead of restarting the history from the queue alone. A history
-  restored from the store is cut to the same window as a primed one. The
-  hidden-state tail kept for a store snapshot is a contiguous copy, not a
-  slice that held a whole prefill chunk alive. The warm-up row leaves the
-  head's tables.
-- `--exact-verify kernels` checks every width a cycle can run (2 to the
-  cap plus one), not only the widest, before it trusts the kernels;
-  `exact_forward` restores the attention flag it found.
 - A proposer or sampler that fails at admission fails that request, not
   the worker.
-- The per-position verify (`--exact-verify positions`) checks the row's
-  stop and length limits on each token before it feeds the next: nothing
-  past the cut enters the caches, the stored entry is exactly what was
-  emitted. Its later positions also hand the presence, frequency and
-  repetition penalties the tokens fed earlier in the cycle, as a plain
-  step would - the logprobs now match plain decoding, not only the tokens.
-
-### Fixed
 - The reasoning budget sees every token before the next decode step. While
   a prefill shared the worker the generator ran several steps per call and
   the budget observed them afterwards, so a forced close armed late and the
