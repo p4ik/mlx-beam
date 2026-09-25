@@ -18,6 +18,7 @@ import mlx.nn as nn
 
 from mlx_beam._vendor.mlx_lm.models.base import create_attention_mask
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache
+from mlx_beam.package import part, read_manifest, verify_part_file
 
 
 class Proposer(Protocol):
@@ -66,13 +67,54 @@ def trunk(model: Any) -> tuple[Any, Any, Any]:
             "its hidden state"
         )
     embed = inner.embed_tokens
-    if getattr(args, "tie_word_embeddings", False):
-        head = embed.as_linear
+    tied = getattr(args, "tie_word_embeddings", None)
+    if tied is None:
+        tied = getattr(text, "tie_word_embeddings", False)
+    if tied:
+        linear = embed.as_linear
     elif hasattr(text, "lm_head"):
-        head = text.lm_head
+        linear = text.lm_head
     else:
         raise ValueError(f"{type(model).__name__} has no lm_head")
+    # What the model does after the projection - a scale (Granite), a
+    # multiplier and a softcap (Muse), a softcap (Gemma) - read from its
+    # attributes in the order the families apply them. `check_head` holds
+    # this composition to the model's own __call__ at warm-up.
+    multiplier = getattr(args, "output_multiplier", None)
+    scaling = getattr(text, "logits_scaling", None)
+    softcap = getattr(text, "final_logit_softcapping", None)
+    if softcap is None:
+        softcap = getattr(args, "final_logit_softcapping", None)
+
+    def head(h):
+        out = linear(h)
+        if multiplier is not None and multiplier != 1.0:
+            out = out * multiplier
+        if scaling is not None and scaling != 1.0:
+            out = out / scaling
+        if softcap:
+            out = mx.tanh(out / softcap) * softcap
+        return out
+
     return inner, head, embed
+
+
+def check_head(model: Any, tokens: list[int]) -> None:
+    """The trunk's two halves against the model's own forward over `tokens`,
+    bit for bit: a family whose logits are post-processed in a way `trunk`
+    does not compose would decode plainly under the speculative batch with
+    the wrong distribution (sampling, logprobs). Raises before that."""
+    inner, head, _ = trunk(model)
+    x = mx.array([tokens])
+    own = model(x)
+    ours = head(inner(x))
+    mx.eval(own, ours)
+    if own.shape != ours.shape or not mx.array_equal(own, ours).item():
+        raise ValueError(
+            f"{type(model).__name__}: the model's forward and the trunk's "
+            "head disagree on the logits; the speculative path cannot serve "
+            "this family until its logit post-processing is composed"
+        )
 
 
 class MTPHead(nn.Module):
@@ -128,12 +170,30 @@ def _strip(k: str) -> str:
     return k.split("mtp.", 1)[1] if "mtp." in k else k
 
 
-def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
-    """Where a checkpoint keeps its MTP head: the file `mtp_file` names in
-    config.json (our layout `mtp/weights.safetensors`, optiq's
+def bundled_head_files(
+    model_path: Path, verify: bool = True
+) -> tuple[list[Path], dict]:
+    """Where a checkpoint keeps its MTP head: the package manifest's
+    `parts.mtp.file` (checked against its SHA-256), else the file `mtp_file`
+    names in config.json (`mtp/weights.safetensors`, optiq's
     `optiq/mtp.safetensors`), else the shards that hold `mtp.*` tensors
     (a base checkpoint). Returns (files, config)."""
     config = json.loads((model_path / "config.json").read_text())
+    mtp = part(read_manifest(model_path), "mtp")
+    if mtp:
+        # A part that names no file cannot be checked; falling back to
+        # mtp_file here would load bytes the manifest never vouched for.
+        if not mtp.get("file"):
+            raise ValueError("manifest parts.mtp names no file")
+        if not verify:
+            # The start-up hint only names the file; loading hashes it.
+            file = model_path / mtp["file"]
+            if not file.is_file():
+                raise FileNotFoundError(
+                    f"manifest names parts.mtp.file {mtp['file']}, not found"
+                )
+            return [file], config
+        return [verify_part_file(model_path, "mtp", mtp)], config
     named = config.get("mtp_file")
     if named:
         file = model_path / named
@@ -154,11 +214,13 @@ def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
 
 def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
     """The head from the checkpoint's own tensors, quantized as the pack says
-    (`mtplx_mtp_quantization`, or the layout's `beam.mtp`), else int4/64;
-    norms shifted unless the layout's manifest says they already are."""
+    (the manifest's `parts.mtp`, or `mtplx_mtp_quantization`), else int4/64;
+    norms shifted unless the manifest says they already are (`norm_convention`
+    `mlx`)."""
     text = getattr(model, "language_model", model)
     args = text.args
     files, config = bundled_head_files(model_path)
+    manifest = part(read_manifest(model_path), "mtp") or {}
     weights: dict = {}
     for file in files:
         raw = mx.load(str(file))
@@ -167,8 +229,11 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         raise ValueError(f"{files[0]} holds no mtp.* tensors")
     layer_class = type(text.model.layers[args.full_attention_interval - 1])
     head = MTPHead(args, layer_class)
-    manifest = (config.get("beam") or {}).get("mtp") or {}
-    quant = config.get("mtplx_mtp_quantization") or manifest.get("quantization") or {}
+    quant = (
+        {k: manifest[k] for k in ("bits", "group_size") if k in manifest}
+        or config.get("mtplx_mtp_quantization")
+        or {}
+    )
     packed = "layers.0.self_attn.k_proj.scales" in weights
     if packed:
         # The packed width says the bits: K / (32 / bits) uint32 per row.
@@ -176,14 +241,31 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         s = weights["layers.0.self_attn.k_proj.scales"]
         bits = 32 * w.shape[1] // args.hidden_size
         group_size = args.hidden_size // s.shape[1]
+        # What the pack says about itself must be what its tensors are.
+        for key, found in (("bits", bits), ("group_size", group_size)):
+            said = quant.get(key)
+            if said is not None and int(said) != found:
+                raise ValueError(
+                    f"the draft head's tensors are packed at {key} {found}, the "
+                    f"checkpoint says {said}"
+                )
         nn.quantize(head, class_predicate=_quant_predicate(bits, group_size))
     else:
         # int4 / 64 measured equal to bf16 in acceptance (2026-09-19, 27B);
         # a width 64 does not divide takes the largest group that does.
-        default_group = next(g for g in (64, 32, 16, 8) if args.hidden_size % g == 0)
-        bits = int(quant.get("bits", 4))
-        group_size = int(quant.get("group_size", default_group))
-    if manifest.get("norm_convention", "hf") != "mlx":
+        default_group = next(
+            (g for g in (64, 32, 16, 8) if args.hidden_size % g == 0), 8
+        )
+        bits = quant.get("bits")
+        group_size = quant.get("group_size")
+        bits = 4 if bits is None else int(bits)
+        group_size = default_group if group_size is None else int(group_size)
+    convention = manifest.get("norm_convention", "hf")
+    if convention not in ("hf", "mlx"):
+        raise ValueError(
+            f"manifest parts.mtp.norm_convention must be hf or mlx, got {convention!r}"
+        )
+    if convention != "mlx":
         weights = shift_norms(weights)
     head.load_weights(list(weights.items()), strict=True)
     if not packed:
@@ -196,7 +278,13 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         "bits": bits,
         "group_size": group_size,
         "prequantized": packed,
-        "norms_shifted": manifest.get("norm_convention", "hf") != "mlx",
+        "norms_shifted": convention != "mlx",
+        # Where the bits and norm convention came from: the package's
+        # manifest, or the loader's own defaults. "verified" says the head
+        # file was hashed against the manifest (bundled_head_files refuses a
+        # part without a file, so a hash there was always checked).
+        "manifest": bool(manifest),
+        "verified": bool(manifest.get("file")) and bool(manifest.get("sha256")),
     }
 
 

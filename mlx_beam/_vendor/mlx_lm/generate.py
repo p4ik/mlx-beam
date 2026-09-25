@@ -1571,9 +1571,15 @@ class BatchGenerator:
         max_kv_size: Optional[int] = None,
         stream=None,
         generation_batch=None,
+        on_step=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
+        # Called with each decode step's responses before the next step
+        # runs: the caller's per-token bookkeeping (a reasoning budget that
+        # arms a forced close) must see a token before the step after it,
+        # not when this call returns after several (VENDORED.md, scheduler).
+        self.on_step = on_step
         self.sampler = sampler or greedy_sampler
         self.logits_processors = logits_processors or []
         self.uid_count = 0
@@ -1850,6 +1856,8 @@ class BatchGenerator:
             tic = time.perf_counter()
             while True:
                 step = self._generation_batch.next()
+                if self.on_step is not None and step:
+                    self.on_step(step)
                 generation_responses += step
                 self._counters.generation_tokens += len(step)
                 self._counters.generation_steps += 1

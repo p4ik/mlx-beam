@@ -166,15 +166,27 @@ def test_submissions_from_many_threads():
         assert all(len(v) == 4 for v in results.values())
 
 
-def test_stored_prefixes_yield_to_running_requests():
+def test_store_budget_is_its_own_limit_and_context_caps_max_tokens():
     from mlx_beam.engine import ContextTooLong
 
     model = tiny_llama()
     with Engine(model, prompt_cache_bytes=1) as engine:
+        # One byte of budget: nothing fits in the store, whatever runs.
         collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
-        # One byte of budget: the store cannot keep anything once a request runs.
+        assert engine.health()["prompt_cache"]["entries"] == 0
+    with Engine(model) as engine:
+        collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
+        one = engine.health()["prompt_cache"]["bytes"]
+        assert one > 0
+    # A budget for two entries keeps two, although each request that ran
+    # held caches of its own meanwhile: those do not count against the store.
+    with Engine(model, prompt_cache_bytes=2 * one) as engine:
+        collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
         collect(engine.submit(GenerationRequest([4, 5, 6], max_tokens=2)))
-        assert engine.health()["prompt_cache"]["entries"] <= 1
+        cache = engine.health()["prompt_cache"]
+        assert cache["entries"] == 2 and cache["bytes"] <= 2 * one
+        collect(engine.submit(GenerationRequest([1, 2, 3, 7], max_tokens=2)))
+        assert engine.health()["prompt_cache"]["tokens_found"] >= 3
     with Engine(model, max_context=8) as engine:
         # A large client limit is served and capped at what the context holds.
         out = collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=6)))
@@ -187,6 +199,31 @@ def test_stored_prefixes_yield_to_running_requests():
         with pytest.raises(ContextTooLong):
             engine.submit(GenerationRequest([1, 2, 3, 4, 5, 6, 7, 8], max_tokens=1))
         assert engine.health()["max_context"] == 8
+
+
+def test_store_budget_ignores_the_caches_of_running_requests():
+    """The budget bounds what the store holds, nothing else: a request whose
+    live caches exceed it does not push stored prefixes out while it runs."""
+    import time
+
+    model = tiny_llama()
+    with Engine(model) as engine:
+        collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
+        one = engine.health()["prompt_cache"]["bytes"]
+    with Engine(model, prompt_cache_bytes=2 * one) as engine:
+        collect(engine.submit(GenerationRequest([1, 2, 3], max_tokens=2)))
+        assert engine.health()["prompt_cache"]["entries"] == 1
+        # A long request holds caches far beyond the budget while it runs;
+        # the stored entry must be there whenever we look meanwhile.
+        long = engine.submit(GenerationRequest(list(range(4, 64)), max_tokens=600))
+        time.sleep(0.05)
+        other = engine.submit(GenerationRequest([7, 8, 9], max_tokens=2))
+        seen = [engine.health()["prompt_cache"]["entries"] for _ in long]
+        # The last token commits the long request's own entry, which does
+        # not fit and takes the store with it (an oversized entry evicts
+        # everything before itself) - a store rule, not a budget one.
+        assert len(seen) > 100 and min(seen[:-1]) >= 1
+        collect(other)
 
 
 def test_short_request_is_not_stuck_behind_a_long_prefill():
@@ -235,23 +272,6 @@ def test_short_request_is_not_stuck_behind_a_long_prefill():
         assert engine.health()["prefill_starved_calls"] == 0
     assert short < 0.5 * solo_long, (short, solo_long)
     assert result["long"] < 2.0 * solo_long, (result["long"], solo_long)
-
-
-def test_a_failing_store_reaches_the_finishing_stream():
-    # The store runs before the last token is delivered; if it raises, the
-    # worker dies and that stream must hear about it, not wait forever.
-    model = tiny_llama()
-    with Engine(model) as engine:
-
-        def boom(*args, **kwargs):
-            raise MemoryError("no room for the entry")
-
-        engine.prefix_store.insert = boom
-        stream = engine.submit(GenerationRequest([1, 2, 3], max_tokens=1))
-        with pytest.raises(EngineDead, match="no room"):
-            for _ in stream:
-                pass
-        assert not engine.alive
 
 
 def test_max_queued_refuses_the_overflow_with_a_count():
@@ -468,3 +488,21 @@ def test_sizes_come_from_the_wrapper_text_config():
         assert engine.health()["max_context"] == 512
         with pytest.raises(ContextTooLong):
             engine.submit(GenerationRequest(list(range(1, 60)) * 9, max_tokens=8))
+
+
+def test_a_failing_store_costs_the_entry_not_the_engine(monkeypatch):
+    """The entry of a finished row could not be written: the answer still
+    reaches the caller, the engine lives, health counts the loss."""
+    model = tiny_hybrid()
+    with Engine(model) as engine:
+
+        def broken(*a, **k):
+            raise RuntimeError("no room in the store")
+
+        monkeypatch.setattr(engine.prefix_store, "insert", broken)
+        out = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=3)))
+        assert len(out) == 3
+        h = engine.health()
+        assert h["alive"] and h["prompt_cache"]["store_failures"] == 1
+        # And the next request runs as if nothing happened.
+        assert len(collect(engine.submit(GenerationRequest([3, 7], max_tokens=2)))) == 2

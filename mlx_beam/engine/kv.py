@@ -51,8 +51,9 @@ class KVPolicy:
     group_size: int = 64
     layers: dict[int, int] = field(default_factory=dict)
     prefill: str = "exact"
-    # Where ``prefill`` came from: "default", "profile" (the package's
-    # kv_config, measured for it) or "flag" (the operator's word).
+    # Where ``prefill`` came from: "default", "profile" (the kv_config file
+    # itself says so), "manifest" (the package's manifest, measured for the
+    # kv_config it names) or "flag" (the operator's word).
     prefill_source: str = "default"
 
     def __post_init__(self):
@@ -70,10 +71,6 @@ class KVPolicy:
 
     def bits_for(self, layer: int) -> int | None:
         return self.layers.get(layer, self.bits)
-
-    @property
-    def quantizes(self) -> bool:
-        return self.bits is not None or any(b for b in self.layers.values())
 
     def describe(self) -> dict:
         return {

@@ -7,11 +7,100 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- A checkpoint in the package layout is read through its manifest:
+  `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
+  head's file, bits, group size and norm convention, and the file is
+  checked against the manifest's SHA-256 before it is loaded - a head whose
+  bytes differ from what the package was measured with is refused. A
+  plain checkpoint keeps the old paths (`mtp_file`, `mtp.*` in the shards)
+  and the loader's defaults.
+- The KV prefill mode a package measured for its own profile
+  (`parts.kv_config.prefill.mode` in the manifest) applies when
+  `--kv-config` names that file: the same bytes as the manifest's SHA-256
+  when it has one, else the same path; the profile's own `prefill` and
+  `--kv-prefill` still win. `/health.kv.prefill_source` says `manifest`
+  when it came from there.
+- The site's pages share one navigation; the current page is marked and
+  links that leave the site say so.
+
+### Changed
+- `--prompt-cache-bytes` is the store's own limit: the caches of running
+  requests no longer count against it, so a parallel request cannot push a
+  stored conversation out. The budget bounds what the store holds, nothing
+  else.
+- The README and the site describe what is built in the present tense and
+  name what is planned as planned; vision and audio will be a package of
+  their own, structured output and GGUF extras with a guard - none of them
+  in this release, and the `extra_not_installed` message says so instead
+  of suggesting an install line that would do nothing.
+- Versions between tags count towards the release they are heading for
+  (`0.1.0a5.devN` after `v0.1.0a4`) instead of the next minor; the rolling
+  `dev` GitHub release follows every merge to `main`, titled with version
+  and date; a tag is refused without its changelog section.
+- `--max-context` help text: only a prompt whose reserve does not fit is a
+  400, a larger `max_tokens` is served capped.
+
+### Fixed
+- The reasoning budget sees every token before the next decode step. While
+  a prefill shared the worker the generator ran several steps per call and
+  the budget observed them afterwards, so a forced close armed late and the
+  block overran its cap (up to a prefill slice's worth of tokens); the
+  engine now observes each step from inside the generator (`on_step`).
+- A response that is not streamed notices a client that went away: the
+  socket is peeked once a second and the row cancelled, instead of
+  decoding to `max_tokens` for nobody.
+- `logprobs.content` books a token whose text the automaton held back (the
+  start of a possible stop word or marker) with the token that releases
+  it; the eos token is never an entry, whatever its arrival flushed. Byte
+  tokens carry their own bytes, not those of U+FFFD - a SentencePiece
+  byte token (`<0xE2>`) its hex, a BPE one its byte alphabet.
+- `/v1/completions` no longer repeats a think opener the raw prompt ends
+  with; the reasoning state is seeded from the assistant's own frame only,
+  so a `<think>` or a recipient label inside a user message is text.
+- The warm-up runs a short prompt through the prefill (three tokens plus
+  a decode step), so a KV policy or a prefill path the model cannot carry
+  fails at start, as promised, not on the first request.
+- A prefix-store entry that cannot be written costs the entry, not the
+  engine: the answer is delivered, `/health.prompt_cache.store_failures`
+  counts it.
+- The speculative batch decodes every row through the trunk's halves; a
+  family that scales or softcaps its logits after the projection (Granite,
+  Gemma, Muse) now gets that post-processing there too, and the warm-up
+  checks the composition against the model's own forward bit for bit.
+- A Hugging Face repo id downloads a package's draft head and tower
+  sidecars (`mtp/`, `optiq/`): a second pass fetches every file the
+  checkpoint's config, manifest and weight index name beyond the default
+  patterns.
+- `beam serve` checks its flags before the load: the KV policy, the
+  template file (a path that names no file is refused instead of rendering
+  the path as the template), `--draft-model`, the request defaults and the
+  port; every refusal to start is exit code 3, argparse's own stay 2.
+  Count flags refuse 0 and negative values. `--trust-remote-code` reaches
+  the tokenizer. `--kv-bits` and `--kv-group-size` beat the checkpoint's
+  kv_config, as the help text said; the group size's default moved into
+  the resolution so a file's value applies only when the flag is unset.
+- Chat: `developer` is `system`; `tool_calls` must be a list (400, not
+  500); `max_completion_tokens: null` does not hide `max_tokens`;
+  `repetition_penalty` must be positive; `tools: []` is no tools.
+- A stop sequence of more than one token no longer leaves its start in
+  the answer: the sequence's last token goes through the detokenizer so
+  the text-level match completes and cuts there (only an eos token is
+  dropped unseen). A prefix before an eos, or cut by the length limit, is
+  still text.
+- `logprobs.content` keeps every token of a multi-byte character: byte
+  tokens the detokenizer holds until the character completes are booked
+  with the token that completes it, instead of being dropped as
+  non-content.
+
+## [0.1.0a4] - 2026-09-25
+
+### Added
 - Speculative decoding, first stage: `--draft-model bundled` loads the
   draft head a checkpoint ships (the `mtp_file` its config names, or the
   `mtp.*` tensors in its shards) and verifies its drafts in one forward
   per cycle. Greedy requests decoding alone get up to three drafts per
-  cycle (`--max-draft-tokens` caps that); everything else - several rows
+  cycle, four tokens with the one the model samples after them
+  (`--max-draft-tokens` caps the drafts); everything else - several rows
   at once, sampling, a request with repetition penalties, a thinking
   budget about to act - decodes plainly through the same path; a logit
   bias is applied to every verified position, so a request with one still

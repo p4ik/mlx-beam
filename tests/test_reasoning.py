@@ -97,7 +97,10 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
     tok = LevelTokenizer()
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
     chat.build_prompt(tok, req)
-    assert tok.seen == ["low", "minimal", "medium"]
+    # The ladder: low refused, minimal refused, medium rendered; every
+    # render after that (the assistant-start probe) uses the rung found.
+    assert tok.seen[:3] == ["low", "minimal", "medium"]
+    assert set(tok.seen[3:]) <= {"medium"}
     # The rung that rendered is kept, so the boundary renders agree.
     assert req.template_kwargs["reasoning_effort"] == "medium"
     tok.seen.clear()

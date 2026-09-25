@@ -6,6 +6,7 @@ per-request stream. Nothing here knows about text, HTTP or chat formats.
 
 from __future__ import annotations
 
+import collections
 import logging
 import queue
 import threading
@@ -27,6 +28,7 @@ from mlx_beam.engine.kv import (
     make_request_cache,
 )
 from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
+from mlx_beam.engine.proposer import check_head
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -187,7 +189,9 @@ class Engine:
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
         self.checkpoint_stride = checkpoint_stride
-        self.checkpoint_stride_max = checkpoint_stride_max
+        # The pruning keeps the newest and the oldest stride checkpoint and
+        # drops from between them, so fewer than two cannot be honoured.
+        self.checkpoint_stride_max = max(2, checkpoint_stride_max)
         # Prompt plus generation must fit; None reads the model's own limit.
         native = model_context_length(model)
         if max_context and native and max_context > native:
@@ -205,9 +209,7 @@ class Engine:
         # Waiting requests beyond this are refused at once instead of queued.
         self.max_queued = max_queued
         self._rejected_queue_full = 0
-        self._budget_warned_at = 0.0
         self.vocab_size = model_vocab_size(model)
-        self._prompt_cache_bytes = prompt_cache_bytes
         self._dead = False
         # Our names on the outside (mlx-lm's server flags), the generator's
         # keyword names on the inside.
@@ -242,34 +244,52 @@ class Engine:
         self._stride: dict[int, list[int]] = {}
         self._samplers = SamplerPool()
         self._budgets: dict[int, ThinkingBudget] = {}
+        # What each budget said about a token, in order, from the step that
+        # produced it (_on_step); the delivery loop takes them off the front.
+        self._observed: dict[int, collections.deque] = {}
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
         self._applied_caches: list[dict] | None = None
+        # Finished rows whose store entry could not be written (health).
+        self.store_failures = 0
         self._started_at = 0.0
         self._ready = threading.Event()
-        self.warmup_tokens: list[int] = [0]
+        # Four tokens: three through the prefill (the prompt batch, the KV
+        # policy's write path) and the last through a decode step - a
+        # single token skips the prefill entirely and a defect there would
+        # surface on the first client request instead of here.
+        self.warmup_tokens: list[int] = [0, 0, 0, 0]
 
     # -- lifecycle --------------------------------------------------------
 
     def start(self, timeout: float | None = 600.0) -> Engine:
-        """Start the worker and wait for its warm-up: one token through the
-        model with the configured KV layout. A policy the model cannot carry
-        fails here, not on the first client request."""
-        if self._thread is not None:
-            return self
-        # Lazy arrays carry the loading thread's stream; the worker cannot
-        # evaluate them ("There is no Stream(cpu, 0) in current thread").
-        # The state holds more than the parameters: rope frequency tables
-        # (Gemma 4, Llama 3) are lazy arrays outside parameters().
-        mx.eval(
-            [a for _, a in tree_flatten(self.model.state) if isinstance(a, mx.array)]
-        )
-        self._started_at = time.monotonic()
-        self._thread = threading.Thread(
-            target=self._run, name="beam-engine", daemon=True
-        )
-        self._thread.start()
+        """Start the worker and wait for its warm-up: a short prompt through
+        the prefill and one decode step with the configured KV layout. A
+        policy the model cannot carry fails here, not on the first client
+        request. A second call while the first warm-up runs waits for it."""
+        with self._lock:
+            if self._thread is None:
+                # Lazy arrays carry the loading thread's stream; the worker
+                # cannot evaluate them ("There is no Stream(cpu, 0) in
+                # current thread"). The state holds more than the
+                # parameters: rope frequency tables (Gemma 4, Llama 3) are
+                # lazy arrays outside parameters().
+                mx.eval(
+                    [
+                        a
+                        for _, a in tree_flatten(self.model.state)
+                        if isinstance(a, mx.array)
+                    ]
+                )
+                self._started_at = time.monotonic()
+                self._thread = threading.Thread(
+                    target=self._run, name="beam-engine", daemon=True
+                )
+                self._thread.start()
+        return self._await_ready(timeout)
+
+    def _await_ready(self, timeout: float | None) -> Engine:
         while not self._ready.wait(0.05):
             if not self._thread.is_alive():
                 raise EngineDead(self._death_message())
@@ -387,6 +407,8 @@ class Engine:
             raise InvalidRequest(
                 "xtc_probability must be in [0, 1], xtc_threshold in [0, 0.5]"
             )
+        if not 0.0 <= p.min_p <= 1.0:
+            raise InvalidRequest("min_p must be in [0, 1]")
         if p.min_tokens_to_keep < 1:
             raise InvalidRequest("min_tokens_to_keep must be at least 1")
         if p.temperature < 0:
@@ -479,7 +501,10 @@ class Engine:
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
             },
-            "prompt_cache": self.prefix_store.describe(),
+            "prompt_cache": {
+                **self.prefix_store.describe(),
+                "store_failures": self.store_failures,
+            },
             "sampling": self._samplers.describe(),
             # None: no proposer configured, every row decodes plainly.
             "speculative": (
@@ -502,16 +527,17 @@ class Engine:
     def _fail_everything(self, error: BaseException) -> None:
         with self._lock:
             self._dead = True
-        dead = EngineDead(f"engine worker died: {error!r}")
+        message = f"engine worker died: {error!r}"
         if self._admitting is not None:
-            self._admitting.put(dead)
+            self._admitting.put(EngineDead(message))
             self._admitting = None
         for stream in self._live.values():
-            stream.put(dead)
+            stream.put(EngineDead(message))
         self._live.clear()
         self._bookkeeping.clear()
         self._stride.clear()
         self._budgets.clear()
+        self._observed.clear()
         self._spec_rows.clear()
         self._spec_bias.clear()
         while True:
@@ -573,7 +599,9 @@ class Engine:
         stream.prompt_cached = covered
         stream.put(PromptProgress(0, len(rest), covered))
         self._live[uid] = stream
-        self._bookkeeping[uid] = (covered, dict(carried))
+        # Copies of the store's own checkpoint dicts: a sidecar written into
+        # a row's checkpoints must never land in the entry it came from.
+        self._bookkeeping[uid] = (covered, {p: dict(c) for p, c in carried.items()})
         self._stride[uid] = []
         if thinking is not None:
             self._budgets[uid] = thinking
@@ -592,19 +620,6 @@ class Engine:
                 self._spec_bias[uid] = (
                     mx.array(list(p.logit_bias.keys())),
                     mx.array(list(p.logit_bias.values())),
-                )
-        if self._prompt_cache_bytes:
-            # Stored prefixes yield to the caches of running requests.
-            room = self._prompt_cache_bytes - gen.prompt_cache_nbytes
-            self.prefix_store.trim_to_bytes(room)
-            if room < 0 and time.monotonic() - self._budget_warned_at > 60:
-                self._budget_warned_at = time.monotonic()
-                logger.warning(
-                    "prompt cache budget %d bytes is below the caches of the "
-                    "running requests (%d bytes): nothing can be stored until "
-                    "they finish",
-                    self._prompt_cache_bytes,
-                    gen.prompt_cache_nbytes,
                 )
 
     def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
@@ -682,6 +697,7 @@ class Engine:
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
+            self._observed.pop(u, None)
             self._forget_row(u)
             got = partial.get(u)
             if got is None:
@@ -696,13 +712,55 @@ class Engine:
                     self.model_key,
                     list(tokens),
                     cache,
-                    checkpoints={
-                        p: c for p, c in checkpoints.items() if p <= len(tokens)
-                    },
+                    checkpoints=checkpoints,
                     cache_type="assistant",
                 )
             except Exception:  # noqa: BLE001 - a lost partial is no failure
                 traceback.print_exc()
+
+    def _on_step(self, step) -> None:
+        """One decode step's responses, from inside the generator before the
+        next step: every budget observes its token now, so a forced close
+        arms in time and a speculative cycle judges `stable_for` on the
+        current count - not after a run of steps that shared the worker
+        with a prefill."""
+        for r in step:
+            thinking = self._budgets.get(r.uid)
+            if thinking is None:
+                continue
+            thinking.observe(r.token, r.finish_reason)
+            self._observed.setdefault(r.uid, collections.deque()).append(
+                (
+                    thinking.last_forced,
+                    thinking.thinking_truncated,
+                    thinking.in_reasoning,
+                )
+            )
+
+    def _store_finished(self, s: ResultStream, r, checkpoints: dict) -> None:
+        """A finished row into the prefix store, plus its system block as an
+        entry of its own when the request marked one."""
+        own_recurrent_state(r.prompt_cache)
+        stored = for_store(r.prompt_cache)
+        tokens = list(r.all_tokens)
+        self.prefix_store.insert(
+            self.model_key,
+            tokens,
+            stored,
+            checkpoints=checkpoints,
+            cache_type="assistant",
+        )
+        if s.request.system_end:
+            # The system block as its own entry: evicted after every
+            # conversation, so the expensive prefix survives a full
+            # turnover of the store.
+            self.prefix_store.insert_prefix(
+                self.model_key,
+                tokens,
+                stored,
+                checkpoints,
+                s.request.system_end,
+            )
 
     def _forget_row(self, uid: int) -> None:
         self._spec_rows.pop(uid, None)
@@ -719,6 +777,9 @@ class Engine:
                 break
         self._applied_caches = describe_caches(cache)
         if self.speculator is not None:
+            # The trunk's head must give the model's own logits: a family
+            # whose post-processing it does not compose is refused here.
+            check_head(self.model, list(self.warmup_tokens))
             # One verify cycle through the model with the configured KV
             # layout: a head or a cache layer the path cannot carry fails
             # here, not on the first client request.
@@ -750,7 +811,11 @@ class Engine:
             else None
         )
         gen = BatchGenerator(
-            self.model, stop_tokens=[], generation_batch=batch_class, **self._gen_args
+            self.model,
+            stop_tokens=[],
+            generation_batch=batch_class,
+            on_step=self._on_step,
+            **self._gen_args,
         )
         self._gen = gen
         try:
@@ -805,35 +870,26 @@ class Engine:
                         continue
                     if r.finish_reason is not None:
                         # Store first: when the caller sees the last token,
-                        # the next request can already find the entry. The
-                        # stream stays in _live until it has the token, so a
-                        # failing store still reaches it as EngineDead.
+                        # the next request can already find the entry. A
+                        # store that fails costs that entry, not the engine:
+                        # the token still goes out, health counts the loss.
                         _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
                         self._stride.pop(r.uid, None)
-                        own_recurrent_state(r.prompt_cache)
-                        stored = for_store(r.prompt_cache)
-                        tokens = list(r.all_tokens)
-                        self.prefix_store.insert(
-                            self.model_key,
-                            tokens,
-                            stored,
-                            checkpoints=checkpoints,
-                            cache_type="assistant",
-                        )
-                        if s.request.system_end:
-                            # The system block as its own entry: evicted after
-                            # every conversation, so the expensive prefix
-                            # survives a full turnover of the store.
-                            self.prefix_store.insert_prefix(
-                                self.model_key,
-                                tokens,
-                                stored,
-                                checkpoints,
-                                s.request.system_end,
+                        try:
+                            self._store_finished(s, r, checkpoints)
+                        except Exception:  # noqa: BLE001 - logged and counted
+                            self.store_failures += 1
+                            logger.exception(
+                                "storing request %s failed; the answer is delivered, "
+                                "the entry is not kept",
+                                s.request.request_id,
                             )
-                    thinking = self._budgets.get(r.uid)
-                    if thinking is not None:
-                        thinking.observe(r.token, r.finish_reason)
+                    # The budget saw this token in _on_step, before the step
+                    # after it ran; what it said then is this token's.
+                    seen = self._observed.get(r.uid)
+                    forced, truncated, in_reasoning = (
+                        seen.popleft() if seen else (False, False, False)
+                    )
                     cut = r.finish_reason == "length"
                     s.put(
                         TokenEvent(
@@ -845,17 +901,15 @@ class Engine:
                                 if s.request.top_logprobs
                                 else None
                             ),
-                            thinking_truncated=(
-                                thinking is not None and thinking.thinking_truncated
-                            ),
-                            response_truncated=cut
-                            and (thinking is None or not thinking.in_reasoning),
-                            forced=thinking is not None and thinking.last_forced,
+                            thinking_truncated=truncated,
+                            response_truncated=cut and not in_reasoning,
+                            forced=forced,
                         )
                     )
                     if r.finish_reason is not None:
                         del self._live[r.uid]
                         self._budgets.pop(r.uid, None)
+                        self._observed.pop(r.uid, None)
                         self._forget_row(r.uid)
         finally:
             gen.close()

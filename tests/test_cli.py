@@ -91,13 +91,13 @@ def test_doctor_reports_missing_package(monkeypatch, capsys):
 
 
 def test_serve_kv_policy_from_arguments(tmp_path):
-    from mlx_beam.cli import kv_policy_from_args, main
+    from mlx_beam.cli import StartupError, kv_policy_from_args, main
 
     cfg = tmp_path / "kv.json"
     cfg.write_text('{"bits": 4, "group_size": 32, "layers": {"3": 8}}')
     import argparse
 
-    args = argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(cfg))
+    args = argparse.Namespace(kv_bits=None, kv_group_size=None, kv_config=str(cfg))
     policy = kv_policy_from_args(args)
     assert (policy.bits, policy.group_size, policy.layers) == (4, 32, {3: 8})
     assert policy.bits_for(3) == 8 and policy.bits_for(0) == 4
@@ -109,25 +109,25 @@ def test_serve_kv_policy_from_arguments(tmp_path):
         '[{"layer_idx": 3, "bits": 4, "group_size": 32}, {"layer_idx": 7, "bits": 4, "group_size": 32}]'
     )
     policy = kv_policy_from_args(
-        argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(listed))
+        argparse.Namespace(kv_bits=8, kv_group_size=None, kv_config=str(listed))
     )
     assert (policy.bits, policy.group_size, policy.layers) == (8, 32, {3: 4, 7: 4})
     assert policy.bits_for(7) == 4 and policy.bits_for(11) == 8
     policy = kv_policy_from_args(
-        argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(listed))
+        argparse.Namespace(kv_bits=None, kv_group_size=None, kv_config=str(listed))
     )
     assert policy.bits is None and policy.bits_for(11) is None
     mixed = tmp_path / "mixed.json"
     mixed.write_text(
         '[{"layer_idx": 3, "bits": 4, "group_size": 32}, {"layer_idx": 7, "bits": 4, "group_size": 64}]'
     )
-    with pytest.raises(SystemExit, match="one group size"):
+    with pytest.raises(StartupError, match="one group size"):
         kv_policy_from_args(
             argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(mixed))
         )
     nameless = tmp_path / "nameless.json"
     nameless.write_text('[{"bits": 4}]')
-    with pytest.raises(SystemExit, match="layer_idx"):
+    with pytest.raises(StartupError, match="layer_idx"):
         kv_policy_from_args(
             argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(nameless))
         )
@@ -136,7 +136,7 @@ def test_serve_kv_policy_from_arguments(tmp_path):
     for text in ('[{"layer_idx": 3}]', '[{"layer_idx": 3, "bits": null}]'):
         bitless = tmp_path / "bitless.json"
         bitless.write_text(text)
-        with pytest.raises(SystemExit, match="bits"):
+        with pytest.raises(StartupError, match="bits"):
             kv_policy_from_args(
                 argparse.Namespace(kv_bits=8, kv_group_size=64, kv_config=str(bitless))
             )
@@ -202,15 +202,15 @@ def test_chat_template_flag_takes_text_or_a_file(tmp_path):
 def test_bad_flags_fail_before_the_model_loads(tmp_path):
     import argparse
 
-    from mlx_beam.cli import kv_policy_from_args, main
+    from mlx_beam.cli import StartupError, kv_policy_from_args, main
 
     bad = tmp_path / "kv.json"
     bad.write_text('{"bits": 4, "layers": [1, 2]}')
-    with pytest.raises(SystemExit, match="kv-config"):
+    with pytest.raises(StartupError, match="kv-config"):
         kv_policy_from_args(
             argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config=str(bad))
         )
-    with pytest.raises(SystemExit, match="kv-config"):
+    with pytest.raises(StartupError, match="kv-config"):
         kv_policy_from_args(
             argparse.Namespace(kv_bits=None, kv_group_size=64, kv_config="/nowhere")
         )
@@ -223,7 +223,7 @@ def test_bad_flags_fail_before_the_model_loads(tmp_path):
 
 
 def test_kv_prefill_comes_from_the_flag_the_profile_or_the_default(tmp_path):
-    from mlx_beam.cli import kv_policy_from_args
+    from mlx_beam.cli import StartupError, kv_policy_from_args
 
     policy = kv_policy_from_args(serve_args("--kv-bits", "8"))
     assert (policy.prefill, policy.prefill_source) == ("exact", "default")
@@ -250,5 +250,189 @@ def test_kv_prefill_comes_from_the_flag_the_profile_or_the_default(tmp_path):
     assert (policy.prefill, policy.prefill_source) == ("quantized", "flag")
     bad = tmp_path / "bad.json"
     bad.write_text('{"bits": 8, "prefill": "later"}')
-    with pytest.raises(SystemExit, match="prefill"):
+    with pytest.raises(StartupError, match="prefill"):
         kv_policy_from_args(serve_args("--kv-config", str(bad)))
+
+
+def test_kv_prefill_from_the_package_manifest_only_for_its_own_kv_config(tmp_path):
+    """A package's manifest says which prefill mode its kv_config was measured
+    with; that applies when the served profile is that file (by path or by
+    hash), not to another profile and not over a flag or the file's own word."""
+    import logging
+
+    from mlx_beam.cli import kv_policy_from_args, policy_with_package_prefill
+    from mlx_beam.package import sha256_of
+
+    pkg = tmp_path / "pkg"
+    (pkg / "extras").mkdir(parents=True)
+    listed = pkg / "extras" / "kv_config.json"
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 64}]')
+    (pkg / "config.json").write_text(
+        json.dumps(
+            {"model_type": "llama", "extras": {"manifest": "extras/manifest.json"}}
+        )
+    )
+    (pkg / "extras" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "beam",
+                "version": 1,
+                "parts": {
+                    "kv_config": {
+                        "file": "extras/kv_config.json",
+                        "sha256": sha256_of(listed),
+                        "prefill": {"mode": "quantized", "measured": "2026-09-18"},
+                    }
+                },
+            }
+        )
+    )
+    log = logging.getLogger("beam-test")
+
+    args = serve_args("--kv-bits", "8", "--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "manifest")
+
+    # The same bytes under another path are the same profile.
+    copy = tmp_path / "elsewhere.json"
+    copy.write_text(listed.read_text())
+    args = serve_args("--kv-bits", "8", "--kv-config", str(copy))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("quantized", "manifest")
+
+    # The package's file edited in place is not the measured profile: the
+    # manifest carries a hash, and the hash decides, not the path.
+    listed.write_text('[{"layer_idx": 3, "bits": 8, "group_size": 64}]')
+    args = serve_args("--kv-bits", "8", "--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 64}]')
+
+    # Another profile was not measured; the flag beats the manifest.
+    other = tmp_path / "other.json"
+    other.write_text('[{"layer_idx": 5, "bits": 8, "group_size": 64}]')
+    args = serve_args("--kv-bits", "8", "--kv-config", str(other))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+    args = serve_args("--kv-config", str(listed), "--kv-prefill", "exact")
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "flag")
+
+    # A plain checkpoint has no manifest; nothing changes.
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "config.json").write_text('{"model_type": "llama"}')
+    args = serve_args("--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, plain, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+
+
+def test_package_files_names_what_the_default_download_misses(tmp_path):
+    """A repo id downloads `model*.safetensors`; a package keeps its draft
+    head and tower sidecars in subfolders the pattern never matches. The
+    second pass asks for exactly those, and nothing already covered."""
+    import json
+
+    from mlx_beam._vendor.mlx_lm.utils import package_files
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "mtp_file": "mtp/weights.safetensors",
+                "extras": {"manifest": "extras/manifest.json"},
+            }
+        )
+    )
+    (tmp_path / "extras").mkdir()
+    (tmp_path / "extras" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "parts": {
+                    "mtp": {"file": "mtp/weights.safetensors"},
+                    "vision": {"file": "optiq/optiq_vision.safetensors"},
+                }
+            }
+        )
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "optiq/optiq_vision.safetensors",
+                }
+            }
+        )
+    )
+    assert package_files(tmp_path) == [
+        "mtp/weights.safetensors",
+        "optiq/optiq_vision.safetensors",
+    ]
+    assert package_files(tmp_path / "nowhere") == []
+
+
+def test_startup_checks_come_before_the_load(tmp_path, monkeypatch):
+    """A typo in the template path, a draft flag that is not 'bundled', a
+    default out of range, an occupied port: every one of them is exit 3
+    before the model is loaded - and argparse's own refusals stay 2."""
+    import socket
+
+    from mlx_beam.cli import chat_template_from_args, main
+
+    loaded = []
+    import mlx_beam._vendor.mlx_lm.utils as utils
+
+    monkeypatch.setattr(utils, "load", lambda *a, **k: loaded.append(1) or (None, None))
+    # A file that is not there, named like one.
+    args = serve_args("--chat-template", str(tmp_path / "missing.jinja"))
+    with pytest.raises(Exception, match="no such file"):
+        chat_template_from_args(args)
+    assert chat_template_from_args(serve_args("--chat-template", "{{ messages }}"))
+    assert main(["serve", "--model", "x", "--chat-template", "tmpl/none.jinja"]) == 3
+    assert main(["serve", "--model", "x", "--draft-model", "other/repo"]) == 3
+    assert main(["serve", "--model", "x", "--temp", "9"]) == 3
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        assert (
+            main(["serve", "--model", "x", "--host", "127.0.0.1", "--port", str(port)])
+            == 3
+        )
+    assert not loaded
+    for bad in (
+        ["--prefill-step-size", "0"],
+        ["--prompt-concurrency", "0"],
+        ["--max-context", "-1"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main(["serve", "--model", "x", *bad])
+        assert exc.value.code == 2
+
+
+def test_a_flag_beats_the_kv_config_file(tmp_path):
+    """The help text says so: --kv-bits and --kv-group-size win over what
+    the checkpoint's kv_config carries; only an unset flag takes the file's."""
+    import argparse
+
+    from mlx_beam.cli import kv_policy_from_args
+
+    cfg = tmp_path / "kv.json"
+    cfg.write_text('{"bits": 4, "group_size": 32, "layers": {"3": 8}}')
+    policy = kv_policy_from_args(
+        argparse.Namespace(kv_bits=8, kv_group_size=128, kv_config=str(cfg))
+    )
+    assert (policy.bits, policy.group_size) == (8, 128) and policy.bits_for(3) == 8
+    listed = tmp_path / "kv_config.json"
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 32}]')
+    policy = kv_policy_from_args(
+        argparse.Namespace(kv_bits=None, kv_group_size=128, kv_config=str(listed))
+    )
+    assert policy.group_size == 128 and policy.bits_for(3) == 4
+    # Nothing set anywhere: 64.
+    assert (
+        kv_policy_from_args(
+            argparse.Namespace(kv_bits=None, kv_group_size=None, kv_config=None)
+        ).group_size
+        == 64
+    )

@@ -38,8 +38,12 @@ def unsupported(what: str, param: str | None = None) -> ApiError:
 
 
 def missing_extra(feature: str, extra: str) -> ApiError:
+    """The feature lives outside the core (vision and audio as their own
+    package, structured output behind a guard). No install line until the
+    extra exists: this release provides none of them."""
     return ApiError(
-        f"{feature} needs the '{extra}' extra, which is not installed",
+        f"{feature} needs the '{extra}' extra, which this release does not "
+        "provide yet",
         code="extra_not_installed",
     )
 

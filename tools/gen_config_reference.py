@@ -45,9 +45,14 @@ def value_column(action: argparse.Action) -> str:
         name = action.metavar if isinstance(action.metavar, str) else action.metavar[0]
         return f"`{name}`" + (" (one or more)" if action.nargs == "+" else "")
     kind = getattr(action.type, "__name__", None)
-    return {"int": "integer", "float": "number", "str": "text", None: "text"}.get(
-        kind, "text"
-    )
+    return {
+        "int": "integer",
+        "_positive_int": "integer ≥ 1",
+        "_count": "integer ≥ 0",
+        "float": "number",
+        "str": "text",
+        None: "text",
+    }.get(kind, "text")
 
 
 def default_column(action: argparse.Action) -> str:

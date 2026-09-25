@@ -305,23 +305,39 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
 # -- the bundled head ------------------------------------------------------
 
 
-def synthetic_head_checkpoint(tmp_path: Path, model, layout: str) -> Path:
-    """A checkpoint directory with a random MTP head: `layout` 'beam' names
-    the file in config.json, 'shards' puts the tensors into a shard listed in
-    the index, 'none' ships no head."""
+def synthetic_head_checkpoint(
+    tmp_path: Path, model, layout: str, manifest_mtp: dict | None = None
+) -> Path:
+    """A checkpoint directory with a random MTP head: `layout` 'beam' is the
+    package layout (config.json `extras.manifest`, the head under `mtp/` as
+    `parts.mtp` with its SHA-256; `manifest_mtp` overrides that entry),
+    'mtp_file' names the file in config.json only, 'shards' puts the tensors
+    into a shard listed in the index, 'none' ships no head."""
+    from mlx_beam.package import sha256_of
+
     args = model.language_model.args
     head = MTPHead(args, type(model.language_model.model.layers[1]))
     mx.eval(head.parameters())
     flat = dict(nn.utils.tree_flatten(head.parameters()))
     cfg = dict(TINY_QWEN35_WRAPPED)
-    if layout == "beam":
+    if layout in ("beam", "mtp_file"):
         (tmp_path / "mtp").mkdir()
-        mx.save_safetensors(
-            str(tmp_path / "mtp" / "weights.safetensors"),
-            {f"mtp.{k}": v for k, v in flat.items()},
-        )
+        head_file = tmp_path / "mtp" / "weights.safetensors"
+        mx.save_safetensors(str(head_file), {f"mtp.{k}": v for k, v in flat.items()})
         cfg["mtp_file"] = "mtp/weights.safetensors"
-        cfg["beam"] = {"mtp": {"norm_convention": "hf"}}
+    if layout == "beam":
+        (tmp_path / "extras").mkdir()
+        cfg["extras"] = {"manifest": "extras/manifest.json"}
+        entry = {
+            "file": "mtp/weights.safetensors",
+            "sha256": sha256_of(head_file),
+            "norm_convention": "hf",
+        }
+        if manifest_mtp is not None:
+            entry = manifest_mtp
+        (tmp_path / "extras" / "manifest.json").write_text(
+            json.dumps({"format": "beam", "version": 1, "parts": {"mtp": entry}})
+        )
     elif layout == "shards":
         mx.save_safetensors(
             str(tmp_path / "model-00002-of-00002.safetensors"),
@@ -340,12 +356,13 @@ def synthetic_head_checkpoint(tmp_path: Path, model, layout: str) -> Path:
     return tmp_path
 
 
-@pytest.mark.parametrize("layout", ["beam", "shards"])
+@pytest.mark.parametrize("layout", ["beam", "mtp_file", "shards"])
 def test_bundled_head_loads_quantized_with_shifted_norms(tmp_path, layout):
     model = tiny_qwen35()
     path = synthetic_head_checkpoint(tmp_path, model, layout)
     head, info = load_bundled_head(model, path)
     assert info["kind"] == "mtp" and info["bits"] == 4 and info["norms_shifted"]
+    assert info["manifest"] == info["verified"] == (layout == "beam")
     assert isinstance(head.layers[0].self_attn.q_proj, nn.QuantizedLinear)
     assert isinstance(head.fc, nn.Linear) and not isinstance(
         head.fc, nn.QuantizedLinear
@@ -354,13 +371,48 @@ def test_bundled_head_loads_quantized_with_shifted_norms(tmp_path, layout):
         str(
             path
             / (
-                "mtp/weights.safetensors"
-                if layout == "beam"
-                else "model-00002-of-00002.safetensors"
+                "model-00002-of-00002.safetensors"
+                if layout == "shards"
+                else "mtp/weights.safetensors"
             )
         )
     )
     assert mx.allclose(head.norm.weight, raw["mtp.norm.weight"] + 1.0)
+
+
+def test_manifest_sets_bits_and_norm_convention_and_checks_the_hash(tmp_path):
+    """The package manifest is the source for the head's quantization and
+    norm convention; a head whose bytes do not match the manifest is refused."""
+    model = tiny_qwen35()
+    path = synthetic_head_checkpoint(
+        tmp_path,
+        model,
+        "beam",
+        manifest_mtp={
+            "file": "mtp/weights.safetensors",
+            "bits": 8,
+            "group_size": 32,
+            "norm_convention": "mlx",
+        },
+    )
+    head, info = load_bundled_head(model, path)
+    assert (info["bits"], info["group_size"]) == (8, 32)
+    assert not info["norms_shifted"] and info["manifest"] and not info["verified"]
+    raw = mx.load(str(path / "mtp/weights.safetensors"))
+    assert mx.allclose(head.norm.weight, raw["mtp.norm.weight"])
+
+    manifest = path / "extras" / "manifest.json"
+    entry = json.loads(manifest.read_text())
+    entry["parts"]["mtp"]["sha256"] = "0" * 64
+    manifest.write_text(json.dumps(entry))
+    with pytest.raises(ValueError, match="sha256"):
+        load_bundled_head(model, path)
+    # A part without a file cannot be checked; config.json's mtp_file is no
+    # substitute, the manifest never vouched for those bytes.
+    del entry["parts"]["mtp"]["file"]
+    manifest.write_text(json.dumps(entry))
+    with pytest.raises(ValueError, match="names no file"):
+        load_bundled_head(model, path)
 
 
 def test_shift_norms_touches_all_seven_and_nothing_else():
@@ -458,7 +510,7 @@ def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):
         assert proposer_from_args(args, model, path, log) is None
     assert "bundles a draft head" in caplog.text  # a hint, not a default
     args.draft_model = "some/repo"
-    with pytest.raises(ValueError, match="only 'bundled'"):
+    with pytest.raises(ValueError, match="only --draft-model bundled"):
         proposer_from_args(args, model, path, log)
     args.draft_model = "bundled"
     proposer = proposer_from_args(args, model, path, log)
@@ -515,3 +567,50 @@ def test_rollback_on_metal_matches_a_shorter_forward(family, head_dim, dtype, ke
         assert mx.allclose(g, w, atol=1e-5, rtol=1e-4)
         if keep > 1 or dtype == mx.bfloat16:
             assert mx.array_equal(got, want)
+
+
+def test_the_trunk_head_reproduces_the_model_logits_or_is_refused():
+    """The speculative batch decodes every row through the trunk's halves;
+    a family that scales or softcaps its logits after the projection must
+    come out bit-equal to its own forward, and one the composition does
+    not cover is refused at warm-up instead of sampling from the wrong
+    distribution."""
+    from mlx_beam._vendor.mlx_lm.models import granite
+    from mlx_beam.engine.proposer import check_head, trunk
+
+    args = granite.ModelArgs.from_dict(
+        dict(
+            model_type="granite",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            logits_scaling=8.0,
+            attention_multiplier=0.25,
+            embedding_multiplier=2.0,
+            residual_multiplier=0.5,
+            max_position_embeddings=512,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+        )
+    )
+    mx.random.seed(3)
+    model = granite.Model(args)
+    mx.eval(model.parameters())
+    x = mx.array([[3, 7, 11, 13]])
+    inner, head, _ = trunk(model)
+    assert mx.array_equal(model(x), head(inner(x)))
+    check_head(model, [3, 7, 11, 13])
+    # A family whose forward does something the trunk does not know.
+    own = type(model).__call__
+    model.__class__ = type(
+        "Odd",
+        (type(model),),
+        {"__call__": lambda self, *a, **k: own(self, *a, **k) * 2},
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        check_head(model, [3, 7, 11, 13])
