@@ -88,7 +88,7 @@ profile = "black"
 [tool.ruff]
 line-length = 88
 target-version = "py311"
-extend-exclude = ["mlx_beam/_vendor", "packages/*/*/_vendor"]
+extend-exclude = ["mlx_beam/_vendor", "packages/*/*/_vendor", "**/_version.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP"]
