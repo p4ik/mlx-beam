@@ -162,8 +162,11 @@ class VisionFrontend:
         rendered without it is a prefix of `text`, and the frame that
         follows tokenizes on its own (it opens with a marker or a line
         break). No processor call, no image: the frame's ids are matched
-        against the prompt's tail, and 0 - the whole prompt - is the answer
-        whenever they do not match or the template will not render."""
+        against the prompt's tail. A template that renders the same either
+        way puts the start at the end (nothing of the prompt is the
+        assistant's, as the text path reads it); 0 - the whole prompt - is
+        the answer only when the template will not render or the frame's
+        ids do not match."""
         tok = getattr(self.processor, "tokenizer", None)
         if tok is None or not isinstance(text, str):
             return 0
@@ -175,7 +178,10 @@ class VisionFrontend:
             return 0
         if not isinstance(without, str) or not text.startswith(without):
             return 0
-        frame = tok.encode(text[len(without) :], add_special_tokens=False)
+        suffix = text[len(without) :]
+        if not suffix:
+            return len(ids)
+        frame = tok.encode(suffix, add_special_tokens=False)
         n = len(frame)
         if not n or n > len(ids) or ids[-n:] != [int(t) for t in frame]:
             return 0

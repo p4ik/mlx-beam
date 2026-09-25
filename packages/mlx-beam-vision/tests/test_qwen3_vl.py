@@ -90,10 +90,12 @@ class FakeProcessor:
 
     tokenizer = Tok()
 
-    def __init__(self, grids, with_bos=False):
+    def __init__(self, grids, with_bos=False, no_generation_suffix=False):
         self.grids = list(grids)
         self.tok = StubTokenizer()
         self.with_bos = with_bos
+        # A template that ignores add_generation_prompt renders the same.
+        self.no_generation_suffix = no_generation_suffix
         self.calls: list[dict] = []
         self.template_kwargs: list[dict] = []
 
@@ -101,7 +103,9 @@ class FakeProcessor:
         self, messages, tokenize=False, add_generation_prompt=True, **kw
     ):
         self.template_kwargs.append(kw)
-        return Rendered(messages, self.with_bos, add_generation_prompt)
+        return Rendered(
+            messages, self.with_bos, add_generation_prompt or self.no_generation_suffix
+        )
 
     def __call__(self, text, images=None, return_tensors="np", **kw):
         self.calls.append(kw)
@@ -235,6 +239,11 @@ def test_frontend_guards_the_prompt_and_the_pixels():
     plain = FakeProcessor([(1, 4, 4)])
     VisionFrontend(plain, tower(), "qwen3_vl").build(messages, [png(1)], {})
     assert plain.calls == [{}]
+    # A template that renders the assistant's prefix either way: the frame
+    # begins at the end, not at 0 - a `<think>` in the user's text is text.
+    same = FakeProcessor([(1, 4, 4)], no_generation_suffix=True)
+    built = VisionFrontend(same, tower(), "qwen3_vl").build(messages, [png(1)], {})
+    assert built.assistant_start == len(built.tokens)
     # The cap reads the header, not the pixels: a 8000 x 8000 PNG of one
     # colour is a few kilobytes and would decode to 192 MB.
     buf = io.BytesIO()
