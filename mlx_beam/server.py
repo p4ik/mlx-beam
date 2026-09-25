@@ -59,6 +59,7 @@ class Served:
         defaults: RequestDefaults | None = None,
         allowed_origins: Sequence[str] = ("*",),
         chat_template_source: str = "model",
+        frontend=None,
     ):
         if reasoning_field not in chat.REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
@@ -70,6 +71,9 @@ class Served:
         self.allowed_origins = tuple(allowed_origins)
         # "model", "flag" or "default": where the chat template came from.
         self.chat_template_source = chat_template_source
+        # The modality frontend a separate package loaded for this
+        # checkpoint (mlx-beam-vision), or None: text only.
+        self.frontend = frontend
         self.started_at = time.time()
 
     def capabilities(self) -> dict:
@@ -78,7 +82,7 @@ class Served:
             "chat": bool(getattr(t, "has_chat_template", True)),
             "tools": bool(getattr(t, "has_tool_calling", False)),
             "thinking": bool(getattr(t, "has_thinking", False)),
-            "vision": False,
+            "vision": self.frontend is not None,
             "audio": False,
         }
 
@@ -100,6 +104,8 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
+        # What serves images, with its evidence; None: the core alone.
+        h["vision"] = None if self.frontend is None else self.frontend.describe()
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
@@ -420,10 +426,17 @@ class Handler(BaseHTTPRequestHandler):
         self._check_model(body)
         tok = self.served.tokenizer
         req = chat.parse_chat_request(
-            body, self.served.model_name, self.served.defaults
+            body,
+            self.served.model_name,
+            self.served.defaults,
+            vision=self.served.frontend is not None,
         )
         gen_request = chat.to_generation_request(
-            tok, req, self.served.defaults, self.served.engine.max_context
+            tok,
+            req,
+            self.served.defaults,
+            self.served.engine.max_context,
+            frontend=self.served.frontend,
         )
         responder = chat.ChatResponder(
             tok, req, gen_request.tokens, reasoning_field=self.served.reasoning_field

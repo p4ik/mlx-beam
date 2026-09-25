@@ -287,7 +287,11 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        layer_hook=None,
     ) -> mx.array:
+        # layer_hook(index, hidden) after each layer: what a vision frontend
+        # adds at the image positions of the first layers (DeepStack);
+        # VENDORED.md, layer hook.
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -310,9 +314,11 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
 
-        for layer, c in zip(self.pipeline_layers, cache):
+        for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            if layer_hook is not None:
+                hidden_states = layer_hook(i, hidden_states)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:

@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mlx_beam.engine.thinking import ReasoningLimits
@@ -37,6 +37,27 @@ class SamplingParams:
     seed: int | None = None
 
 
+@dataclass(frozen=True)
+class ImageSpan:
+    """An image's place in the prompt: the placeholder positions
+    [start, end) whose embeddings come from the image's features rather
+    than the vocabulary, the features (end - start, hidden) the frontend
+    computed, optional features added at the image positions after the
+    first text layers (DeepStack, one per layer), and the image's digest -
+    the prefix cache keys on it, so the same placeholders with another
+    image never meet."""
+
+    start: int
+    end: int
+    features: Any
+    digest: str
+    deepstack: tuple = ()
+
+    def __post_init__(self):
+        if self.end <= self.start:
+            raise ValueError("an image span must cover at least one position")
+
+
 @dataclass
 class GenerationRequest:
     """Token ids in, tokens out. Text belongs to the API layer."""
@@ -61,11 +82,30 @@ class GenerationRequest:
     max_prompt_tokens: int | None = None
     # Think markers and the reasoning budget; None: no budget, no forcing.
     reasoning: ReasoningLimits | None = None
+    # Images in the prompt, by position; the prefill takes their features
+    # in place of the placeholder tokens' embeddings.
+    spans: Sequence[ImageSpan] = ()
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
         if not self.tokens:
             raise ValueError("prompt is empty")
+        for span in self.spans:
+            if span.end > len(self.tokens):
+                raise ValueError("an image span reaches past the prompt")
+
+    @property
+    def cache_key(self) -> list[int]:
+        """What the prefix store keys on: the tokens, with every image
+        span's positions replaced by ids derived from the image's digest -
+        the same length, so boundaries keep their positions, and never a
+        vocabulary id, so text never matches an image."""
+        key = list(self.tokens)
+        for span in self.spans:
+            seed = int(span.digest[:16], 16) if span.digest else 0
+            for i in range(span.start, span.end):
+                key[i] = -1 - ((seed + (i - span.start) * 0x9E3779B1) % (2**31))
+        return key
         if self.max_tokens < 1:
             raise ValueError("max_tokens must be at least 1")
         if self.top_logprobs < 0:

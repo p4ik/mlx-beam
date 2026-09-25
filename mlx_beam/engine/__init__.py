@@ -9,7 +9,12 @@ from mlx_beam.engine.core import (
     reset_peak_memory,
 )
 from mlx_beam.engine.kv import KVPolicy
-from mlx_beam.engine.request import GenerationRequest, ResultStream, TokenEvent
+from mlx_beam.engine.request import (
+    GenerationRequest,
+    ImageSpan,
+    ResultStream,
+    TokenEvent,
+)
 from mlx_beam.engine.thinking import ContextTooLong, ReasoningLimits
 
 __all__ = [
@@ -18,6 +23,7 @@ __all__ = [
     "EngineDead",
     "InvalidRequest",
     "GenerationRequest",
+    "ImageSpan",
     "KVPolicy",
     "QueueFull",
     "ReasoningLimits",

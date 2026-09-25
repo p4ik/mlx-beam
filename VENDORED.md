@@ -108,6 +108,15 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
 is stored quantized).
 
+`layer hook` - `models/qwen3_5.py`, `Qwen3_5TextModel.__call__`: one
+keyword argument, `layer_hook`, a callable applied to the hidden states
+after every decoder layer, index first. The engine's prefill hands in what
+a vision frontend adds at the image positions after the first layers
+(DeepStack: the Qwen3-VL tower's intermediate features); with the argument
+left out the loop is upstream's. The text model already took
+`input_embeddings` upstream; that is how the image features enter at the
+placeholder positions. Tests: `tests/test_vision_core.py`.
+
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
 two constructor arguments. `generation_batch` is the class built at the move
 to decoding (`PromptProcessingBatch.generate`) and for the empty batch;

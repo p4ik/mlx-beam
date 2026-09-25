@@ -111,6 +111,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `/health.speculative.proposer.form` names it. Exercised against a tiny
   GLM with a random head; acceptance on the real package is still to be
   measured.
+- The core's side of images. A request carries image spans - placeholder
+  positions with the features a frontend computed, and per-layer extras
+  for towers that add them after the first text layers (DeepStack) - and
+  the prefill embeds them in place of the placeholders' vocabulary
+  embeddings, chunk by chunk, beside text-only rows. The prefix cache
+  keys on the image's digest, so the same placeholders with another
+  image never meet; a stride checkpoint never lands inside an image.
+  Chat requests take OpenAI's `image_url` parts as `data:` URLs (nothing
+  is fetched). What serves the images is a separate package found
+  through the entry-point group `mlx_beam.modalities`; without one the
+  core answers image input with a 400 naming the `vision` extra, as
+  before. `/health.vision` and `capabilities.vision` say what was found.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

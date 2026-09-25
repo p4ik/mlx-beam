@@ -36,6 +36,7 @@ from mlx_beam.engine.prefix import (
     window_layers,
 )
 from mlx_beam.engine.priming import PrimingPromptBatch
+from mlx_beam.engine.proposer import trunk
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -182,6 +183,8 @@ class Engine:
         # row present here may speculate; its thinking budget, if any, is
         # checked per cycle.
         self._spec_coupling: dict[int, SeededSampler | None] = {}
+        # uid -> the request's image spans, read by the prefill.
+        self._spans: dict[int, tuple] = {}
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
@@ -445,6 +448,17 @@ class Engine:
         with self._lock:
             self._cancelled.add(request_id)
 
+    def _prompt_batch_class(self):
+        """The prefill class: the one that runs the trunk without the lm_head
+        and serves image spans and the draft head, whenever the model
+        exposes its trunk; a model that does not keeps upstream's prefill
+        (and cannot serve images)."""
+        try:
+            trunk(self.model)
+        except ValueError:
+            return None
+        return PrimingPromptBatch.bound(lambda uid: self._spans.get(uid, ()))
+
     def _may_speculate(self, uid: int, tokens: int) -> bool:
         """Whether a cycle of `tokens` may run for the row now: the row was
         admitted with a proposer, and its thinking budget, if any, cannot
@@ -541,6 +555,7 @@ class Engine:
         self._stride.clear()
         self._budgets.clear()
         self._spec_coupling.clear()
+        self._spans.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -551,7 +566,7 @@ class Engine:
     def _admit(self, gen: BatchGenerator, stream: ResultStream) -> None:
         req = stream.request
         try:
-            hit = self.prefix_store.fetch(self.model_key, list(req.tokens))
+            hit = self.prefix_store.fetch(self.model_key, req.cache_key)
             if hit is None:
                 cache, covered, carried = (
                     make_request_cache(self.model, self.kv_policy),
@@ -601,6 +616,8 @@ class Engine:
         stream.prompt_cached = covered
         stream.put(PromptProgress(0, len(rest), covered))
         self._live[uid] = stream
+        if req.spans:
+            self._spans[uid] = tuple(req.spans)
         self._bookkeeping[uid] = (covered, dict(carried))
         self._stride[uid] = []
         if thinking is not None:
@@ -679,6 +696,12 @@ class Engine:
             return
         self._bookkeeping[uid][1][position] = snap
 
+    @staticmethod
+    def _store_key(request: GenerationRequest, tokens: list[int]) -> list[int]:
+        """What the store files a finished (or cut) row under: the request's
+        cache key (image spans as digests) plus what was generated."""
+        return request.cache_key + list(tokens[len(request.tokens) :])
+
     def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
         """The draft head's history at the end of a row, next to the entry's
         end state: the next turn of the conversation resumes it whole."""
@@ -702,6 +725,8 @@ class Engine:
         last = max([covered, *taken])
         if position // stride <= last // stride or position in checkpoints:
             return
+        if any(s.start < position < s.end for s in self._spans.get(uid, ())):
+            return  # never inside an image: a cut there would split it
         self._checkpoint(gen, uid, position, windows=False)
         if position not in checkpoints:
             return  # a plain model: nothing was stored
@@ -733,7 +758,8 @@ class Engine:
             partial = {}
             gen.remove(uids)
         for u in uids:
-            self._live.pop(u).put(None)
+            stream = self._live.pop(u)
+            stream.put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
@@ -751,7 +777,7 @@ class Engine:
                 cache = for_store(cache)
                 self.prefix_store.insert(
                     self.model_key,
-                    list(tokens),
+                    self._store_key(stream.request, list(tokens)),
                     cache,
                     checkpoints={
                         p: c for p, c in checkpoints.items() if p <= len(tokens)
@@ -763,6 +789,7 @@ class Engine:
 
     def _forget_row(self, uid: int) -> None:
         self._spec_coupling.pop(uid, None)
+        self._spans.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
@@ -840,7 +867,7 @@ class Engine:
             self.model,
             stop_tokens=[],
             generation_batch=batch_class,
-            prompt_batch=PrimingPromptBatch if self.speculator is not None else None,
+            prompt_batch=self._prompt_batch_class(),
             **self._gen_args,
         )
         self._gen = gen
@@ -903,7 +930,7 @@ class Engine:
                         self._stride.pop(r.uid, None)
                         own_recurrent_state(r.prompt_cache)
                         stored = for_store(r.prompt_cache)
-                        tokens = list(r.all_tokens)
+                        tokens = self._store_key(s.request, list(r.all_tokens))
                         self._head_checkpoint(r.uid, checkpoints, len(tokens))
                         self.prefix_store.insert(
                             self.model_key,
