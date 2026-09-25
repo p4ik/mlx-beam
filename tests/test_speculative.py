@@ -407,6 +407,12 @@ def test_manifest_sets_bits_and_norm_convention_and_checks_the_hash(tmp_path):
     manifest.write_text(json.dumps(entry))
     with pytest.raises(ValueError, match="sha256"):
         load_bundled_head(model, path)
+    # A part without a file cannot be checked; config.json's mtp_file is no
+    # substitute, the manifest never vouched for those bytes.
+    del entry["parts"]["mtp"]["file"]
+    manifest.write_text(json.dumps(entry))
+    with pytest.raises(ValueError, match="names no file"):
+        load_bundled_head(model, path)
 
 
 def test_shift_norms_touches_all_seven_and_nothing_else():

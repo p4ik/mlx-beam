@@ -39,7 +39,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Multi-token prediction** — The checkpoint's own draft head, verified exactly. On today for one greedy request at a time; in the batch and under sampling planned.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
 - **Responses API** — Next to chat completions, stateless.
-- **No bloat** — The core is the token path and the API formats. Vision and audio come as their own package (`pip install mlx-beam[vision]` installs it); structured output and GGUF are extras with a guard; nothing else ships in the core that you did not ask for. Expert streaming for models larger than memory is planned.
+- **No bloat** — The core is the token path and the API formats. Vision and audio will come as their own package, selected through an extra of this one; structured output and GGUF as extras with a guard - none of them exists in this release, a request that needs one gets a clear refusal. Expert streaming for models larger than memory is planned.
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 

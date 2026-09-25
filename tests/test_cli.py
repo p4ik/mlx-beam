@@ -300,6 +300,14 @@ def test_kv_prefill_from_the_package_manifest_only_for_its_own_kv_config(tmp_pat
     policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
     assert (policy.prefill, policy.prefill_source) == ("quantized", "manifest")
 
+    # The package's file edited in place is not the measured profile: the
+    # manifest carries a hash, and the hash decides, not the path.
+    listed.write_text('[{"layer_idx": 3, "bits": 8, "group_size": 64}]')
+    args = serve_args("--kv-bits", "8", "--kv-config", str(listed))
+    policy = policy_with_package_prefill(kv_policy_from_args(args), args, pkg, log)
+    assert (policy.prefill, policy.prefill_source) == ("exact", "default")
+    listed.write_text('[{"layer_idx": 3, "bits": 4, "group_size": 64}]')
+
     # Another profile was not measured; the flag beats the manifest.
     other = tmp_path / "other.json"
     other.write_text('[{"layer_idx": 5, "bits": 8, "group_size": 64}]')

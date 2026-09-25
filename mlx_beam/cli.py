@@ -375,8 +375,10 @@ def kv_policy_from_args(args):
 def policy_with_package_prefill(policy, args, model_path: Path, log):
     """The prefill mode a package measured for its own kv_config
     (`parts.kv_config.prefill.mode` in the manifest) applies when that is the
-    profile in use - the file --kv-config names is the manifest's, by path or
-    by SHA-256 - and neither the file nor a flag said otherwise."""
+    profile in use - the file --kv-config names has the manifest's SHA-256,
+    or, for a manifest without one, is the manifest's file by path - and
+    neither the file nor a flag said otherwise. A profile edited in place
+    is not the measured one; the hash is what tells."""
     from dataclasses import replace
 
     from mlx_beam.package import part, read_manifest, sha256_of
@@ -388,10 +390,10 @@ def policy_with_package_prefill(policy, args, model_path: Path, log):
     if not mode or not entry.get("file"):
         return policy
     ours = Path(args.kv_config)
-    theirs = model_path / entry["file"]
-    same = ours.resolve() == theirs.resolve() or (
-        bool(entry.get("sha256")) and sha256_of(ours) == entry["sha256"]
-    )
+    if entry.get("sha256"):
+        same = sha256_of(ours) == entry["sha256"]
+    else:
+        same = ours.resolve() == (model_path / entry["file"]).resolve()
     if not same:
         return policy
     log.info(

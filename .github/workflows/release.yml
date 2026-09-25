@@ -24,6 +24,15 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Pushes to one branch run one at a time, and a newer push cancels the older
+# build: the dev release follows the newest commit anyway. Tags and dispatches
+# have groups of their own and are never cancelled. What can still overlap
+# (a dispatch beside a push) is settled by the head check before the dev
+# release is touched.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
+
 permissions:
   contents: read
 
@@ -157,6 +166,14 @@ jobs:
         run: |
           built="$BUILT"
           date=$(date -u +%Y-%m-%d)
+          # The release follows the branch head. A run whose commit the
+          # branch has moved past (a dispatch or a build the cancel did not
+          # catch) leaves the newer release alone.
+          head=$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME" | cut -f1)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::notice::$GITHUB_REF_NAME moved on to ${head::7}; the dev release stays with the newer commit"
+            exit 0
+          fi
           {
             echo "Untagged build of \`${GITHUB_SHA::7}\` on \`$GITHUB_REF_NAME\`, $date - version \`$built\`."
             echo

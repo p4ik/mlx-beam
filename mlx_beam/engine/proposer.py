@@ -137,7 +137,11 @@ def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
     (a base checkpoint). Returns (files, config)."""
     config = json.loads((model_path / "config.json").read_text())
     mtp = part(read_manifest(model_path), "mtp")
-    if mtp and mtp.get("file"):
+    if mtp:
+        # A part that names no file cannot be checked; falling back to
+        # mtp_file here would load bytes the manifest never vouched for.
+        if not mtp.get("file"):
+            raise ValueError("manifest parts.mtp names no file")
         return [verify_part_file(model_path, "mtp", mtp)], config
     named = config.get("mtp_file")
     if named:
@@ -208,9 +212,11 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         "prequantized": packed,
         "norms_shifted": manifest.get("norm_convention", "hf") != "mlx",
         # Where the bits and norm convention came from: the package's
-        # manifest, verified by hash, or the loader's own defaults.
+        # manifest, or the loader's own defaults. "verified" says the head
+        # file was hashed against the manifest (bundled_head_files refuses a
+        # part without a file, so a hash there was always checked).
         "manifest": bool(manifest),
-        "verified": bool(manifest.get("sha256")),
+        "verified": bool(manifest.get("file")) and bool(manifest.get("sha256")),
     }
 
 

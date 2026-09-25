@@ -16,9 +16,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and the loader's defaults.
 - The KV prefill mode a package measured for its own profile
   (`parts.kv_config.prefill.mode` in the manifest) applies when
-  `--kv-config` names that file, by path or by SHA-256; the profile's own
-  `prefill` and `--kv-prefill` still win. `/health.kv.prefill_source` says
-  `manifest` when it came from there.
+  `--kv-config` names that file: the same bytes as the manifest's SHA-256
+  when it has one, else the same path; the profile's own `prefill` and
+  `--kv-prefill` still win. `/health.kv.prefill_source` says `manifest`
+  when it came from there.
 - The site's pages share one navigation; the current page is marked and
   links that leave the site say so.
 
@@ -28,9 +29,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   stored conversation out. The budget bounds what the store holds, nothing
   else.
 - The README and the site describe what is built in the present tense and
-  name what is planned as planned; vision and audio are a package of their
-  own (`pip install mlx-beam[vision]`), structured output and GGUF extras
-  with a guard. The `extra_not_installed` message names the install line.
+  name what is planned as planned; vision and audio will be a package of
+  their own, structured output and GGUF extras with a guard - none of them
+  in this release, and the `extra_not_installed` message says so instead
+  of suggesting an install line that would do nothing.
 - Versions between tags count towards the release they are heading for
   (`0.1.0a5.devN` after `v0.1.0a4`) instead of the next minor; the rolling
   `dev` GitHub release follows every merge to `main`, titled with version
