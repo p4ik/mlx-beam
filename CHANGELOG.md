@@ -40,6 +40,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `input_json_delta` when the call closes. A `cache_control` marker is
   accepted on a message's last block (a checkpoint boundary) and refused
   elsewhere, never dropped in silence.
+- A repair ladder for tool calls: the parser's own reading, validated
+  against the tool's declared schema; when the parser refuses, a reading
+  of the text with the usual defects of model JSON mended (a code fence,
+  Python's literals, single quotes, a trailing comma, braces left open);
+  when the schema objects, values coerced where they plainly are the
+  declared type written another way ("42" for an integer, "true" for a
+  boolean, a JSON text for an object). Every rung is validated again,
+  nothing is invented, what a rung did is the call's `repair_actions`,
+  and a call no rung makes valid still comes back as text.
+  `/health.tools.repairs` counts the rungs.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is

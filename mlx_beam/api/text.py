@@ -14,6 +14,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from mlx_beam._vendor.mlx_lm.generate import TextStateMachine
+from mlx_beam.api import repair
 from mlx_beam.engine.request import TokenEvent
 
 logger = logging.getLogger(__name__)
@@ -230,20 +231,75 @@ class ToolCallParser:
             return text + (self._end if closed else "")
         return self._start + text + (self._end if closed else "")
 
+    def _read(self, text: str) -> list[dict]:
+        parsed = self._parser(text, self._tools)
+        return [dict(tc) for tc in (parsed if isinstance(parsed, list) else [parsed])]
+
     def _parse(self, text: str) -> list[dict] | None:
+        """The repair ladder: the parser's own reading, validated against
+        the tool's schema; a reading of the mended text when the parser
+        refused; the values coerced to the declared types when the schema
+        objected. Every rung is validated again, what a rung did is the
+        call's `repair_actions`, and a call no rung makes valid is None."""
+        actions: list[str] = []
         try:
-            parsed = self._parser(text, self._tools)
-            out = []
-            for tc in parsed if isinstance(parsed, list) else [parsed]:
-                tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
-                tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-                item = {"id": tc_id, "type": "function", "function": tc}
-                out.append(item)
+            calls = self._read(text)
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
             # TypeError: a literal the parser evaluated (a set, bytes) that
             # JSON cannot carry; KeyError: a call without arguments.
-            logger.warning("tool call not parseable (%s): %r", e, text[:200])
-            return None
+            mended = repair.repair_json_text(text)
+            if mended == text:
+                logger.warning("tool call not parseable (%s): %r", e, text[:200])
+                repair.STATS["failed"] += 1
+                return None
+            try:
+                calls = self._read(mended)
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e2:
+                logger.warning("tool call not parseable (%s): %r", e2, text[:200])
+                repair.STATS["failed"] += 1
+                return None
+            actions.append("json repaired")
+        out = []
+        for tc in calls:
+            if "arguments" not in tc or "name" not in tc:
+                repair.STATS["failed"] += 1
+                return None
+            args = tc["arguments"]
+            own = list(actions)
+            schema = repair.schema_for(self._tools, tc["name"])
+            if schema is not None:
+                problems = repair.validate(args, schema)
+                if problems and isinstance(args, dict):
+                    args, coerced = repair.coerce(args, schema)
+                    own += coerced
+                    problems = repair.validate(args, schema)
+                if problems:
+                    logger.warning(
+                        "tool call %s fails its schema (%s): %r",
+                        tc["name"],
+                        "; ".join(problems),
+                        text[:200],
+                    )
+                    repair.STATS["failed"] += 1
+                    return None
+            tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
+            try:
+                tc["arguments"] = json.dumps(args, ensure_ascii=False)
+            except TypeError as e:
+                # A literal the parser evaluated (a set, bytes) JSON cannot carry.
+                logger.warning("tool call not parseable (%s): %r", e, text[:200])
+                repair.STATS["failed"] += 1
+                return None
+            item = {"id": tc_id, "type": "function", "function": tc}
+            if own:
+                item["repair_actions"] = own
+            out.append(item)
+        rung = (
+            "coerced"
+            if any(len(i.get("repair_actions", ())) > len(actions) for i in out)
+            else ("repaired" if actions else "strict")
+        )
+        repair.STATS[rung] += 1
         if self._streaming:
             for item in out:
                 item["index"] = self._idx

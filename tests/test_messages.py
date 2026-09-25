@@ -8,7 +8,14 @@ import pytest
 
 from mlx_beam.api import messages
 from mlx_beam.api.errors import ApiError
-from tests.stub_tokenizer import EOS, THINK_END, THINK_START, TOOL_END, TOOL_START, StubTokenizer
+from tests.stub_tokenizer import (
+    EOS,
+    THINK_END,
+    THINK_START,
+    TOOL_END,
+    TOOL_START,
+    StubTokenizer,
+)
 from tests.test_api import events
 from tests.test_server import call, server  # noqa: F401 - fixture
 
@@ -26,7 +33,9 @@ def test_request_blocks_become_messages_and_tools_map():
         {
             "model": "m",
             "max_tokens": 5,
-            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "system": [
+                {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+            ],
             "messages": [
                 {"role": "user", "content": "w1"},
                 {
@@ -34,14 +43,27 @@ def test_request_blocks_become_messages_and_tools_map():
                     "content": [
                         {"type": "thinking", "thinking": "hmm", "signature": "x"},
                         {"type": "text", "text": "w2"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"words": "w3"}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "lookup",
+                            "input": {"words": "w3"},
+                        },
                     ],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "w4"}]},
-                        {"type": "text", "text": "w5", "cache_control": {"type": "ephemeral"}},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [{"type": "text", "text": "w4"}],
+                        },
+                        {
+                            "type": "text",
+                            "text": "w5",
+                            "cache_control": {"type": "ephemeral"},
+                        },
                     ],
                 },
             ],
@@ -59,10 +81,21 @@ def test_request_blocks_become_messages_and_tools_map():
     assert c.model == "m" and c.max_tokens == 5 and c.stop == ["w9"]
     assert c.sampling.temperature == 0.5 and c.sampling.top_k == 5
     assert c.max_reasoning_tokens == 32 and c.template_kwargs["enable_thinking"] is True
-    assert [m["role"] for m in c.messages] == ["system", "user", "assistant", "tool", "user"]
+    assert [m["role"] for m in c.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
     assert c.messages[0]["content"] == "sys"
-    assert c.messages[2]["reasoning_content"] == "hmm" and c.messages[2]["content"] == "w2"
-    assert c.messages[2]["tool_calls"][0]["function"] == {"name": "lookup", "arguments": {"words": "w3"}}
+    assert (
+        c.messages[2]["reasoning_content"] == "hmm" and c.messages[2]["content"] == "w2"
+    )
+    assert c.messages[2]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": {"words": "w3"},
+    }
     assert c.messages[3] == {"role": "tool", "tool_call_id": "toolu_1", "content": "w4"}
     assert c.messages[4]["content"] == "w5"
     assert c.tools[0]["function"]["parameters"] == TOOLS[0]["input_schema"]
@@ -80,7 +113,11 @@ def test_refusals_are_explicit():
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                            {
+                                "type": "text",
+                                "text": "a",
+                                "cache_control": {"type": "ephemeral"},
+                            },
                             {"type": "text", "text": "b"},
                         ],
                     }
@@ -93,17 +130,30 @@ def test_refusals_are_explicit():
     assert exc.value.code == "unsupported"
     with pytest.raises(ApiError) as exc:
         messages.parse_messages_request(
-            {**base, "messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]},
+            {
+                **base,
+                "messages": [
+                    {"role": "user", "content": [{"type": "image", "source": {}}]}
+                ],
+            },
             "m",
         )
     assert exc.value.code == "extra_not_installed"
     with pytest.raises(ApiError):
-        messages.parse_messages_request({**base, "messages": [{"role": "system", "content": "x"}]}, "m")
+        messages.parse_messages_request(
+            {**base, "messages": [{"role": "system", "content": "x"}]}, "m"
+        )
     with pytest.raises(ApiError):
-        messages.parse_messages_request({**base, "thinking": {"type": "sometimes"}}, "m")
-    req = messages.parse_messages_request({**base, "thinking": {"type": "disabled"}}, "m")
+        messages.parse_messages_request(
+            {**base, "thinking": {"type": "sometimes"}}, "m"
+        )
+    req = messages.parse_messages_request(
+        {**base, "thinking": {"type": "disabled"}}, "m"
+    )
     assert req.chat.template_kwargs["enable_thinking"] is False
-    req = messages.parse_messages_request({**base, "tools": TOOLS, "tool_choice": {"type": "none"}}, "m")
+    req = messages.parse_messages_request(
+        {**base, "tools": TOOLS, "tool_choice": {"type": "none"}}, "m"
+    )
     assert req.chat.tools is None
 
 
@@ -123,8 +173,13 @@ def test_blocks_in_order_and_the_stream_events():
     ids = [THINK_START, 10, 11, THINK_END, 12, TOOL_START, 20, 21, TOOL_END]
     evs, final = run(ids, tools=TOOLS)
     types = [e["type"] for e in evs]
-    assert types[:2] == ["message_start", "ping"] and types[-2:] == ["message_delta", "message_stop"]
-    starts = [e["content_block"]["type"] for e in evs if e["type"] == "content_block_start"]
+    assert types[:2] == ["message_start", "ping"] and types[-2:] == [
+        "message_delta",
+        "message_stop",
+    ]
+    starts = [
+        e["content_block"]["type"] for e in evs if e["type"] == "content_block_start"
+    ]
     assert starts == ["thinking", "text", "tool_use"]
     assert [e["index"] for e in evs if e["type"] == "content_block_stop"] == [0, 1, 2]
     deltas = [e["delta"] for e in evs if e["type"] == "content_block_delta"]
@@ -137,12 +192,18 @@ def test_blocks_in_order_and_the_stream_events():
     assert final["type"] == "message" and final["role"] == "assistant"
     assert [b["type"] for b in final["content"]] == ["thinking", "text", "tool_use"]
     assert final["content"][0]["thinking"] == "w10 w11 "
-    assert final["content"][2]["name"] == "w20" and final["content"][2]["input"] == {"words": "w21"}
+    assert final["content"][2]["name"] == "w20" and final["content"][2]["input"] == {
+        "words": "w21"
+    }
     assert final["stop_reason"] == "tool_use"
     prompt = messages.to_generation_request(
         StubTokenizer(),
         messages.parse_messages_request(
-            {"max_tokens": 1, "messages": [{"role": "user", "content": "w1"}], "tools": TOOLS},
+            {
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "w1"}],
+                "tools": TOOLS,
+            },
             "m",
         ),
     ).tokens
@@ -153,7 +214,9 @@ def test_blocks_in_order_and_the_stream_events():
         "cache_creation_input_tokens": 0,
     }
     evs, final = run([10, 11], finish="length")
-    assert final["stop_reason"] == "max_tokens" and final["content"] == [{"type": "text", "text": "w10 w11 "}]
+    assert final["stop_reason"] == "max_tokens" and final["content"] == [
+        {"type": "text", "text": "w10 w11 "}
+    ]
     evs, final = run([10])
     assert final["stop_reason"] == "end_turn"
 
@@ -172,7 +235,9 @@ def test_endpoints_and_the_error_envelope(server):  # noqa: F811
     status, _, raw = call(server, "POST", "/v1/messages/count_tokens", body)
     counted = json.loads(raw)
     assert status == 200 and counted == {"input_tokens": out["usage"]["input_tokens"]}
-    status, _, raw = call(server, "POST", "/v1/messages", {"max_tokens": 3, "messages": []})
+    status, _, raw = call(
+        server, "POST", "/v1/messages", {"max_tokens": 3, "messages": []}
+    )
     err = json.loads(raw)
     assert status == 400 and err == {
         "type": "error",

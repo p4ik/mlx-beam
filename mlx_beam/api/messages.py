@@ -122,7 +122,9 @@ def _convert_message(m: Any, i: int, marks: list[str]) -> list[dict]:
             continue  # nothing to render: the trace is not ours to read
         elif kind == "tool_use":
             if role != "assistant":
-                raise ApiError(f"{here}: tool_use belongs to the assistant", param="messages")
+                raise ApiError(
+                    f"{here}: tool_use belongs to the assistant", param="messages"
+                )
             args = block.get("input")
             if not isinstance(args, dict):
                 raise ApiError(f"{here}.input must be an object", param="messages")
@@ -135,7 +137,9 @@ def _convert_message(m: Any, i: int, marks: list[str]) -> list[dict]:
             )
         elif kind == "tool_result":
             if role != "user":
-                raise ApiError(f"{here}: tool_result belongs to the user", param="messages")
+                raise ApiError(
+                    f"{here}: tool_result belongs to the user", param="messages"
+                )
             flush()
             out.append(
                 {
@@ -149,7 +153,9 @@ def _convert_message(m: Any, i: int, marks: list[str]) -> list[dict]:
         elif kind == "document":
             raise unsupported("document blocks", "messages")
         else:
-            raise ApiError(f"{here} has an unknown block type {kind!r}", param="messages")
+            raise ApiError(
+                f"{here} has an unknown block type {kind!r}", param="messages"
+            )
     flush()
     if not out:
         out.append({"role": role, "content": ""})
@@ -217,7 +223,9 @@ def parse_messages_request(
     )
     stop = body.get("stop_sequences") or []
     if not isinstance(stop, list) or any(not isinstance(s, str) for s in stop):
-        raise ApiError("stop_sequences must be a list of strings", param="stop_sequences")
+        raise ApiError(
+            "stop_sequences must be a list of strings", param="stop_sequences"
+        )
     template_kwargs: dict[str, Any] = dict(defaults.chat_template_args)
     max_reasoning = None
     thinking = body.get("thinking")
@@ -230,7 +238,9 @@ def parse_messages_request(
             if budget is not None:
                 max_reasoning = _number(thinking, "budget_tokens", None, 0, None, int)
         else:
-            raise ApiError("thinking.type must be enabled or disabled", param="thinking")
+            raise ApiError(
+                "thinking.type must be enabled or disabled", param="thinking"
+            )
     elif thinking is not None:
         raise ApiError("thinking must be an object", param="thinking")
     chat = ChatRequest(
@@ -365,7 +375,11 @@ class MessagesResponder:
                     yield {
                         "type": "content_block_start",
                         "index": index,
-                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
                     }
                 text += d.reasoning
                 yield {
@@ -382,7 +396,11 @@ class MessagesResponder:
                     "name": tc["function"]["name"],
                     "input": {},
                 }
-                yield {"type": "content_block_start", "index": index, "content_block": block}
+                yield {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": block,
+                }
                 yield {
                     "type": "content_block_delta",
                     "index": index,
@@ -392,7 +410,9 @@ class MessagesResponder:
                     },
                 }
                 yield {"type": "content_block_stop", "index": index}
-                content.append({**block, "input": json.loads(tc["function"]["arguments"])})
+                content.append(
+                    {**block, "input": json.loads(tc["function"]["arguments"])}
+                )
             if d.content:
                 if current != "text":
                     yield from close_current()

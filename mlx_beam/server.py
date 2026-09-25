@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mlx_beam import __version__
-from mlx_beam.api import chat, completions, messages, responses
+from mlx_beam.api import chat, completions, messages, repair, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
@@ -112,6 +112,10 @@ class Served:
             "start": getattr(t, "tool_call_start", None),
             "end": getattr(t, "tool_call_end", None),
             "via_label": bool(getattr(t, "tool_call_via_label", False)),
+            # The repair ladder's counters since start: calls read as they
+            # were, after the JSON was mended, after values were coerced,
+            # and calls no rung made valid (returned as text).
+            "repairs": dict(repair.STATS),
         }
 
     def models(self) -> dict:
