@@ -17,12 +17,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.vision import VisionModel
-from mlx_beam_vision.families import Encoded
-from mlx_beam_vision.weights import load_prefixed, strip_prefix
+from mlx_beam_vision.families import Encoded, Loaded, cast
 
 NAME = "mistral3"
-TOWER_PREFIXES = ("vision_tower.", "model.vision_tower.")
-PROJECTOR_PREFIXES = ("multi_modal_projector.", "model.multi_modal_projector.")
+# `vision_encoder` is the older Pixtral layout.
+PARTS = ("vision_tower", "vision_encoder", "multi_modal_projector")
 
 
 class PatchMerger(nn.Module):
@@ -75,7 +74,23 @@ class Projector(nn.Module):
         return self.linear_2(self.gelu(self.linear_1(x)))
 
 
+def tower_keys(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """The vendored VisionModel keeps Pixtral under `vision_model`; the HF
+    layout (`vision_tower.transformer.*`, `patch_conv`, `ln_pre`) has no
+    such level, mlx-vlm's conversions do."""
+    return {
+        k if k.startswith("vision_model.") else f"vision_model.{k}": v
+        for k, v in weights.items()
+    }
+
+
+def per_layer(config: dict) -> bool:
+    return False  # everything enters at the embedding
+
+
 class Tower:
+    per_layer = False
+
     def __init__(self, config: dict, model_path: Path | None, dtype=mx.bfloat16):
         vc = dict(config.get("vision_config") or {})
         vc.setdefault("model_type", "pixtral")
@@ -101,28 +116,16 @@ class Tower:
             self.load(model_path)
 
     def load(self, model_path: Path) -> None:
-        raw = load_prefixed(model_path, TOWER_PREFIXES + PROJECTOR_PREFIXES)
-        tower = next(
-            (p for p in TOWER_PREFIXES if any(k.startswith(p) for k in raw)), None
+        loaded = Loaded(model_path, PARTS)
+        weights = self.model.sanitize(
+            tower_keys(loaded.part("vision_tower", "vision_encoder"))
         )
-        proj = next(
-            (p for p in PROJECTOR_PREFIXES if any(k.startswith(p) for k in raw)), None
-        )
-        if tower is None or proj is None:
-            raise FileNotFoundError(
-                f"{model_path}: no vision tower and projector in the index"
-            )
-        weights = self.model.sanitize(strip_prefix(raw, tower))
-        for w in (weights, strip_prefix(raw, proj)):
-            if any(k.endswith(".scales") for k in w):
-                raise ValueError("a quantized vision tower is not supported yet")
-        cast = lambda d: {k: v.astype(self.dtype) for k, v in d.items()}  # noqa: E731
-        self.model.load_weights(list(cast(weights).items()), strict=True)
+        self.model.load_weights(cast(weights, self.dtype), strict=True)
         self.projector.load_weights(
-            list(cast(strip_prefix(raw, proj)).items()), strict=True
+            cast(loaded.part("multi_modal_projector"), self.dtype), strict=True
         )
         mx.eval(self.model.parameters(), self.projector.parameters())
-        self.loaded_from = sorted({k.split("/")[0] for k in raw})
+        self.loaded_from = loaded.shards
 
     def encode(
         self, pixel_values: mx.array, image_sizes: list[tuple[int, int]]
@@ -157,10 +160,6 @@ class Tower:
         }
 
 
-def build(config: dict, model_path: Path | None, dtype=mx.bfloat16) -> Tower:
-    return Tower(config, model_path, dtype)
-
-
 def pixel_inputs(processed: dict):
     """(pixel values as (N, H, W, C), the real sizes) from what the
     processor returned: transformers gives (N, C, H, W) and `image_sizes`."""
@@ -170,3 +169,12 @@ def pixel_inputs(processed: dict):
     pv = pv.transpose(0, 2, 3, 1)
     sizes = [(int(h), int(w)) for h, w in processed["image_sizes"]]
     return pv, sizes
+
+
+def select(inputs, keep: list[int]):
+    pv, sizes = inputs
+    return pv[mx.array(keep)], [sizes[i] for i in keep]
+
+
+def count(inputs) -> int:
+    return int(inputs[0].shape[0])

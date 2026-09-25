@@ -54,7 +54,7 @@ TOWER_CONFIG = {
 
 def tower():
     mx.random.seed(0)
-    t = qwen3_vl.build(TOWER_CONFIG, None, dtype=mx.float32)
+    t = qwen3_vl.Tower(TOWER_CONFIG, None, dtype=mx.float32)
     mx.eval(t.model.parameters())
     return t
 
@@ -65,21 +65,42 @@ def pixels(grid):
     return np.random.RandomState(n).randn(n, 3 * T * PATCH * PATCH).astype(np.float32)
 
 
+class Rendered(str):
+    """What the fake template renders: a str for the frontend's BOS check
+    (a real processor renders text), carrying the messages the fake
+    tokenizer reads."""
+
+    def __new__(cls, messages, with_bos):
+        self = super().__new__(cls, "<bos>..." if with_bos else "...")
+        self.messages = messages
+        return self
+
+
 class FakeProcessor:
     """Stands in for transformers' processor: the stub tokenizer's text,
     each image part `image_tokens` placeholders, random pixels."""
 
-    def __init__(self, grids):
+    class Tok:
+        bos_token = "<bos>"
+
+    tokenizer = Tok()
+
+    def __init__(self, grids, with_bos=False):
         self.grids = list(grids)
         self.tok = StubTokenizer()
+        self.with_bos = with_bos
+        self.calls: list[dict] = []
+        self.template_kwargs: list[dict] = []
 
     def apply_chat_template(
         self, messages, tokenize=False, add_generation_prompt=True, **kw
     ):
-        return messages
+        self.template_kwargs.append(kw)
+        return Rendered(messages, self.with_bos)
 
-    def __call__(self, text, images=None, return_tensors="np"):
-        messages = text[0]
+    def __call__(self, text, images=None, return_tensors="np", **kw):
+        self.calls.append(kw)
+        messages = text[0].messages
         ids = [2]
         grids = iter(self.grids)
         used = []
@@ -105,6 +126,17 @@ class FakeProcessor:
             out["pixel_values"] = np.concatenate([pixels(g) for g in used])
             out["image_grid_thw"] = np.array(used)
         return out
+
+
+def _count(encode):
+    """`encode` wrapped to record the grids each tower pass saw."""
+
+    def wrapped(pixel_values, grid_thw):
+        wrapped.grids.append(grid_thw.tolist())
+        return encode(pixel_values, grid_thw)
+
+    wrapped.grids = []
+    return wrapped
 
 
 def png(seed):
@@ -154,12 +186,58 @@ def test_frontend_builds_spans_and_caches_by_digest():
     again = front.build(messages, [a, b], {})
     assert front.images_encoded == 2 and front.cache.describe()["hits"] == 2
     assert mx.array_equal(again.spans[0].features, built.spans[0].features)
+    # A cached entry is its own array, not a slice keeping the call's batch.
+    assert again.spans[0].features.nbytes == 4 * 4 * 32
     d = front.describe()
     assert d["provider"] == "mlx-beam-vision" and d["feature_cache"]["entries"] == 2
+    # One image known, one new: only the new one goes through the tower,
+    # picked out of the processor's batch (its patches and its grid).
+    front.tower.encode = _count(front.tower.encode)
+    third = front.build(messages, [a, png(3)], {})
+    assert front.images_encoded == 3 and front.tower.encode.grids == [[[1, 2, 6]]]
+    assert mx.array_equal(third.spans[0].features, built.spans[0].features)
     with pytest.raises(ValueError, match="do not match the images"):
         front.build(messages, [a, b, png(9)], {})
     with pytest.raises(ValueError, match="not a readable image"):
         front.build(messages, [Image(b"nope"), b], {})
+
+
+def test_frontend_guards_the_prompt_and_the_pixels():
+    """The rendered template already carries the BOS: the processor must
+    not add a second. A server-set chat template reaches the processor.
+    An image above the pixel cap is refused before a pixel is decoded;
+    EXIF orientation is applied."""
+    from mlx_beam_vision import frontend as fe
+    from PIL import Image as PILImage
+
+    proc = FakeProcessor([(1, 4, 4)], with_bos=True)
+    front = VisionFrontend(proc, tower(), "qwen3_vl")
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "w1"}, {"type": "image"}]}
+    ]
+    front.build(messages, [png(1)], {"enable_thinking": False})
+    assert proc.calls == [{"add_special_tokens": False}]
+    assert proc.template_kwargs == [{"enable_thinking": False}]
+    front.chat_template = "{{ messages }}"
+    front.build(messages, [png(1)], {})
+    assert proc.template_kwargs[-1] == {"chat_template": "{{ messages }}"}
+    assert front.describe()["chat_template"] == "server"
+    plain = FakeProcessor([(1, 4, 4)])
+    VisionFrontend(plain, tower(), "qwen3_vl").build(messages, [png(1)], {})
+    assert plain.calls == [{}]
+    # The cap reads the header, not the pixels: a 8000 x 8000 PNG of one
+    # colour is a few kilobytes and would decode to 192 MB.
+    buf = io.BytesIO()
+    PILImage.new("RGB", (8000, 8000)).save(buf, format="PNG")
+    with pytest.raises(ValueError, match="pixels is above"):
+        fe.open_images([Image(buf.getvalue())])
+    # EXIF says rotated: a 8 x 4 photo stored sideways comes out 4 x 8.
+    buf = io.BytesIO()
+    exif = PILImage.Exif()
+    exif[0x0112] = 6
+    PILImage.new("RGB", (8, 4)).save(buf, format="JPEG", exif=exif)
+    (opened,) = fe.open_images([Image(buf.getvalue(), "image/jpeg")])
+    assert opened.size == (4, 8)
 
 
 def test_provider_dispatches_by_model_type():
@@ -171,6 +249,25 @@ def test_provider_dispatches_by_model_type():
         {"model_type": "qwen3_5"}
     )  # no vision_config: text only
     assert not provider.supports({"model_type": "llama", "vision_config": {}})
+    # A type the package knows and cannot serve is claimed and refused
+    # with the reason, so the health says why instead of a wrong tower.
+    unified = {"model_type": "gemma4_unified", "vision_config": {"x": 1}}
+    assert provider.supports(unified) and provider.family_for(unified) is None
+    with pytest.raises(ValueError, match="bidirectionally"):
+        provider.load(None, ".", unified, None)
+    # What the tower will ask of the prefill, from the config alone.
+    assert provider.needs(TOWER_CONFIG) == ("input_embeddings", "layer_hook")
+    no_deepstack = {
+        **TOWER_CONFIG,
+        "vision_config": {
+            **TOWER_CONFIG["vision_config"],
+            "deepstack_visual_indexes": [],
+        },
+    }
+    assert provider.needs(no_deepstack) == ("input_embeddings",)
+    assert provider.needs({"model_type": "gemma4", "vision_config": {}}) == (
+        "input_embeddings",
+    )
     assert any(
         ep.name == "vision"
         for ep in modalities.entry_points(group=modalities.ENTRY_POINT_GROUP)
@@ -232,7 +329,7 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
         "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
     }
     mx.random.seed(1)
-    t = mistral3.build(config, None, dtype=mx.float32)
+    t = mistral3.Tower(config, None, dtype=mx.float32)
     mx.eval(t.model.parameters(), t.projector.parameters())
     # Two images: 64x32 (4x2 patches -> 2x1 merged) and 32x32 (2x2 -> 1x1).
     pv = mx.array(np.random.RandomState(0).randn(2, 64, 64, 3).astype(np.float32))
@@ -284,6 +381,62 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
     assert provider.family_for(config) == "mistral3"
 
 
+def test_mistral3_loads_the_hf_layout_and_mlx_vlms(tmp_path):
+    """HF keeps Pixtral's blocks right under `vision_tower` (and everything
+    under `model.`); mlx-vlm's conversions add a `vision_model` level. Both
+    load into the same tower, strictly."""
+    from mlx.utils import tree_flatten
+    from mlx_beam_vision.families import mistral3
+
+    config = {
+        "model_type": "mistral3",
+        "vision_config": {
+            "model_type": "pixtral",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "head_dim": 16,
+            "image_size": 64,
+            "patch_size": 16,
+            "num_channels": 3,
+        },
+        "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
+    }
+    mx.random.seed(1)
+    source = mistral3.Tower(config, None, dtype=mx.float32)
+    mx.eval(source.model.parameters(), source.projector.parameters())
+    tower = dict(tree_flatten(source.model.parameters()))
+    proj = dict(tree_flatten(source.projector.parameters()))
+    layouts = {
+        "hf": {
+            **{
+                f"model.vision_tower.{k.removeprefix('vision_model.')}": v
+                for k, v in tower.items()
+            },
+            **{f"model.multi_modal_projector.{k}": v for k, v in proj.items()},
+        },
+        "mlx-vlm": {
+            **{f"vision_tower.{k}": v for k, v in tower.items()},
+            **{f"multi_modal_projector.{k}": v for k, v in proj.items()},
+        },
+    }
+    pv = mx.array(np.random.RandomState(0).randn(1, 64, 64, 3).astype(np.float32))
+    want = source.encode(pv, [(64, 64)])[0].features
+    for name, weights in layouts.items():
+        path = tmp_path / name
+        path.mkdir()
+        # Conv weights in PyTorch's layout, as a checkpoint stores them.
+        stored = {
+            k: (v.transpose(0, 3, 1, 2) if "patch_conv.weight" in k else v)
+            for k, v in weights.items()
+        }
+        mx.save_safetensors(str(path / "model.safetensors"), stored)
+        t = mistral3.Tower(config, path, dtype=mx.float32)
+        assert t.loaded_from == ["model.safetensors"]
+        assert mx.allclose(t.encode(pv, [(64, 64)])[0].features, want, atol=1e-5)
+
+
 def test_gemma4_family_pools_and_projects_per_image():
     from mlx_beam_vision.families import gemma4
 
@@ -306,7 +459,7 @@ def test_gemma4_family_pools_and_projects_per_image():
         "text_config": {"hidden_size": 32},
     }
     mx.random.seed(2)
-    t = gemma4.build(config, None, dtype=mx.float32)
+    t = gemma4.Tower(config, None, dtype=mx.float32)
     mx.eval(t.model.parameters(), t.embedder.parameters())
     # 96 x 96 -> 6 x 6 patches -> 2 x 2 pooled = 4 soft tokens; 48 x 96 -> 3x6 -> 1x2 = 2.
     big = mx.array(np.random.RandomState(0).randn(3, 96, 96).astype(np.float32))
@@ -314,6 +467,43 @@ def test_gemma4_family_pools_and_projects_per_image():
     encoded = t.encode([big, small], None)
     assert [e.features.shape for e in encoded] == [(4, 32), (2, 32)]
     assert provider.family_for(config) == "gemma4"
+    # As transformers' Gemma 4 processor hands them: patchified and padded
+    # to one length, with `image_position_ids` (-1 on the padding rows).
+    processed = _gemma_processed([big, small], patch=16, max_patches=36)
+    images, positions = gemma4.pixel_inputs(processed)
+    assert [p.shape for p in images] == [(36, 768), (36, 768)]
+    assert positions[1].shape == (36, 2) and positions[1][-1].tolist() == [-1, -1]
+    from_processor = t.encode(images, positions)
+    assert [e.features.shape for e in from_processor] == [(4, 32), (2, 32)]
+    assert mx.allclose(from_processor[0].features, encoded[0].features, atol=1e-4)
+    assert mx.allclose(from_processor[1].features, encoded[1].features, atol=1e-4)
+
+
+def _gemma_processed(images, patch, max_patches):
+    """Patches (N, max_patches, patch pixels) and positions (N, max_patches,
+    2) the way image_processing_gemma4 lays them out: row-major patches,
+    (x, y) positions, padding rows zero with position -1."""
+    pixel_values, position_ids = [], []
+    for image in images:
+        c, h, w = image.shape
+        ph, pw = h // patch, w // patch
+        # convert_image_to_patches: (pH, pW, p, p, C), then row-major.
+        patches = (
+            image.reshape(c, ph, patch, pw, patch)
+            .transpose(1, 3, 2, 4, 0)
+            .reshape(ph * pw, c * patch * patch)
+        )
+        xs, ys = np.meshgrid(np.arange(pw), np.arange(ph), indexing="xy")
+        pos = np.stack([xs.flatten(), ys.flatten()], axis=-1)
+        pad = max_patches - ph * pw
+        patches = np.pad(np.array(patches), [(0, pad), (0, 0)])
+        pos = np.pad(pos, [(0, pad), (0, 0)], constant_values=-1)
+        pixel_values.append(patches)
+        position_ids.append(pos)
+    return {
+        "pixel_values": np.stack(pixel_values),
+        "image_position_ids": np.stack(position_ids),
+    }
 
 
 def test_muse_glimmer_family_shuffles_adapts_and_projects():
@@ -338,7 +528,7 @@ def test_muse_glimmer_family_shuffles_adapts_and_projects():
         "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
     }
     mx.random.seed(3)
-    t = muse_glimmer.build(config, None, dtype=mx.float32)
+    t = muse_glimmer.Tower(config, None, dtype=mx.float32)
     mx.eval(
         t.model.parameters(),
         t.vision_adapter.parameters(),
@@ -412,14 +602,21 @@ def tiny_granite_text():
     return model
 
 
+def granite_tower(config=GRANITE_CONFIG, seed=5):
+    from mlx_beam_vision.families import granite4_vision
+
+    mx.random.seed(seed)
+    t = granite4_vision.Tower(config, None, dtype=mx.float32)
+    # The checkpoint brings the newline feature; here a stand-in.
+    t.image_newline = mx.random.normal((32,))
+    return t
+
+
 def test_granite_vision_family_projects_ahead_of_its_target_layers():
     """Granite adds nothing at the embedding: zero features at the
     placeholders, one projected set per target layer - the base view, the
     unpadded tile grid with a newline per row."""
-    from mlx_beam_vision.families import granite4_vision
-
-    mx.random.seed(5)
-    t = granite4_vision.build(GRANITE_CONFIG, None, dtype=mx.float32)
+    t = granite_tower()
     # One tile (32 x 32): 1 token from a 2x2 patch grid at rate 1/2, plus the newline.
     one = mx.array(np.random.RandomState(0).randn(1, 3, 32, 32).astype(np.float32))
     # A 32 x 64 image: base view plus a 1 x 2 tile grid -> 1 + (1 row x 2 + newline) = 4.
@@ -434,16 +631,53 @@ def test_granite_vision_family_projects_ahead_of_its_target_layers():
     assert provider.family_for(GRANITE_CONFIG) == "granite4_vision"
     d = t.describe()
     assert d["deepstack_layers"] == [0] and d["spatial_layers"] == [1]
+    # A LLaVA-NeXT processor pads every image to the call's largest tile
+    # count: beside a 64 x 64 image (base + 2 x 2 tiles, 5) the 32 x 64
+    # one arrives with two zero tiles and must read the same as alone.
+    wide = {**GRANITE_CONFIG, "image_grid_pinpoints": [[32, 64], [64, 32], [64, 64]]}
+    t = granite_tower(wide)
+    assert t.tiles_of((32, 64)) == 3 and t.tiles_of((64, 64)) == 5
+    alone = t.encode([two], [(32, 64)])[0]
+    padded = mx.concatenate([two, mx.zeros((2, 3, 32, 32))])
+    four = mx.array(np.random.RandomState(2).randn(5, 3, 32, 32).astype(np.float32))
+    beside = t.encode([padded, four], [(32, 64), (64, 64)])
+    assert mx.array_equal(beside[0].deepstack[0], alone.deepstack[0])
+    assert beside[1].deepstack[0].shape[0] == 1 + 2 * (2 + 1)
+
+
+def test_granite_unpad_rounds_before_it_truncates():
+    """303 x 303 into a 12 x 10 grid: the scaled edge is 9.999999999999998,
+    which int() would cut to 9 and the reference keeps at 10."""
+    from mlx_beam_vision.families.granite4_vision import unpad
+
+    grid = mx.zeros((4, 12, 10))
+    assert unpad(grid, (303, 303)).shape == (4, 10, 10)
+
+
+def test_granite_projectors_aimed_at_one_layer_both_add_there():
+    from mlx_beam_vision.families import granite4_vision
+
+    both = {**GRANITE_CONFIG, "spatial_target_layers": [0]}
+    t = granite_tower(both)
+    one = mx.array(np.random.RandomState(0).randn(1, 3, 32, 32).astype(np.float32))
+    (enc,) = t.encode([one], [(32, 32)])
+    assert list(enc.deepstack) == [0]
+    # The same sum as two projectors kept apart.
+    apart = granite_tower()
+    (split,) = apart.encode([one], [(32, 32)])
+    assert mx.allclose(
+        enc.deepstack[0], split.deepstack[0] + split.deepstack[1], atol=1e-5
+    )
+    none = {**GRANITE_CONFIG, "deepstack_layer_map": [], "use_spatial_sampling": False}
+    with pytest.raises(ValueError, match="no text layer"):
+        granite4_vision.Tower(none, None, dtype=mx.float32)
 
 
 def test_granite_engine_path_matches_a_direct_forward():
-    from mlx_beam_vision.families import granite4_vision
-
     from mlx_beam.engine import GenerationRequest
 
     model = tiny_granite_text()
-    mx.random.seed(6)
-    t = granite4_vision.build(GRANITE_CONFIG, None, dtype=mx.float32)
+    t = granite_tower(seed=6)
     tiles = mx.array(np.random.RandomState(2).randn(1, 3, 32, 32).astype(np.float32))
     (enc,) = t.encode([tiles], [(32, 32)])
     from mlx_beam.engine import ImageSpan

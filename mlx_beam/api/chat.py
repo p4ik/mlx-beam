@@ -17,6 +17,7 @@ from mlx_beam.api.errors import (
     ApiError,
     bool_field,
     missing_extra,
+    no_vision,
     object_field,
     text_field,
     unsupported,
@@ -163,7 +164,8 @@ def _reject_unsupported(body: dict) -> None:
 def decode_image(part: dict, where: str) -> Image:
     """The bytes of an image part: an OpenAI `image_url` (or a Responses
     `input_image`) whose url is a `data:` URL. Nothing is fetched - a
-    remote URL is refused, the client sends the bytes."""
+    remote URL is refused, the client sends the bytes. A `detail` field
+    is accepted and ignored: the processor decides the resolution."""
     url = part.get("image_url")
     if isinstance(url, dict):
         url = url.get("url")
@@ -178,7 +180,8 @@ def decode_image(part: dict, where: str) -> Image:
     if not sep or ";base64" not in head:
         raise ApiError(f"{where}: the data URL must be base64", param="messages")
     try:
-        data = base64.b64decode(payload, validate=True)
+        # Line breaks between the base64 lines are how some encoders wrap.
+        data = base64.b64decode("".join(payload.split()), validate=True)
     except (binascii.Error, ValueError):
         raise ApiError(
             f"{where}: the data URL is not valid base64", param="messages"
@@ -214,7 +217,7 @@ def _normalise_messages(messages: Any, images: list[Image] | None = None) -> lis
                     )
                 elif kind in ("image_url", "input_image"):
                     if images is None:
-                        raise missing_extra("image input", "vision")
+                        raise no_vision()
                     images.append(decode_image(part, where))
                     parts.append({"type": "image"})
                     with_image = True
@@ -347,29 +350,23 @@ def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
 
 
 def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
-    """The prompt's token ids; with images, through the modality frontend
-    (which also fills `req.spans`)."""
+    """The prompt's token ids; with images, rendered and expanded by the
+    modality frontend (which also fills `req.spans`) - through the same
+    effort ladder and checks as text."""
     if not getattr(tokenizer, "has_chat_template", True):
         raise ApiError("this model has no chat template; use /v1/completions")
+    if req.images and frontend is None:
+        raise no_vision()
     mirror_reasoning(req.messages, renderer_reasoning_keys(tokenizer))
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    if req.images:
-        if frontend is None:
-            raise missing_extra("image input", "vision")
-        try:
-            built = frontend.build(req.messages, req.images, kwargs)
-        except ValueError as e:
-            raise ApiError(
-                f"the image input was refused: {e}", param="messages"
-            ) from None
-        if not built.tokens:
-            raise ApiError("the prompt is empty", param="messages")
-        req.spans = list(built.spans)
-        return list(built.tokens)
 
     def render(**extra):
+        if req.images:
+            built = frontend.build(req.messages, req.images, {**kwargs, **extra})
+            req.spans = list(built.spans)
+            return built.tokens
         return tokenizer.apply_chat_template(
             req.messages,
             add_generation_prompt=True,
@@ -377,14 +374,17 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             **{**kwargs, **extra},
         )
 
+    rejected = (
+        "the image input was refused"
+        if req.images
+        else "the chat template rejected the messages"
+    )
     level = kwargs.get("reasoning_effort")
     try:
         tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
         if not (level and is_effort_rejection(e)):
-            raise ApiError(
-                f"the chat template rejected the messages: {e}", param="messages"
-            ) from None
+            raise ApiError(f"{rejected}: {e}", param="messages") from None
         # The template knows the levels but not this name: climb the ladder
         # and remember the rung that rendered, so every re-render agrees.
         tokens = None
@@ -393,10 +393,7 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
                 tokens = render(reasoning_effort=candidate)
             except Exception as e2:  # noqa: BLE001
                 if not is_effort_rejection(e2):
-                    raise ApiError(
-                        f"the chat template rejected the messages: {e2}",
-                        param="messages",
-                    ) from None
+                    raise ApiError(f"{rejected}: {e2}", param="messages") from None
                 continue
             req.template_kwargs["reasoning_effort"] = candidate
             break

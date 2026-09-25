@@ -225,7 +225,7 @@ class Qwen3MoeModel(PipelineMixin, nn.Module):
 
         for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache)):
             if layer_hook is not None:
-                h = layer_hook(i, h)
+                h = layer_hook(self.start_idx + i, h)
             h = layer(h, mask, c)
 
         # Send to the next process in the pipeline

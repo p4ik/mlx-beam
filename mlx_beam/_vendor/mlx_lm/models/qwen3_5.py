@@ -317,7 +317,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             if layer_hook is not None:
-                hidden_states = layer_hook(i, hidden_states)
+                hidden_states = layer_hook(self.start_idx + i, hidden_states)
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         # Send to the next process in the pipeline

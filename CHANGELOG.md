@@ -118,35 +118,48 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   embeddings, chunk by chunk, beside text-only rows. The prefix cache
   keys on the image's digest, so the same placeholders with another
   image never meet; a stride checkpoint never lands inside an image.
-  Chat requests take OpenAI's `image_url` parts as `data:` URLs (nothing
-  is fetched). What serves the images is a separate package found
+  Chat and Responses requests take OpenAI's `image_url` / `input_image`
+  parts as `data:` URLs (nothing is fetched; a base64 payload may be
+  wrapped in lines); an image request goes through the same effort
+  ladder and template checks as text, and a processor's refusal is the
+  client's 400. What serves the images is a separate package found
   through the entry-point group `mlx_beam.modalities`; without one the
-  core answers image input with a 400 naming the `vision` extra, as
-  before. A frontend states what it needs of the text model (input
-  embeddings; the layer hook for per-layer extras), read from the model
-  at load: a frontend the model cannot serve is refused and
-  `/health.vision` says why, and an image request the model cannot serve
-  is a 400, never a dead worker. `/health.vision` and
-  `capabilities.vision` say what was found.
+  core answers image input with a 400 that says what is missing and
+  points at `/health.vision`. A frontend states what it needs of the
+  text model (input embeddings; the layer hook for per-layer extras) -
+  before its tower is read, when the provider can tell from the config -
+  and a frontend the model cannot serve is refused with the reason in
+  `/health.vision`; an image request the model cannot serve is a 400,
+  never a dead worker. `--chat-template` and `--trust-remote-code` reach
+  the frontend's processor. `/health.vision` and `capabilities.vision`
+  say what was found.
 - `mlx-beam-vision`, the first package beside the core
   (`packages/mlx-beam-vision`, its own project on PyPI, installed by
   `mlx-beam[vision]`): five tower families vendored from mlx-vlm (MIT) -
   Qwen3-VL (which Qwen3.5 and Qwen3.8 carry unchanged, DeepStack
-  included), Pixtral for Mistral 3 (an image's rows as separate spans),
-  Gemma 4 (image), Muse Glimmer, Granite Vision 4.1 (AnyRes tiles, window
-  Q-Former projectors adding features ahead of their text layers; its
-  checkpoints load as text through a `granite4_vision` model class, the
-  dense or the Mamba-2 hybrid text model by the config) - each with its
-  projector after the reference implementation; the checkpoint's own
-  processor through
-  transformers renders the template and expands the placeholders; the
-  tower's tensors come from the checkpoint's index (a package's own
-  vision file included); encoder outputs are cached by image digest,
-  bounded in bytes. The workspace builds and tests both packages, the
-  release ships both wheels at the same version, and import-linter keeps
-  the core from importing the package. Exercised on tiny towers against a
-  direct forward; the processors and the real towers are a Mac round.
-  Not yet: audio, video, quantized towers.
+  included), Pixtral for Mistral 3 (an image's rows as separate spans;
+  the HF layout and mlx-vlm's conversions both load), Gemma 4 E-series
+  (image; the processor's patchified inputs with their patch positions),
+  Muse Glimmer, Granite Vision 4.1 (AnyRes tiles, window Q-Former
+  projectors adding features ahead of their text layers, the tiles a
+  processor pads onto an image left out, the unpadding rounded as the
+  reference does; its checkpoints load as text through a
+  `granite4_vision` model class, the dense or the Mamba-2 hybrid text
+  model by the config) - each with its projector after the reference
+  implementation; the checkpoint's own processor through transformers
+  (5.15 or later) renders the template and expands the placeholders, its
+  BOS not added twice; the tower's tensors come from the checkpoint's
+  index (a package's own vision file included) and `/health.vision`
+  names the shards; encoder outputs are cached by image digest, bounded
+  in bytes, only the images the cache lacks go through the tower; an
+  image above 32 megapixels is refused before it is decoded, EXIF
+  orientation is applied. Gemma 4 12B (`gemma4_unified`, encoder-free,
+  its image tokens attending bidirectionally in the text model) is
+  refused with that reason. The workspace builds and tests both
+  packages, the release ships both wheels at the same version, and
+  import-linter keeps the core from importing the package. Exercised on
+  tiny towers against a direct forward; the processors and the real
+  towers are a Mac round. Not yet: audio, video, quantized towers.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

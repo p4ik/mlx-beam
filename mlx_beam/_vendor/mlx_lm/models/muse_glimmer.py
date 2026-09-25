@@ -250,8 +250,10 @@ class Model(nn.Module):
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            # Drop the vision tower — this is a text-only port.
-            if k.startswith(("vision_tower", "vision_adapter", "vision_projection")):
+            # Drop the vision tower (either layout) — this is a text-only port.
+            if k.removeprefix("model.").startswith(
+                ("vision_tower", "vision_adapter", "vision_projection")
+            ):
                 continue
             # Meta/MLX nest the text tower under language_model.*
             if k.startswith("language_model.model."):

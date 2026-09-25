@@ -538,7 +538,11 @@ def serve(args) -> int:
         model_path,
         json.loads((model_path / "config.json").read_text()),
         tokenizer,
+        trust_remote_code=args.trust_remote_code,
     )
+    if frontend is not None and template_source != "model":
+        # The flag's template renders image requests too, not only text.
+        frontend.chat_template = tokenizer.chat_template
     served = Served(
         engine,
         tokenizer,

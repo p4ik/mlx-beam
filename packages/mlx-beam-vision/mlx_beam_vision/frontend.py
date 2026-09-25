@@ -8,16 +8,24 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
+from mlx_beam_vision import families
 from mlx_beam_vision.cache import FeatureCache
 
 from mlx_beam.engine.request import ImageSpan
 from mlx_beam.modalities import Built, Image
 
 logger = logging.getLogger("beam.vision")
+
+# The largest image decoded, in pixels. The tower runs in the request's
+# thread, outside the engine's prefill valve, and PIL's own guard starts
+# at ~89 MP; Qwen's processors take up to ~16.7 MP. Decided 2026-09-25;
+# a larger image is a 400, not a stall of the whole server.
+MAX_IMAGE_PIXELS = 32_000_000
 
 
 def _spans_from(
@@ -49,13 +57,26 @@ def _spans_from(
 
 
 def open_images(images: Sequence[Image]):
+    """PIL images from the request's bytes: size checked before a pixel
+    is decoded, EXIF orientation applied (a phone's photo is stored as
+    the sensor saw it), RGB."""
     from PIL import Image as PILImage
+    from PIL import ImageOps
 
     out = []
     for img in images:
         try:
             pil = PILImage.open(io.BytesIO(img.data))
+            w, h = pil.size
+            if w * h > MAX_IMAGE_PIXELS:
+                raise ValueError(
+                    f"{w} x {h} pixels is above the {MAX_IMAGE_PIXELS} this "
+                    "server decodes; scale the image down"
+                )
+            pil = ImageOps.exif_transpose(pil)
             pil.load()
+        except ValueError:
+            raise
         except Exception as e:  # noqa: BLE001 - the bytes are the client's
             raise ValueError(f"not a readable image ({e})") from None
         out.append(pil.convert("RGB"))
@@ -64,7 +85,9 @@ def open_images(images: Sequence[Image]):
 
 class VisionFrontend:
     """`processor` is the checkpoint's transformers processor (its
-    `apply_chat_template` and `__call__`), `tower` a family's Tower."""
+    `apply_chat_template` and `__call__`), `tower` a family's Tower.
+    `chat_template` set by the server overrides the processor's own
+    (the `--chat-template` flag reaches image requests too)."""
 
     name = "mlx-beam-vision"
 
@@ -73,7 +96,9 @@ class VisionFrontend:
         self.tower = tower
         self.family = family
         self.cache = FeatureCache(cache_bytes)
+        self.chat_template: str | None = None
         self.images_encoded = 0
+        self._count = threading.Lock()
 
     @property
     def needs(self) -> tuple[str, ...]:
@@ -84,21 +109,38 @@ class VisionFrontend:
             return ("input_embeddings", "layer_hook")
         return ("input_embeddings",)
 
-    def _placeholder(self) -> int:
-        return self.tower.image_token_id
+    def _text_kwargs(self, text: str) -> dict:
+        # The rendered template already carries the BOS the tokenizer would
+        # add; adding it again would start the prompt with two.
+        tok = getattr(self.processor, "tokenizer", None)
+        bos = getattr(tok, "bos_token", None)
+        if bos and isinstance(text, str) and text.startswith(bos):
+            return {"add_special_tokens": False}
+        return {}
 
     def build(self, messages, images: Sequence[Image], template_kwargs: dict) -> Built:
+        kwargs = dict(template_kwargs)
+        if self.chat_template is not None:
+            kwargs["chat_template"] = self.chat_template
         text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **template_kwargs
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
         pil = open_images(images)
-        processed = self.processor(text=[text], images=pil or None, return_tensors="np")
+        processed = self.processor(
+            text=[text],
+            images=pil or None,
+            return_tensors="np",
+            **self._text_kwargs(text),
+        )
         ids = [int(t) for t in processed["input_ids"][0]]
         encoded = self._encode(images, processed)
         counts = [int(enc.features.shape[0]) for enc in encoded]
         spans = []
         for runs, image, enc in zip(
-            _spans_from(ids, self._placeholder(), counts), images, encoded, strict=True
+            _spans_from(ids, self.tower.image_token_id, counts),
+            images,
+            encoded,
+            strict=True,
         ):
             off = 0
             for start, end in runs:
@@ -117,27 +159,30 @@ class VisionFrontend:
 
     def _encode(self, images: Sequence[Image], processed: dict) -> list:
         """Every image's features: from the cache by digest, else one tower
-        pass over the ones missing (all at once), evaluated and cached."""
-        family = self._family_module()
+        pass over the ones missing (the family picks them out of the
+        processor's batch), evaluated and cached as arrays of their own."""
+        family = families.module_for(self.family)
         keys = [(img.digest, self.family) for img in images]
         found = [self.cache.get(k) for k in keys]
         missing = [i for i, f in enumerate(found) if f is None]
         if missing:
-            fresh = self.tower.encode(*family.pixel_inputs(processed))
-            if len(fresh) != len(images):
+            inputs = family.pixel_inputs(processed)
+            if family.count(inputs) != len(images):
                 raise ValueError("the processor's grids do not match the images")
-            for i in missing:
-                enc = fresh[i]
+            if len(missing) < len(images):
+                inputs = family.select(inputs, missing)
+            fresh = self.tower.encode(*inputs)
+            for i, enc in zip(missing, fresh, strict=True):
+                # A slice of the call's batch would keep the whole batch
+                # alive in the cache and count only its own bytes.
+                enc.features = mx.contiguous(enc.features)
+                enc.deepstack = {k: mx.contiguous(d) for k, d in enc.deepstack.items()}
                 mx.eval(enc.features, *enc.deepstack.values())
                 self.cache.put(keys[i], enc, [enc.features, *enc.deepstack.values()])
                 found[i] = enc
-                self.images_encoded += 1
+            with self._count:
+                self.images_encoded += len(missing)
         return found
-
-    def _family_module(self):
-        import importlib
-
-        return importlib.import_module(f"mlx_beam_vision.families.{self.family}")
 
     def describe(self) -> dict:
         return {
@@ -145,6 +190,9 @@ class VisionFrontend:
             "family": self.family,
             "tower": self.tower.describe(),
             "processor": type(self.processor).__name__,
+            "chat_template": (
+                "server" if self.chat_template is not None else "processor"
+            ),
             "feature_cache": self.cache.describe(),
             "images_encoded": self.images_encoded,
         }

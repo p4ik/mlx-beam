@@ -15,7 +15,7 @@ language model is mlx-beam's.
 |---|---|---|
 | `qwen3_vl` | `mlx_vlm/models/qwen3_vl/` (`vision.py`, `config.py`) | Qwen3-VL, Qwen3.5, Qwen3.8 (the same tower; DeepStack features returned alongside) |
 | `pixtral` | `mlx_vlm/models/pixtral/` (`vision.py`, `config.py`) | Mistral 3 (the projector is ours, after upstream's `mistral3.py`) |
-| `gemma4` | `mlx_vlm/models/gemma4/` (`vision.py`, `config.py`) | Gemma 4 (the embedder is ours, after upstream's `gemma4.py`) |
+| `gemma4` | `mlx_vlm/models/gemma4/` (`vision.py`, `config.py`) | Gemma 4 E-series (the embedder is ours, after upstream's `gemma4.py`); upstream's `gemma4_unified/` (the encoder-free 12B) is not taken - its image tokens need a bidirectional mask in the text model |
 | `muse_glimmer` | `mlx_vlm/models/muse_glimmer/` (`vision.py`, `config.py`) | Muse Glimmer (adapter and projection ours, after upstream's `muse_glimmer.py`) |
 | `granite4_vision` | `mlx_vlm/models/granite4_vision/` (`vision.py`, `config.py`, `downsampling.py`, `qformer.py`) | Granite Vision 4.1 (the packing and per-layer routing ours, after upstream's `granite4_vision.py`) |
 

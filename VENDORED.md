@@ -111,16 +111,17 @@ is stored quantized).
 `layer hook` - `models/qwen3_5.py`, `Qwen3_5TextModel.__call__`;
 `models/qwen3.py`, `Qwen3Model.__call__`; `models/qwen3_moe.py`,
 `Qwen3MoeModel.__call__`: one keyword argument, `layer_hook`, a callable
-applied to the hidden states before every decoder layer, index first. The
-engine's prefill hands in what a vision frontend adds at the image
-positions ahead of certain layers (DeepStack: the Qwen3-VL tower's
-intermediate features ahead of layers 1 to 3 - on Qwen3-VL's own text
-models `qwen3`/`qwen3_moe` as much as on Qwen3.5's - and Granite Vision's
-projected features ahead of its target layers); with the argument left out
-the loop is upstream's. The text models already took `input_embeddings`
-upstream; that is how the image features enter at the placeholder
-positions. Tests: `tests/test_vision_core.py` (Qwen3.5 and Qwen3-VL's
-wrapper over `qwen3`).
+applied to the hidden states before every decoder layer, index first -
+the layer's index in the whole model, `start_idx` added where the model
+is pipeline-sharded. The engine's prefill hands in what a vision frontend
+adds at the image positions ahead of certain layers (DeepStack: the
+Qwen3-VL tower's intermediate features ahead of layers 1 to 3 - on
+Qwen3-VL's own text models `qwen3`/`qwen3_moe` as much as on Qwen3.5's -
+and Granite Vision's projected features ahead of its target layers); with
+the argument left out the loop is upstream's. The text models already
+took `input_embeddings` upstream; that is how the image features enter
+at the placeholder positions. Tests: `tests/test_vision_core.py` (Qwen3.5
+and Qwen3-VL's wrapper over `qwen3`).
 
 `input embeddings` - `models/muse_glimmer.py`, `MuseGlimmerModel`: one
 keyword argument, `input_embeddings`, standing in for `embed_inputs(ids)`
@@ -130,9 +131,12 @@ way); `models/granite.py`, `GraniteModel` and `Model`: `input_embeddings`
 (standing in for `embed_tokens(ids)`, the multiplier still applies) and
 `layer_hook` as on Qwen3.5, for Granite Vision; `models/granitemoehybrid.py`,
 `GraniteMoeHybridModel` and `Model`: the same two, the Mamba-2 hybrid
-being the text model Granite Vision 4.1 ships with. Upstream's other text
-models took the argument already; Qwen3.5, Mistral 3 and Gemma 4 need
-nothing here. Tests:
+being the text model Granite Vision 4.1 ships with. Upstream's Qwen3.5,
+Mistral 3 and Gemma 4 text models took `input_embeddings` already, so
+those files carry no change for it. `muse_glimmer.py`'s `sanitize` also
+drops the tower under either layout (`vision_tower.*` and
+`model.vision_tower.*`). Tests: `tests/test_vision_core.py` (the engine
+path against a direct forward per text model); the towers themselves in
 `packages/mlx-beam-vision/tests`.
 
 `granite4_vision` - `models/granite4_vision.py`, ours (no upstream file):
@@ -143,6 +147,10 @@ package loads them itself) and moves the nested `model.language_model`
 up, `make_cache` is the hybrid's. Without it the loader has no class for
 `model_type: granite4_vision` and the CLI cannot load the checkpoint at
 all. Tests: `tests/test_vision_core.py`.
+
+The vision towers (`packages/mlx-beam-vision/mlx_beam_vision/_vendor/`,
+`tools/vendor.toml` part `mlx-vlm-vision`) are vendored from mlx-vlm too;
+that package's own `VENDORED.md` lists them.
 
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
 two constructor arguments. `generation_batch` is the class built at the move

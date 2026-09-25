@@ -2,12 +2,14 @@
 only through the entry-point group `mlx_beam.modalities` and this contract.
 
 A provider module exposes `supports(config) -> bool` (the checkpoint's
-config.json, plus what it ships) and `load(model, model_path, config,
-tokenizer) -> Frontend`. A frontend turns a request's messages and images
-into the prompt's token ids and the image spans the prefill embeds
-(`build`), and says what it is (`describe`). Nothing here imports a
-frontend: the core without the package answers image input with a 400
-that names the extra, never with a guess.
+config.json, plus what it ships), `load(model, model_path, config,
+tokenizer, *, trust_remote_code=False) -> Frontend`, and may expose
+`needs(config) -> tuple[str, ...]` - what its frontend will ask of the
+prefill, known before any weight is read. A frontend turns a request's
+messages and images into the prompt's token ids and the image spans the
+prefill embeds (`build`), and says what it is (`describe`). Nothing here
+imports a frontend: the core without the package answers image input
+with a 400 that names the extra, never with a guess.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import hashlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from importlib.metadata import entry_points
 from typing import Any, Protocol
 
@@ -34,8 +37,9 @@ class Image:
     data: bytes
     media_type: str = "image/png"
 
-    @property
+    @cached_property
     def digest(self) -> str:
+        # Hashed once: a span per placeholder run reads it, Mistral has dozens.
         return hashlib.sha256(self.data).hexdigest()
 
 
@@ -54,6 +58,9 @@ class Frontend(Protocol):
     # "input_embeddings" always, "layer_hook" when a family adds per-layer
     # extras (DeepStack). A frontend without the attribute needs the first.
     needs: tuple[str, ...]
+    # A chat template the server sets (its --chat-template flag) in place
+    # of the processor's own; None keeps the checkpoint's.
+    chat_template: str | None
 
     def build(
         self, messages: list[dict], images: Sequence[Image], template_kwargs: dict
@@ -84,37 +91,50 @@ def providers() -> list[Any]:
     return found
 
 
-def unmet_needs(model, frontend: Any) -> list[str]:
-    """What this frontend needs of the prefill that the model's text trunk
-    does not take - read from the model, not promised by the family."""
+def unmet_needs(model, needs: Sequence[str]) -> list[str]:
+    """What of `needs` the model's text trunk does not take - read from
+    the model, not promised by the family."""
     from mlx_beam.engine.priming import image_capabilities
 
     can = image_capabilities(model)
-    needs = getattr(frontend, "needs", ("input_embeddings",))
     return [name for name in needs if not can.get(name, False)]
 
 
 def load_frontend(
-    model, model_path, config: dict, tokenizer
+    model, model_path, config: dict, tokenizer, *, trust_remote_code: bool = False
 ) -> tuple[Frontend | None, str | None]:
     """(frontend, reason): the first provider that supports this checkpoint
     and whose needs the model's trunk meets, loaded; else None and, when a
     provider was refused, why - the health carries it. No provider at all:
-    (None, None), the core stays text-only and says so."""
+    (None, None), the core stays text-only and says so. A provider that
+    states its needs up front is refused before its tower is read."""
     reason = None
     for provider in providers():
+        name = getattr(provider, "__name__", str(provider))
         try:
             if not provider.supports(config):
                 continue
-            frontend = provider.load(model, model_path, config, tokenizer)
+            stated = getattr(provider, "needs", None)
+            missing = unmet_needs(model, stated(config)) if stated else []
+            if not missing:
+                frontend = provider.load(
+                    model,
+                    model_path,
+                    config,
+                    tokenizer,
+                    trust_remote_code=trust_remote_code,
+                )
+                missing = unmet_needs(
+                    model, getattr(frontend, "needs", ("input_embeddings",))
+                )
+                name = frontend.name
         except Exception as e:  # noqa: BLE001 - one provider's failure is its own
-            reason = f"{getattr(provider, '__name__', provider)}: {e}"
+            reason = f"{name}: {e}"
             logger.warning("modality provider %s", reason)
             continue
-        missing = unmet_needs(model, frontend)
         if missing:
             reason = (
-                f"{frontend.name} needs {', '.join(missing)} of the text model, "
+                f"{name} needs {', '.join(missing)} of the text model, "
                 f"which {type(model).__name__} does not take"
             )
             logger.warning("modality provider refused: %s", reason)

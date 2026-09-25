@@ -110,14 +110,20 @@ class PrimingPromptBatch(PromptProcessingBatch):
 
     def prompt(self, tokens):
         proposer = self._proposer
-        lengths = {len(t) for t in tokens}
-        if not tokens or len(lengths) != 1:
-            # Rows of unequal length need padding; the engine never sends
-            # those (it cuts every prefill call to the shortest segment).
-            return super().prompt(tokens)
         if len(self.uids) != len(tokens):
             raise ValueError("The batch length doesn't match the number of inputs")
         starts = [len(t) for t in self.tokens]
+        lengths = {len(t) for t in tokens}
+        if not tokens or len(lengths) != 1:
+            # Rows of unequal length need padding, which the embedded path
+            # does not do; the engine cuts every prefill call to the
+            # shortest segment, so this is a text-only call - or a bug,
+            # and then a loud one rather than images silently dropped.
+            if self._overlaps(starts, 0, max(lengths, default=0)):
+                raise ValueError(
+                    "image spans in a prefill call with rows of unequal length"
+                )
+            return super().prompt(tokens)
         for sti, ti in zip(self.tokens, tokens, strict=True):
             sti += ti
         rows = tokens

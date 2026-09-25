@@ -259,7 +259,7 @@ def test_served_reports_the_frontend_and_the_registry_finds_a_provider():
             return config.get("model_type") == "qwen3_5"
 
         @staticmethod
-        def load(model, model_path, config, tokenizer):
+        def load(model, model_path, config, tokenizer, *, trust_remote_code=False):
             return FakeFrontend(tokenizer)
 
     modalities.register(Provider)
@@ -310,7 +310,7 @@ def test_a_frontend_the_text_model_cannot_serve_is_refused_at_load():
             return True
 
         @staticmethod
-        def load(model, model_path, config, tokenizer):
+        def load(model, model_path, config, tokenizer, *, trust_remote_code=False):
             return Needy(tokenizer)
 
     modalities.register(Provider)
@@ -534,3 +534,152 @@ def test_a_granite_vision_checkpoint_loads_through_the_model_loader(
             )
         )
         assert len(out) == 2 and engine.health()["alive"]
+
+
+def test_responses_take_images_through_the_same_frontend():
+    """`input_image` parts reach the chat path as image parts: decoded
+    with a frontend, refused without one - the same as chat. A base64
+    payload wrapped in lines decodes; `detail` is ignored."""
+    from mlx_beam.api import responses
+
+    flat = __import__("base64").b64encode(png(4).data).decode()
+    lines = "\n".join(flat[i : i + 8] for i in range(0, len(flat), 8))
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "w1"},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{lines}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ]
+    }
+    with pytest.raises(ApiError) as exc:
+        responses.parse_responses_request(body, "m")
+    assert (
+        exc.value.code == "extra_not_installed"
+        and "/health.vision" in exc.value.message
+    )
+    req = responses.parse_responses_request(body, "m", vision=True)
+    assert len(req.chat.images) == 1 and req.chat.images[0].digest == png(4).digest
+    assert req.chat.messages[0]["content"] == [
+        {"type": "text", "text": "w1"},
+        {"type": "image"},
+    ]
+    tok = StubTokenizer()
+    gen = responses.to_generation_request(tok, req, frontend=FakeFrontend(tok))
+    assert len(gen.spans) == 1
+
+
+def test_an_image_path_climbs_the_effort_ladder_and_reports_the_processor():
+    """With images the prompt goes through the frontend, and through the
+    same ladder: an effort word the template rejects is replaced by the
+    rung it takes; a processor error is the client's 400, not a 500."""
+    tok = StubTokenizer()
+
+    class Picky(FakeFrontend):
+        def build(self, messages, images, template_kwargs):
+            if template_kwargs.get("reasoning_effort") not in (
+                None,
+                "low",
+                "medium",
+                "high",
+            ):
+                raise ValueError("reasoning_effort must be one of low, medium, high")
+            if template_kwargs.get("boom"):
+                raise RuntimeError("the processor choked")
+            return super().build(messages, images, template_kwargs)
+
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "w1"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ],
+        "reasoning_effort": "max",
+    }
+    req = chat.parse_chat_request(body, "m", vision=True)
+    tokens = chat.build_prompt(tok, req, Picky(tok))
+    assert req.template_kwargs["reasoning_effort"] == "high" and len(req.spans) == 1
+    assert tokens[req.spans[0].start] == PAD
+    req.template_kwargs["boom"] = True
+    with pytest.raises(ApiError, match="image input was refused: the processor choked"):
+        chat.build_prompt(tok, req, Picky(tok))
+    with pytest.raises(ApiError) as exc:
+        chat.build_prompt(tok, req, None)
+    assert exc.value.code == "extra_not_installed"
+
+
+def test_a_provider_stating_its_needs_is_refused_before_its_tower_loads():
+    from mlx_beam._vendor.mlx_lm.models import llama
+
+    tok = StubTokenizer()
+    plain = llama.Model(
+        llama.ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=1,
+        )
+    )
+    mx.eval(plain.parameters())
+    loads = []
+
+    class Provider:
+        __name__ = "stating-provider"
+
+        @staticmethod
+        def supports(config):
+            return True
+
+        @staticmethod
+        def needs(config):
+            return ("input_embeddings", "layer_hook")
+
+        @staticmethod
+        def load(model, model_path, config, tokenizer, *, trust_remote_code=False):
+            loads.append(trust_remote_code)
+            return FakeFrontend(tokenizer)
+
+    modalities.register(Provider)
+    try:
+        found, why = modalities.load_frontend(plain, None, {"model_type": "llama"}, tok)
+        assert found is None and "layer_hook" in why and loads == []
+        found, why = modalities.load_frontend(
+            tiny_qwen35(), None, {"model_type": "qwen3_5"}, tok, trust_remote_code=True
+        )
+        assert found is not None and why is None and loads == [True]
+    finally:
+        modalities._registered.remove(Provider)
+
+
+def test_unequal_prefill_rows_with_spans_are_a_loud_error():
+    """The engine cuts every prefill call to the shortest segment; a call
+    with rows of unequal length and an image span in them is a bug, and
+    raises instead of dropping the images."""
+    from mlx_beam.engine.priming import PrimingPromptBatch
+
+    model = tiny_qwen35()
+    front = FakeFrontend(StubTokenizer())
+    _, built = request(front, [png(7)])
+    cls = PrimingPromptBatch.bound(lambda uid: built.spans if uid == 1 else ())
+    caches = [make_request_cache(model, KVPolicy()) for _ in range(2)]
+    batch = cls(model, [1, 2], caches, prefill_step_size=64)
+    with pytest.raises(ValueError, match="unequal length"):
+        batch.prompt([built.tokens, built.tokens[:-2]])

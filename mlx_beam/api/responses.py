@@ -38,6 +38,7 @@ from mlx_beam.api.errors import (
 from mlx_beam.api.reasoning import read_aliases
 from mlx_beam.api.text import TextAssembler, TextDelta
 from mlx_beam.engine.request import GenerationRequest
+from mlx_beam.modalities import Image
 
 
 @dataclass
@@ -51,27 +52,37 @@ class ResponsesRequest:
     tool_choice: str = "auto"
 
 
-def _content_text(content: Any, item_index: int) -> str | None:
+def _content_parts(content: Any, item_index: int):
+    """A message's content as the chat path takes it: text parts folded
+    into a string, or the list of parts when an image is among them
+    (`_normalise_messages` decodes it, or refuses it without a frontend)."""
     if content is None or isinstance(content, str):
         return content
     if not isinstance(content, list):
         raise ApiError(
             f"input[{item_index}].content must be text or parts", param="input"
         )
-    texts = []
+    parts: list[dict] = []
+    with_image = False
     for part in content:
         kind = part.get("type") if isinstance(part, dict) else None
         if kind in ("input_text", "output_text", "text"):
-            texts.append(text_field(part, "text", f"input[{item_index}]"))
-        elif kind in ("input_image",):
-            raise missing_extra("image input", "vision")
+            parts.append(
+                {
+                    "type": "text",
+                    "text": text_field(part, "text", f"input[{item_index}]"),
+                }
+            )
+        elif kind == "input_image":
+            parts.append({"type": "input_image", "image_url": part.get("image_url")})
+            with_image = True
         elif kind in ("input_audio", "input_file"):
             raise unsupported(f"input part {kind}", "input")
         else:
             raise ApiError(
                 f"input[{item_index}] has an unknown part type {kind!r}", param="input"
             )
-    return "".join(texts)
+    return parts if with_image else "".join(p["text"] for p in parts)
 
 
 def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
@@ -110,7 +121,7 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
                 )
             message = {
                 "role": "system" if role == "developer" else role,
-                "content": _content_text(item.get("content"), i),
+                "content": _content_parts(item.get("content"), i),
             }
             if role == "assistant" and pending_reasoning:
                 message["reasoning_content"] = pending_reasoning
@@ -188,8 +199,12 @@ def _tools_to_chat(tools: Any) -> list[dict] | None:
 
 
 def parse_responses_request(
-    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+    body: dict,
+    default_model: str,
+    defaults: RequestDefaults = DEFAULTS,
+    vision: bool = False,
 ) -> ResponsesRequest:
+    """`vision` says a frontend serves images (as for chat)."""
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     for key in ("previous_response_id", "conversation"):
@@ -218,9 +233,10 @@ def parse_responses_request(
         template_kwargs["enable_thinking"] = thinking
     if level is not None:
         template_kwargs["reasoning_effort"] = level
+    images: list[Image] | None = [] if vision else None
     chat = ChatRequest(
         messages=_normalise_messages(
-            items_to_messages(body.get("input"), body.get("instructions"))
+            items_to_messages(body.get("input"), body.get("instructions")), images
         ),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
@@ -235,6 +251,7 @@ def parse_responses_request(
         min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
+        images=images or [],
     )
     return ResponsesRequest(
         chat=chat,
@@ -251,9 +268,12 @@ def to_generation_request(
     req: ResponsesRequest,
     defaults: RequestDefaults = DEFAULTS,
     max_context: int | None = None,
+    frontend=None,
 ) -> GenerationRequest:
     # Same prompt, budget and markers as chat; only the response shape differs.
-    return chat_to_generation_request(tokenizer, req.chat, defaults, max_context)
+    return chat_to_generation_request(
+        tokenizer, req.chat, defaults, max_context, frontend=frontend
+    )
 
 
 class ResponsesResponder:

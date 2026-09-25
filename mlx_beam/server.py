@@ -467,10 +467,17 @@ class Handler(BaseHTTPRequestHandler):
         self._check_model(body)
         tok = self.served.tokenizer
         req = responses.parse_responses_request(
-            body, self.served.model_name, self.served.defaults
+            body,
+            self.served.model_name,
+            self.served.defaults,
+            vision=self.served.frontend is not None,
         )
         gen_request = responses.to_generation_request(
-            tok, req, self.served.defaults, self.served.engine.max_context
+            tok,
+            req,
+            self.served.defaults,
+            self.served.engine.max_context,
+            frontend=self.served.frontend,
         )
         responder = responses.ResponsesResponder(
             tok,

@@ -20,7 +20,10 @@ jobs:
       - name: The configuration page matches the serve parser
         run: python3 tools/gen_config_reference.py --check
       - name: The core never imports the vision package
-        run: uvx --from import-linter lint-imports
+        # The contract names both packages, so both must be importable.
+        run: |
+          uv sync --extra dev --extra vision
+          uv run lint-imports
 
   test-apple-silicon:
     # macos-15 runners are Apple silicon (M-series): real MLX, tiny models.

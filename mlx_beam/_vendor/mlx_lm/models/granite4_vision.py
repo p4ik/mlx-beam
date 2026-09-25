@@ -1,4 +1,3 @@
-# Copyright © 2025 Apple Inc.
 # The text-only view of a Granite Vision 4.1 checkpoint, after mlx-lm's
 # qwen3_vl.py and mistral3.py: the language model one level down under
 # `language_model`, the tower and the projectors dropped at load. The

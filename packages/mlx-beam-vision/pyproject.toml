@@ -22,7 +22,9 @@ classifiers = [
 dependencies = [
   "mlx-beam",
   "mlx>=0.32; sys_platform == 'darwin'",
-  "transformers>=5.7",
+  # Muse Glimmer's processor arrived in 5.15; Gemma 4 and Granite Vision
+  # 4.1 are older.
+  "transformers>=5.15",
   "pillow>=10",
   "numpy",
 ]

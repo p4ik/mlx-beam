@@ -32,17 +32,19 @@ def shards_for(model_path: Path, prefixes: Iterable[str]) -> dict[str, list[str]
     )
 
 
-def load_prefixed(model_path: Path, prefixes: Iterable[str]) -> dict[str, mx.array]:
+def load_prefixed(
+    model_path: Path, prefixes: Iterable[str]
+) -> tuple[dict[str, mx.array], list[str]]:
     """The tensors whose names start with one of `prefixes`, names as in
-    the checkpoint."""
+    the checkpoint, and the shard files they were read from."""
     prefixes = tuple(prefixes)
     out: dict[str, mx.array] = {}
+    shards: list[str] = []
     for shard, names in shards_for(model_path, prefixes).items():
         raw = mx.load(str(model_path / shard))
         wanted = set(names) if names else {k for k in raw if k.startswith(prefixes)}
-        out.update({k: v for k, v in raw.items() if k in wanted})
-    return out
-
-
-def strip_prefix(weights: dict[str, mx.array], prefix: str) -> dict[str, mx.array]:
-    return {k[len(prefix) :]: v for k, v in weights.items() if k.startswith(prefix)}
+        found = {k: v for k, v in raw.items() if k in wanted}
+        if found:
+            out.update(found)
+            shards.append(shard)
+    return out, sorted(shards)
