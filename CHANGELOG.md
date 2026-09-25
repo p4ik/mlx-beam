@@ -28,6 +28,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   one that takes the word unchecked gets it as sent (the vocabulary such
   models were trained on); one without the kwarg gets nothing. Before,
   every word was mapped onto one template's three names.
+- Anthropic's Messages API: `/v1/messages` (system field, content blocks
+  with text, thinking, tool_use and tool_result, tools with
+  `input_schema`, `tool_choice` auto or none, `stop_sequences`,
+  `thinking.budget_tokens`, `top_k`) answering in content blocks in the
+  order thinking, text, tool_use with Anthropic's stop reasons, usage
+  (`cache_read_input_tokens` from the prefix cache) and stream events
+  (`message_start`, per block start / delta / stop, `message_delta`,
+  `message_stop`, `ping`), errors in Anthropic's envelope; and
+  `/v1/messages/count_tokens`. Tool arguments go out in one
+  `input_json_delta` when the call closes. A `cache_control` marker is
+  accepted on a message's last block (a checkpoint boundary) and refused
+  elsewhere, never dropped in silence.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is

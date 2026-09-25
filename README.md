@@ -23,7 +23,7 @@ beam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --port 8000 \
   --kv-bits 8
 ```
 
-That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) plus `/health`, which reports what was actually built: the KV layout per layer, the batching and cache settings, the Metal allocator's `memory` counters (`active`, `peak`, `cache` — RSS does not see these), and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own). `POST /health/reset-peak` starts a fresh peak window for a measurement.
+That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`), Anthropic's Messages API next to it (`/v1/messages`, `/v1/messages/count_tokens`; point `ANTHROPIC_BASE_URL` at it), plus `/health`, which reports what was actually built: the KV layout per layer, the batching and cache settings, the Metal allocator's `memory` counters (`active`, `peak`, `cache` — RSS does not see these), and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own). `POST /health/reset-peak` starts a fresh peak window for a measurement.
 
 Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`, `--prompt-cache-size`, `--chat-template`, …). Token limits say what they count: `--max-context` (prompt plus generated, a hard cap), `--max-prompt-tokens` (prompt, a hard cap), `--max-completion-tokens` (generated, the default a request may override), `--max-reasoning-tokens` (the think block; closed by force at the budget) and `--min-response-tokens` (what the answer keeps after the block). `beam serve --help` lists them all with their units, and the [configuration page](https://p4ik.github.io/mlx-beam/configuration/) has the same tables next to the request fields and what a checkpoint may bring along.
 
@@ -38,7 +38,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Mixed-precision KV cache** — Bits per layer, set at conversion. Quantized after the prefill by default (the prefill never reads quantized data); `--kv-prefill quantized` writes it quantized from the first token for profiles measured that way.
 - **Multi-token prediction** — The checkpoint's own draft head, verified exactly. On today for one greedy request at a time; in the batch and under sampling planned.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
-- **Responses API** — Next to chat completions, stateless.
+- **Responses and Messages APIs** — Next to chat completions, stateless: OpenAI's Responses shape and Anthropic's Messages shape on the same token path.
 - **No bloat** — The core is the token path and the API formats. Vision and audio will come as their own package, selected through an extra of this one; structured output and GGUF as extras with a guard - none of them exists in this release, a request that needs one gets a clear refusal. Expert streaming for models larger than memory is planned.
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.

@@ -96,7 +96,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 
 ## Request: fields a call may send
 
-Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`). A field left out falls back to the server's default for it.
+Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`); `/v1/messages` takes Anthropic's (`system`, content blocks, `tools` with `input_schema`, `stop_sequences`, `thinking.budget_tokens`, `top_k`) and answers in Anthropic's blocks, events and error envelope, `/v1/messages/count_tokens` counts the rendered prompt. A `cache_control` marker maps onto the prompt cache's checkpoints when it sits on a message's last block and is refused otherwise. A field left out falls back to the server's default for it.
 
 | Field | Values | What it does |
 |---|---|---|

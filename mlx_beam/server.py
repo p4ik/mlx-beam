@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mlx_beam import __version__
-from mlx_beam.api import chat, completions, responses
+from mlx_beam.api import chat, completions, messages, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
@@ -178,10 +178,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _error_body(self, err: ApiError) -> dict:
+        # The messages endpoints answer in Anthropic's envelope.
+        if self.path.startswith("/v1/messages"):
+            return messages.anthropic_error(err)
+        return err.body()
+
     def _send_error(self, err: ApiError) -> None:
         # A full queue clears; a dead engine does not come back on its own.
         headers = {"Retry-After": "1"} if err.code == "queue_full" else None
-        self._send_json(err.status, err.body(), headers)
+        self._send_json(err.status, self._error_body(err), headers)
 
     def _cors(self) -> None:
         allowed = self.served.allowed_origins
@@ -267,6 +273,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         routes: dict[str, Callable[[dict], None]] = {
             "/v1/chat/completions": self._chat,
+            "/v1/messages": self._messages,
+            "/v1/messages/count_tokens": self._count_tokens,
             "/v1/completions": self._completions,
             "/v1/responses": self._responses,
             "/health/reset-peak": self._reset_peak,
@@ -305,7 +313,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._streaming:
             self._send_error(err)
             return
-        self._sse(err.body(), "error" if self._sse_events else None)
+        self._sse(self._error_body(err), "error" if self._sse_events else None)
         if not self._sse_events:
             self._sse("[DONE]")
 
@@ -474,6 +482,30 @@ class Handler(BaseHTTPRequestHandler):
         gen_request = completions.to_generation_request(tok, req, self.served.defaults)
         responder = completions.CompletionResponder(tok, req, gen_request.tokens)
         self._run(gen_request, responder, req.stream)
+
+    def _messages(self, body: dict) -> None:
+        self._check_model(body)
+        tok = self.served.tokenizer
+        req = messages.parse_messages_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        gen_request = messages.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
+        responder = messages.MessagesResponder(
+            tok,
+            req,
+            gen_request.tokens,
+            route_thinking=self.served.reasoning_field != "none",
+        )
+        self._run(gen_request, responder, req.stream, sse_events=True)
+
+    def _count_tokens(self, body: dict) -> None:
+        self._check_model(body)
+        req = messages.parse_messages_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        self._send_json(200, messages.count_tokens(self.served.tokenizer, req))
 
     def _responses(self, body: dict) -> None:
         self._check_model(body)
