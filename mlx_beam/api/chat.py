@@ -338,7 +338,13 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
-    return list(tokens)
+    tokens = list(tokens)
+    opener = getattr(tokenizer, "answer_opener_tokens", None)
+    if opener and kwargs.get("enable_thinking") is False:
+        # A family whose template has no switch (Harmony, Muse): the answer
+        # is opened in the prompt, so the model writes it without a block.
+        tokens += list(opener)
+    return tokens
 
 
 # Boundaries are found by re-rendering message prefixes; the last few user
@@ -475,10 +481,14 @@ def reasoning_limits(
     end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
     if not start or not end:
         return None
-    newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
-    # Closed the way the models were trained to close: a line break, the
-    # marker, a blank line.
-    close = newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+    close = getattr(tokenizer, "think_close_tokens", None)
+    if not close:
+        newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
+        # Closed the way the models were trained to close: a line break, the
+        # marker, a blank line.
+        close = (
+            newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+        )
     return ReasoningLimits(
         start=start,
         end=end,

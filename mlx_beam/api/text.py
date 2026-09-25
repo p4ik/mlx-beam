@@ -32,10 +32,31 @@ class TextDelta:
         return not (self.content or self.reasoning or self.tool_calls)
 
 
+def route_label(tokenizer, label: str) -> str:
+    """Where the text after a label goes: reasoning, normal (the answer) or
+    tool. Gemma's channels are all reasoning; Harmony's `analysis` is,
+    `final` is the answer, a `commentary` with a recipient (or a recipient
+    before the channel) a tool call; Muse's `self` is the reasoning, `user`
+    the answer, any other recipient a tool."""
+    family = getattr(tokenizer, "think_family", None)
+    label = label.strip()
+    if family == "harmony":
+        if "to=" in label or label.startswith("functions."):
+            return "tool"
+        return "reasoning" if label.startswith("analysis") else "normal"
+    if family == "muse":
+        if label == "self":
+            return "reasoning"
+        return "normal" if label in ("", "user", "assistant") else "tool"
+    return "reasoning"
+
+
 def initial_state(tokenizer, prompt_tokens: list[int]) -> tuple[str, str]:
     """A prompt that ends inside an open think block continues as reasoning -
-    or inside the opener's label, when the label's line end is still to
-    come; the second value is that open marker as the prompt carries it."""
+    or inside the opener's label, when the label's end is still to come;
+    the second value is that open marker as the prompt carries it. A label
+    already complete is routed: a prompt ending in the answer's opener
+    (thinking switched off) starts in the answer."""
     if getattr(tokenizer, "has_thinking", False):
         start = tokenizer.rfind_think_start(prompt_tokens)
         if start > tokenizer.rfind_think_end(prompt_tokens):
@@ -43,6 +64,10 @@ def initial_state(tokenizer, prompt_tokens: list[int]) -> tuple[str, str]:
             label_end = getattr(tokenizer, "think_label_end", None)
             if label_end and label_end not in opened:
                 return "label", opened
+            if label_end:
+                label = opened[len(tokenizer.think_start) :].split(label_end, 1)[0]
+                if route_label(tokenizer, label) != "reasoning":
+                    return "normal", ""
             return "reasoning", opened
     return "normal", ""
 
@@ -110,13 +135,17 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
     transitions: dict = {}
     thinking = getattr(tokenizer, "has_thinking", False)
     label_end = getattr(tokenizer, "think_label_end", None)
+    via_label = getattr(tokenizer, "tool_call_via_label", False)
     if thinking and label_end:
-        # A labelled opener (Gemma 4's channel): the label runs to the line
-        # end and is part of the marker, whatever tokens it comes as. The
-        # assembler finds that line end itself - the automaton reports one
-        # text per segment and only the state after it, so a line end it
-        # matched could not be told apart from the reasoning text behind it.
-        transitions.setdefault("normal", []).append((tokenizer.think_start, "label"))
+        # A labelled opener (Gemma 4's channel, Harmony's channel, Muse's
+        # recipient): the label runs to its end and is part of the marker,
+        # whatever tokens it comes as. The assembler finds that end itself
+        # - the automaton reports one text per segment and only the state
+        # after it, so an end it matched could not be told apart from the
+        # reasoning text behind it - and routes by what the label says.
+        openers = getattr(tokenizer, "think_openers", None) or (tokenizer.think_start,)
+        for opener in openers:
+            transitions.setdefault("normal", []).append((opener, "label"))
         transitions["label"] = [(tokenizer.think_end, "normal")]
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
     elif thinking:
@@ -125,9 +154,12 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
         )
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
     if tools and getattr(tokenizer, "has_tool_calling", False):
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
-        if thinking:
-            transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+        if not via_label:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
+            if thinking:
+                transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
             [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
         )
@@ -231,6 +263,7 @@ class TextAssembler:
         route_thinking: bool = True,
         tools_enabled: bool = True,
     ):
+        self._tokenizer = tokenizer
         self._detok = tokenizer.detokenizer
         # The automaton always runs, so reasoning is counted in every mode;
         # routing off puts the markers back into the text where they were cut.
@@ -242,8 +275,10 @@ class TextAssembler:
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
         self._label_end = getattr(tokenizer, "think_label_end", None) or ""
-        # The opener's label so far, until its line end shows up.
+        # The opener's label so far, until its line end shows up, and how
+        # many tokens it took (they count as reasoning only if it opens one).
         self._label = seeded[len(self._think_start) :] if start == "label" else ""
+        self._label_tokens = 0
         # A think block the prompt opened: the client sees it once, up front.
         self._lead = seeded if not route_thinking else ""
         self._tool_text = ""
@@ -349,14 +384,31 @@ class TextAssembler:
                 delta.content = (self._take_lead() or opened) + clean
             if self._prev != "label":
                 self._label = ""
+                self._label_tokens = 0
+            self._label_tokens += 1
+            label = self._label
             rest = self._after_label(clean)
             if rest is not None:
-                # The line end may arrive in one segment with the label, or
-                # with the first reasoning text: what follows it is reasoning.
-                self._state = self._enter("reasoning")
-                current = "reasoning"
-                if self._route:
-                    delta.reasoning = rest
+                # The label's end may arrive in one segment with the label,
+                # or with the first text behind it: that text goes where
+                # the label says - reasoning, the answer, or a tool call
+                # (the header stays with the call's text for the parser).
+                label = (label + clean).split(self._label_end, 1)[0]
+                target = route_label(self._tokenizer, label)
+                if target == "tool" and "tool" not in self._state[2]:
+                    target = "normal"  # tools off: the model's text as is
+                self._state = self._enter(target)
+                current = target
+                if target == "reasoning":
+                    if self._route:
+                        delta.reasoning = rest
+                elif target == "tool":
+                    self.reasoning_tokens -= self._label_tokens
+                    self._tool_text = label + self._label_end + rest
+                else:
+                    # The label opened the answer: its tokens were no reasoning.
+                    self.reasoning_tokens -= self._label_tokens
+                    delta.content += rest
         elif current == "reasoning":
             self.reasoning_tokens += 1
             if self._route:
@@ -368,8 +420,12 @@ class TextAssembler:
             self._tool_text += clean
         else:
             if self._prev == "tool":
-                self._pending_tools.append((self._tool_text, True))
+                # The end marker may sit inside a text segment (ATEM's is
+                # plain text): what the automaton released with it is the
+                # call's last text, not the answer's.
+                self._pending_tools.append((self._tool_text + clean, True))
                 self._tool_text = ""
+                clean = ""
             closed = ""
             if self._prev in ("reasoning", "label") and not self._route:
                 # A block the prompt opened may close on the first token.

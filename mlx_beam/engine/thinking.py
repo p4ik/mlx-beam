@@ -159,6 +159,8 @@ class ThinkingBudget:
         self._start_prefix = mx.array(limits.start[:-1], dtype=mx.int32)
         # While set, the opener cannot complete: no block fits any more.
         self._block = False
+        # Tokens of the close's tail still to come after the end marker.
+        self._closing = 0
         limit = limits.max_tokens
         if limit is None:
             return
@@ -216,7 +218,14 @@ class ThinkingBudget:
     def observe(self, token: int, finish_reason: str | None) -> None:
         """One generated token, in order; called after the generator returned it."""
         self.last_forced = self._is_forced(token)
-        if self._state == "reasoning":
+        if self._closing:
+            # The close's tail after the end marker (a line break, or the
+            # answer's opener for a family that closes by opening it): the
+            # queue keeps forcing it, the arming ends with its last token.
+            self._closing -= 1
+            if self._closing == 0:
+                self._disarm()
+        elif self._state == "reasoning":
             if self._end.feed(token):
                 self._state = "normal"
                 if self._armed_at is not None:
@@ -226,7 +235,13 @@ class ThinkingBudget:
                         self._armed_at + self._free + self._close_counted
                     )
                     self.thinking_truncated |= forced
-                    self._disarm()
+                    # The marker's last token was this one; the rest of the
+                    # close follows from the queue.
+                    tail = close_tail(self.limits) - 1
+                    if tail > 0 and not self._natural:
+                        self._closing = tail
+                    else:
+                        self._disarm()
             else:
                 self.reasoning_tokens += 1
                 self._gate_opener()
@@ -248,7 +263,7 @@ class ThinkingBudget:
         turn out to be: no force queued, no opener masked, and `tokens` more
         counted tokens cannot arm the force or the mask. A speculative cycle
         may then verify that many tokens without calling it."""
-        if self._block or self._pos < len(self._queue):
+        if self._block or self._pos < len(self._queue) or self._closing:
             return False
         limit = self.limits.max_tokens
         if limit is None:
@@ -262,8 +277,10 @@ class ThinkingBudget:
         """Once armed, the tokens after the free one are the queue's - unless
         the free token itself began the end marker, then the model's own
         close is merely completed and nothing counts as forced."""
-        if self._armed_at is None or self._state != "reasoning":
+        if self._armed_at is None:
             return False
+        if self._state != "reasoning":
+            return bool(self._closing) and not self._natural
         since = self.reasoning_tokens - self._armed_at
         if since < self._free:
             self._natural = token == self._guard
@@ -298,6 +315,7 @@ class ThinkingBudget:
         self._pos = 0
         self._armed_at = None
         self._closed = None
+        self._closing = 0
 
     def _gate_opener(self) -> None:
         """Another block costs the opener, a free token and the counted part

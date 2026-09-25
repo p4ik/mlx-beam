@@ -82,6 +82,35 @@ class Served:
             "audio": False,
         }
 
+    def reasoning_markers(self) -> dict:
+        """The think family and its markers as the tokenizer found them:
+        the evidence behind capabilities.thinking."""
+        t = self.tokenizer
+        if not getattr(t, "has_thinking", False):
+            return {"family": None}
+        return {
+            "family": getattr(t, "think_family", None),
+            "start": getattr(t, "think_start", None),
+            "end": getattr(t, "think_end", None),
+            "openers": list(getattr(t, "think_openers", None) or ()),
+            "label_end": getattr(t, "think_label_end", None),
+            "close_tokens": list(getattr(t, "think_close_tokens", None) or ()),
+            "answer_opener_tokens": list(
+                getattr(t, "answer_opener_tokens", None) or ()
+            ),
+        }
+
+    def tool_markers(self) -> dict:
+        t = self.tokenizer
+        if not getattr(t, "has_tool_calling", False):
+            return {"parser": None}
+        return {
+            "parser": getattr(t, "tool_parser_type", None),
+            "start": getattr(t, "tool_call_start", None),
+            "end": getattr(t, "tool_call_end", None),
+            "via_label": bool(getattr(t, "tool_call_via_label", False)),
+        }
+
     def models(self) -> dict:
         return {
             "object": "list",
@@ -100,6 +129,8 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
+        h["reasoning"] = self.reasoning_markers()
+        h["tools"] = self.tool_markers()
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),

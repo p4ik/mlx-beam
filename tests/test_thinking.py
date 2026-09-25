@@ -125,7 +125,10 @@ def test_engine_forces_the_close_and_reports_the_flags():
         # and the blank line, then the 3 answer tokens.
         assert tokens[2:5] == [nl, end, nl2] and len(tokens) == 8
         assert tokens[:2] == free[:2]
-        assert [e.forced for e in events] == [False, False, True, True] + [False] * 4
+        # The close's tail after the marker is the queue's as well.
+        assert [e.forced for e in events] == [False, False, True, True, True] + [
+            False
+        ] * 3
         assert events[-1].thinking_truncated and events[-1].finish_reason == "length"
         assert events[-1].response_truncated
         # A client stop on the marker ends the request there, flagged.
@@ -241,9 +244,9 @@ def test_two_token_end_marker_is_exact_and_a_started_close_is_finished():
     out = steps.run(10)
     assert out[:6] == [START, 10, 11, NL, E1, E2]
     assert tracker.reasoning_tokens == 5 and tracker.thinking_truncated
-    # The forced tokens are marked as such, up to the end marker.
-    assert steps.forced[:6] == [False, False, False, True, True, True]
-    assert not any(steps.forced[6:])
+    # The forced tokens are marked as such, the close's tail included.
+    assert steps.forced[:7] == [False, False, False, True, True, True, True]
+    assert not any(steps.forced[7:])
     # The model starts the marker on the free token and would wander off:
     # the marker is completed instead, so no second run-up eats the answer.
     tracker = ThinkingBudget(limits)

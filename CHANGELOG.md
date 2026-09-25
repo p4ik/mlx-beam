@@ -7,6 +7,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- Two marker families: Harmony (gpt-oss) and Muse (ATEM). The reasoning,
+  the answer and a tool call sit behind a label - the channel, or the
+  recipient after `<|start|>assistant` - and the text assembler routes by
+  what the label says: `analysis` / `self` to the reasoning field, `final`
+  / `user` to the content, a recipient naming a tool to a tool call. Tool
+  parsers for both (`harmony`: the JSON body of a commentary message;
+  `atem`: the `<atem:invoke>` block, values typed by the tool's schema).
+  A thinking budget closes the block the way these families do - by
+  opening the answer - and forces the whole sequence; `enable_thinking:
+  false` opens the answer in the prompt, since their templates have no
+  switch. `/health.reasoning` names the family and its markers,
+  `/health.tools` the parser.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is
@@ -24,6 +36,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   links that leave the site say so.
 
 ### Changed
+- The `forced` flag of a token now covers the whole forced close, the part
+  after the end marker included (a line break, or the answer's opener).
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing
