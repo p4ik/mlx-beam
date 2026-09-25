@@ -35,12 +35,13 @@ class Proposer(Protocol):
         hidden: mx.array,
         token: mx.array,
         choose: Callable[[mx.array, int], mx.array] | None = None,
+        depth: int | None = None,
     ) -> mx.array:
-        """Up to `depth` draft ids (lazy, shape (n,)) following `token` (shape
-        (1,)), given the target's hidden state at that position ((1, 1, H)).
-        `choose(logits, i)` turns the (1, V) logits of draft i into its token
-        ((1,)); None means argmax. An empty array means: nothing to draft,
-        decode this step plainly."""
+        """Up to `depth` draft ids (lazy, shape (n,); None: the proposer's
+        own depth) following `token` (shape (1,)), given the target's hidden
+        state at that position ((1, 1, H)). `choose(logits, i)` turns the
+        (1, V) logits of draft i into its token ((1,)); None means argmax.
+        An empty array means: nothing to draft, decode this step plainly."""
 
     def commit(self, uid: int, hidden: mx.array, tokens: list[int]) -> None:
         """The verify's outcome: `tokens` are the drafts that held (in order),
@@ -380,16 +381,17 @@ class BundledHeadProposer:
 
     # -- the cycle ------------------------------------------------------------
 
-    def propose(self, uid, hidden, token, choose=None):
+    def propose(self, uid, hidden, token, choose=None, depth=None):
+        depth = self.depth if depth is None else depth
         self._tail.pop(uid, None)
         drafts = []
         out, cache = self._feed(uid, hidden, token[None])
         out = out[:, -1:]
-        for i in range(self.depth):
+        for i in range(depth):
             logits = self._lm_head(out)[:, -1, :]
             draft = mx.argmax(logits, axis=-1) if choose is None else choose(logits, i)
             drafts.append(draft)
-            if len(drafts) == self.depth:
+            if len(drafts) == depth:
                 break
             out = self.head(out, draft[None], self._embed, cache)
         self._chain[uid] = len(drafts) - 1

@@ -81,12 +81,6 @@ class QueueFull(RuntimeError):
     """More requests are waiting than --max-queued allows; try again later."""
 
 
-# Draft depth of a cycle at this stage: three held the best gain for one row
-# on a 27B (2.1x, p1..p3 0.87/0.79/0.74; 2026-09-19, M4 Pro). A regulator
-# picks below the cap later; until then the cap only lowers this.
-FIXED_DRAFT_DEPTH = 3
-
-
 def _model_args(model: Any) -> list:
     """Where a model keeps its sizes: its own args, the `text_config` dict a
     multimodal wrapper stores instead (qwen3_5, gemma), and the nested
@@ -182,8 +176,7 @@ class Engine:
         self.model_key = model_key
         self.kv_policy = kv_policy or KVPolicy()
         # Speculative decoding: a proposer drafts, the verify cycle in
-        # SpeculativeGenerationBatch checks. Depth is fixed at this stage;
-        # the flag is a cap (measured 2.1x at depth 3 for one row, 19.09.).
+        # SpeculativeGenerationBatch checks.
         # uid -> None for a greedy row, its SeededSampler for a sampled one:
         # the verify draws through it and the proposer drafts through it. A
         # row present here may speculate; its thinking budget, if any, is
@@ -193,7 +186,10 @@ class Engine:
         if proposer is not None:
             if max_draft_tokens < 1:
                 raise ValueError("max_draft_tokens must be at least 1")
-            proposer.depth = min(FIXED_DRAFT_DEPTH, max_draft_tokens)
+            # The cap; the regulator picks each cycle's depth below it from
+            # measured acceptance and cost (three held the best gain for one
+            # row on a 27B: 2.1x, p1..p3 0.87/0.79/0.74; 2026-09-19, M4 Pro).
+            proposer.depth = max_draft_tokens
             self.speculator = Speculator(
                 proposer, proposer.depth, self._may_speculate, self._spec_coupling.get
             )

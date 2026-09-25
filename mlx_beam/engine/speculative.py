@@ -33,6 +33,7 @@ decodes plainly through the same class, so no request is refused for it.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -44,6 +45,7 @@ from mlx_beam._vendor.mlx_lm.models.gated_delta import gated_delta_update
 from mlx_beam._vendor.mlx_lm.models.ssm import ssm_update
 from mlx_beam.engine.exact import exact_forward
 from mlx_beam.engine.proposer import Proposer, trunk
+from mlx_beam.engine.regulator import Regulator
 
 
 class RollbackUnsupported(RuntimeError):
@@ -62,7 +64,9 @@ class Speculator:
         coupling: Callable[[int], Any] = lambda uid: None,
     ):
         self.proposer = proposer
+        # The cap; the regulator picks the depth of each cycle below it.
         self.depth = depth
+        self.regulator = Regulator(depth)
         # eligible(uid, tokens_this_cycle): no logits processor whose state
         # could change within the cycle.
         self.eligible = eligible
@@ -87,9 +91,11 @@ class Speculator:
         self.accepted = 0
 
     def describe(self) -> dict:
+        reg = self.regulator.describe()
         return {
             "proposer": self.proposer.describe(),
-            "depth": self.depth,
+            "depth": reg["depth"],
+            "max_depth": self.depth,
             "mode": self.mode,
             "exact": self.exact,
             "cycles": self.cycles,
@@ -102,8 +108,9 @@ class Speculator:
             "tokens_per_cycle": (
                 round(1 + self.accepted / self.cycles, 2) if self.cycles else None
             ),
-            "parked": False,
-            "reason": None,
+            "parked": reg["parked"],
+            "reason": reg["reason"],
+            "regulator": reg,
         }
 
 
@@ -327,21 +334,35 @@ class SpeculativeGenerationBatch(GenerationBatch):
 
     # -- the cycle -------------------------------------------------------------
 
-    def _can_speculate(self) -> bool:
+    def _alone(self) -> bool:
         spec = self.speculator
         return (
-            spec is not None
-            and len(self.uids) == 1
-            and self._hidden_slot is not None
-            and spec.eligible(self.uids[0], spec.depth + 1)
+            spec is not None and len(self.uids) == 1 and self._hidden_slot is not None
         )
 
+    def _plain(self, measure: bool):
+        """One plain step; alone, its wall time is the regulator's depth 0."""
+        tic = time.perf_counter()
+        out = super().next()
+        if measure:
+            self.speculator.regulator.observe_plain(time.perf_counter() - tic)
+        return out
+
     def next(self):
-        if not self._can_speculate():
+        if not self._alone():
             return super().next()
-        responses = self._cycle()
+        spec = self.speculator
+        k = spec.regulator.choose()
+        if k == 0 or not spec.eligible(self.uids[0], k + 1):
+            return self._plain(measure=True)
+        tic = time.perf_counter()
+        accepted = spec.accepted
+        responses = self._cycle(k)
         if responses is None:
-            return super().next()
+            return self._plain(measure=True)
+        spec.regulator.observe_cycle(
+            k, spec.accepted - accepted, time.perf_counter() - tic
+        )
         return responses
 
     def _arm(self) -> list[ArraysCache]:
@@ -457,13 +478,13 @@ class SpeculativeGenerationBatch(GenerationBatch):
                 break
         return responses, finish
 
-    def _cycle(self):
+    def _cycle(self, depth: int):
         spec = self.speculator
         uid = self.uids[0]
         y = self._next_tokens  # (1,), sampled, not yet in the caches
         lp_y = self._next_logprobs[0]
         h = self._hidden_slot
-        drafts = spec.proposer.propose(uid, h, y, self._chooser(uid))
+        drafts = spec.proposer.propose(uid, h, y, self._chooser(uid), depth)
         k = int(drafts.shape[0]) if drafts.ndim else 0
         if k == 0:
             return None

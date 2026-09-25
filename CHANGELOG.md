@@ -82,6 +82,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `primed_pairs` and `histories_restored`. Measured before on the 27B
   head: 2.39 against 2.23 tokens per cycle with and without the prompt
   primed.
+- A depth regulator. Each cycle's draft depth is chosen below
+  `--max-draft-tokens` from what was measured on the machine: the
+  acceptance at each chain position and the wall time of a cycle at each
+  depth against the wall time of a plain step (measured, not assumed);
+  the depth with the best expected tokens per time runs, a neighbour is
+  probed now and then. A cycle that commits fewer tokens than its cost in
+  plain steps is a loss; sixteen in a row park the proposer for a
+  cooldown of plain steps that doubles each time (128 to 4096) until a
+  cycle wins again. `/health.speculative` reports the current `depth`
+  (the cap as `max_depth`) and under `regulator` the acceptance by
+  position, the costs, the rates, the tokens saved, `parked` with the
+  reason and the cooldown left.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

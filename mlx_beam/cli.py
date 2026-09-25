@@ -256,8 +256,9 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "--max-draft-tokens",
         type=int,
         default=3,
-        help="cap on the drafts verified per cycle (default: 3, the fixed depth "
-        "at this stage; a lower value lowers it)",
+        help="cap on the drafts verified per cycle; the regulator picks each "
+        "cycle's depth below it from the acceptance and the cycle cost it "
+        "measures (default: 3, the depth with the best gain measured on a 27B)",
     )
     cache = p.add_argument_group("prompt cache")
     cache.add_argument(

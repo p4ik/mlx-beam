@@ -64,7 +64,7 @@ class OracleProposer:
         self._current = []
         self._pos = {}
 
-    def propose(self, uid, hidden, token, choose=None):
+    def propose(self, uid, hidden, token, choose=None, depth=None):
         seq, pos = self._current, self._pos.get(uid, 0)
         if not seq:
             return mx.array([], dtype=mx.uint32)  # unscripted: decode plainly
@@ -73,7 +73,7 @@ class OracleProposer:
         assert seq[pos] == t, (seq[pos], t, pos)
         right = self.plan(self.calls)
         drafts = []
-        for i in range(self.depth):
+        for i in range(self.depth if depth is None else depth):
             true = seq[pos + 1 + i] if pos + 1 + i < len(seq) else 0
             drafts.append(true if i < right else (true + 1) % 64)
         return mx.array(drafts, dtype=mx.uint32)
@@ -153,8 +153,12 @@ def test_health_reports_the_cycle_counters():
     engine = run_speculative(model, oracle)
     with engine:
         h = engine.health()["speculative"]
-        assert h["proposer"]["kind"] == "oracle" and h["depth"] == 3
+        assert h["proposer"]["kind"] == "oracle" and h["max_depth"] == 3
+        assert 1 <= h["depth"] <= 3
         assert h["cycles"] >= 1 and h["parked"] is False
+        reg = h["regulator"]
+        assert reg["cost_ms"]["plain"] is not None and reg["cost_ms"]["cycle"]
+        assert len(reg["acceptance_by_position"]) == 3 and reg["reason"] is None
 
 
 def test_finish_inside_a_block_trims_the_block():
@@ -223,8 +227,8 @@ class FixedDraftProposer:
         self.drafts = list(drafts)
         self.depth = len(self.drafts)
 
-    def propose(self, uid, hidden, token, choose=None):
-        return mx.array(self.drafts, dtype=mx.uint32)
+    def propose(self, uid, hidden, token, choose=None, depth=None):
+        return mx.array(self.drafts[:depth], dtype=mx.uint32)
 
     def commit(self, uid, hidden, tokens):
         pass
@@ -316,6 +320,7 @@ def test_every_draft_leaves_the_sampled_transcript_alone():
     engine.warmup_tokens = [1]
     hits = 0
     with engine:
+        engine.speculator.regulator.fixed = 3  # every cycle the full chain
         for draft in range(vocab):
             proposer.drafts[0] = draft
             accepted = engine.speculator.accepted
@@ -355,6 +360,7 @@ def test_committed_draws_follow_the_target_under_an_adversarial_draft():
     n = 2048
     pairs = []
     with engine:
+        engine.speculator.regulator.fixed = 3  # never parks on the losses
         for seed in range(n):
             p = SamplingParams(temperature=1.0, top_k=4, seed=seed)
             out = collect(
@@ -544,7 +550,7 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
     class Silent:
         kind, depth = "silent", 3
 
-        def propose(self, uid, hidden, token, choose=None):
+        def propose(self, uid, hidden, token, choose=None, depth=None):
             return mx.array([], dtype=mx.uint32)
 
         def commit(self, *a):
