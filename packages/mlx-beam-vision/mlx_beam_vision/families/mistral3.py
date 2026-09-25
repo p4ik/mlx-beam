@@ -15,7 +15,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.vision import VisionModel
 from mlx_beam_vision.families import Encoded
@@ -55,7 +54,15 @@ class PatchMerger(nn.Module):
 
 
 class Projector(nn.Module):
-    def __init__(self, vision_hidden: int, text_hidden: int, eps: float, merge: int, patch: int, bias: bool):
+    def __init__(
+        self,
+        vision_hidden: int,
+        text_hidden: int,
+        eps: float,
+        merge: int,
+        patch: int,
+        bias: bool,
+    ):
         super().__init__()
         self.norm = nn.RMSNorm(vision_hidden, eps=eps)
         self.patch_merger = PatchMerger(vision_hidden, merge, patch)
@@ -74,7 +81,9 @@ class Tower:
         vc.setdefault("model_type", "pixtral")
         self.config = VisionConfig.from_dict(vc)
         text = config.get("text_config") or {}
-        self.image_token_id = int(config.get("image_token_id") or config.get("image_token_index") or 10)
+        self.image_token_id = int(
+            config.get("image_token_id") or config.get("image_token_index") or 10
+        )
         self.merge = int(config.get("spatial_merge_size", 2))
         self.feature_layer = int(config.get("vision_feature_layer", -1))
         self.dtype = dtype
@@ -93,32 +102,46 @@ class Tower:
 
     def load(self, model_path: Path) -> None:
         raw = load_prefixed(model_path, TOWER_PREFIXES + PROJECTOR_PREFIXES)
-        tower = next((p for p in TOWER_PREFIXES if any(k.startswith(p) for k in raw)), None)
-        proj = next((p for p in PROJECTOR_PREFIXES if any(k.startswith(p) for k in raw)), None)
+        tower = next(
+            (p for p in TOWER_PREFIXES if any(k.startswith(p) for k in raw)), None
+        )
+        proj = next(
+            (p for p in PROJECTOR_PREFIXES if any(k.startswith(p) for k in raw)), None
+        )
         if tower is None or proj is None:
-            raise FileNotFoundError(f"{model_path}: no vision tower and projector in the index")
+            raise FileNotFoundError(
+                f"{model_path}: no vision tower and projector in the index"
+            )
         weights = self.model.sanitize(strip_prefix(raw, tower))
         for w in (weights, strip_prefix(raw, proj)):
             if any(k.endswith(".scales") for k in w):
                 raise ValueError("a quantized vision tower is not supported yet")
         cast = lambda d: {k: v.astype(self.dtype) for k, v in d.items()}  # noqa: E731
         self.model.load_weights(list(cast(weights).items()), strict=True)
-        self.projector.load_weights(list(cast(strip_prefix(raw, proj)).items()), strict=True)
+        self.projector.load_weights(
+            list(cast(strip_prefix(raw, proj)).items()), strict=True
+        )
         mx.eval(self.model.parameters(), self.projector.parameters())
         self.loaded_from = sorted({k.split("/")[0] for k in raw})
 
-    def encode(self, pixel_values: mx.array, image_sizes: list[tuple[int, int]]) -> list[Encoded]:
+    def encode(
+        self, pixel_values: mx.array, image_sizes: list[tuple[int, int]]
+    ) -> list[Encoded]:
         """`pixel_values` (N, H, W, C) padded to one size, `image_sizes` the
         real (height, width) of each; per image its merged features."""
         _, states = self.model(
-            pixel_values.astype(self.dtype), output_hidden_states=True, image_sizes=image_sizes
+            pixel_values.astype(self.dtype),
+            output_hidden_states=True,
+            image_sizes=image_sizes,
         )
         selected = states[self.feature_layer][0]
         merged = self.projector(selected, image_sizes)
         out = []
         at = 0
         for height, width in image_sizes:
-            n = (height // self.config.patch_size // self.merge) * (width // self.config.patch_size // self.merge)
+            n = (height // self.config.patch_size // self.merge) * (
+                width // self.config.patch_size // self.merge
+            )
             out.append(Encoded(merged[at : at + n]))
             at += n
         return out

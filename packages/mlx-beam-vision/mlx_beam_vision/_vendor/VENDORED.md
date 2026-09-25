@@ -17,6 +17,7 @@ language model is mlx-beam's.
 | `pixtral` | `mlx_vlm/models/pixtral/` (`vision.py`, `config.py`) | Mistral 3 (the projector is ours, after upstream's `mistral3.py`) |
 | `gemma4` | `mlx_vlm/models/gemma4/` (`vision.py`, `config.py`) | Gemma 4 (the embedder is ours, after upstream's `gemma4.py`) |
 | `muse_glimmer` | `mlx_vlm/models/muse_glimmer/` (`vision.py`, `config.py`) | Muse Glimmer (adapter and projection ours, after upstream's `muse_glimmer.py`) |
+| `granite4_vision` | `mlx_vlm/models/granite4_vision/` (`vision.py`, `config.py`, `downsampling.py`, `qformer.py`) | Granite Vision 4.1 (the packing and per-layer routing ours, after upstream's `granite4_vision.py`) |
 
 `tools/vendor_diff.py` in the repository root compares these files against
 the wheel (`tools/vendor.toml`, part `mlx-vlm-vision`).

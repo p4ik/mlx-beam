@@ -34,6 +34,7 @@ modified = [
   "tool_parsers/qwen3_coder.py",
   "tool_parsers/mistral.py",
   "models/muse_glimmer.py",
+  "models/granite.py",
 ]
 
 [parts.optiq]
@@ -82,6 +83,7 @@ local = [
   "pixtral/__init__.py",
   "gemma4/__init__.py",
   "muse_glimmer/__init__.py",
+  "granite4_vision/__init__.py",
 ]
 # base.py holds two pieces of upstream's models/base.py, nothing else.
 modified = ["base.py"]
@@ -96,3 +98,7 @@ modified = ["base.py"]
 "gemma4/config.py" = "models/gemma4/config.py"
 "muse_glimmer/vision.py" = "models/muse_glimmer/vision.py"
 "muse_glimmer/config.py" = "models/muse_glimmer/config.py"
+"granite4_vision/vision.py" = "models/granite4_vision/vision.py"
+"granite4_vision/config.py" = "models/granite4_vision/config.py"
+"granite4_vision/downsampling.py" = "models/granite4_vision/downsampling.py"
+"granite4_vision/qformer.py" = "models/granite4_vision/qformer.py"

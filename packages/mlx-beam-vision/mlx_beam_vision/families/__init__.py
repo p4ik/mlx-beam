@@ -13,10 +13,11 @@ import mlx.core as mx
 
 @dataclass
 class Encoded:
-    """One image encoded: features (tokens, hidden), per-layer extras."""
+    """One image encoded: features (tokens, hidden), and what is added at
+    its positions ahead of certain text layers ({layer: features})."""
 
     features: mx.array
-    deepstack: tuple[mx.array, ...] = field(default_factory=tuple)
+    deepstack: dict[int, mx.array] = field(default_factory=dict)
 
 
 FAMILIES: dict[str, str] = {
@@ -29,4 +30,5 @@ FAMILIES: dict[str, str] = {
     "gemma4": "gemma4",
     "gemma4_unified": "gemma4",
     "muse_glimmer": "muse_glimmer",
+    "granite4_vision": "granite4_vision",
 }

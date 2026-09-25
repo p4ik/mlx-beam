@@ -42,16 +42,24 @@ class ImageSpan:
     """An image's place in the prompt: the placeholder positions
     [start, end) whose embeddings come from the image's features rather
     than the vocabulary, the features (end - start, hidden) the frontend
-    computed, optional features added at the image positions after the
-    first text layers (DeepStack, one per layer), and the image's digest -
-    the prefix cache keys on it, so the same placeholders with another
-    image never meet."""
+    computed, optional features added at the image positions ahead of
+    certain text layers (DeepStack: {layer index: features}, applied
+    before that layer runs), and the image's digest - the prefix cache
+    keys on it, so the same placeholders with another image never meet."""
 
     start: int
     end: int
     features: Any
     digest: str
-    deepstack: tuple = ()
+    deepstack: Any = field(default_factory=dict)
+
+    @property
+    def extras(self) -> dict:
+        """The per-layer features as a mapping, whatever form they came in
+        (a sequence means one per layer from the first)."""
+        if isinstance(self.deepstack, dict):
+            return self.deepstack
+        return dict(enumerate(self.deepstack))
 
     def __post_init__(self):
         if self.end <= self.start:

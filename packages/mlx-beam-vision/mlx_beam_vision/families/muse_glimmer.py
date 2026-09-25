@@ -14,7 +14,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_beam_vision._vendor.mlx_vlm.muse_glimmer.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.muse_glimmer.vision import VisionModel
 from mlx_beam_vision.families import Encoded
@@ -44,10 +43,13 @@ class Tower:
         self.dtype = dtype
         self.model = VisionModel(self.config)
         self.vision_adapter = Adapter(
-            int(config.get("out_hidden_size", 6144)), int(config.get("projector_hidden_size", 4096))
+            int(config.get("out_hidden_size", 6144)),
+            int(config.get("projector_hidden_size", 4096)),
         )
         self.vision_projection = nn.Linear(
-            int(config.get("projector_hidden_size", 4096)), int(text.get("hidden_size", 4096)), bias=False
+            int(config.get("projector_hidden_size", 4096)),
+            int(text.get("hidden_size", 4096)),
+            bias=False,
         )
         self.loaded_from: list[str] = []
         if model_path is not None:
@@ -56,17 +58,34 @@ class Tower:
     def load(self, model_path: Path) -> None:
         prefixes = tuple(f"{root}{part}." for root in PREFIX_ROOTS for part in PARTS)
         raw = load_prefixed(model_path, prefixes)
-        root = next((r for r in PREFIX_ROOTS if any(k.startswith(f"{r}vision_tower.") for k in raw)), None)
+        root = next(
+            (
+                r
+                for r in PREFIX_ROOTS
+                if any(k.startswith(f"{r}vision_tower.") for k in raw)
+            ),
+            None,
+        )
         if root is None:
             raise FileNotFoundError(f"{model_path}: no vision tower in the index")
         raw = {k: v for k, v in raw.items() if "rotary_emb.inv_freq" not in k}
         if any(k.endswith(".scales") for k in raw):
             raise ValueError("a quantized vision tower is not supported yet")
         cast = lambda d: [(k, v.astype(self.dtype)) for k, v in d.items()]  # noqa: E731
-        self.model.load_weights(cast(strip_prefix(raw, f"{root}vision_tower.")), strict=True)
-        self.vision_adapter.load_weights(cast(strip_prefix(raw, f"{root}vision_adapter.")), strict=True)
-        self.vision_projection.load_weights(cast(strip_prefix(raw, f"{root}vision_projection.")), strict=True)
-        mx.eval(self.model.parameters(), self.vision_adapter.parameters(), self.vision_projection.parameters())
+        self.model.load_weights(
+            cast(strip_prefix(raw, f"{root}vision_tower.")), strict=True
+        )
+        self.vision_adapter.load_weights(
+            cast(strip_prefix(raw, f"{root}vision_adapter.")), strict=True
+        )
+        self.vision_projection.load_weights(
+            cast(strip_prefix(raw, f"{root}vision_projection.")), strict=True
+        )
+        mx.eval(
+            self.model.parameters(),
+            self.vision_adapter.parameters(),
+            self.vision_projection.parameters(),
+        )
         self.loaded_from = sorted({k.split("/")[0] for k in raw})
 
     def encode(self, pixel_values: mx.array, grid_thw: mx.array) -> list[Encoded]:

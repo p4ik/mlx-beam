@@ -75,17 +75,18 @@ class PrimingPromptBatch(PromptProcessingBatch):
         return h
 
     def _hook(self, overlaps: list[tuple]):
-        """What DeepStack adds after layer i at the image positions: the
-        span's i-th extra features, for the layers that have them."""
-        depth = max((len(span.deepstack) for _, _, _, span, _ in overlaps), default=0)
-        if depth == 0:
+        """What DeepStack adds at the image positions ahead of a layer: the
+        span's extra features for that layer, where it has them."""
+        if not any(span.extras for _, _, _, span, _ in overlaps):
             return None
 
         def hook(i: int, h: mx.array) -> mx.array:
             for row, a, b, span, off in overlaps:
-                if i < len(span.deepstack):
-                    extra = span.deepstack[i][off : off + (b - a)].astype(h.dtype)
-                    h[row, a:b, :] = h[row, a:b, :] + extra
+                extra = span.extras.get(i)
+                if extra is not None:
+                    h[row, a:b, :] = h[row, a:b, :] + extra[off : off + (b - a)].astype(
+                        h.dtype
+                    )
             return h
 
         return hook

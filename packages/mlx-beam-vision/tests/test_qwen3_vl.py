@@ -123,7 +123,7 @@ def test_tower_encodes_per_image_with_deepstack():
     encoded = t.encode(pv, mx.array(grids))
     assert [e.features.shape for e in encoded] == [(4, 32), (3, 32)]
     assert all(
-        len(e.deepstack) == 1 and e.deepstack[0].shape == e.features.shape
+        list(e.deepstack) == [1] and e.deepstack[1].shape == e.features.shape
         for e in encoded
     )
     d = t.describe()
@@ -146,7 +146,7 @@ def test_frontend_builds_spans_and_caches_by_digest():
     built = front.build(messages, [a, b], {})
     assert [(s.start, s.end) for s in built.spans] == [(3, 7), (7, 10)]
     assert built.tokens[3:10] == [TOWER_CONFIG["image_token_id"]] * 7
-    assert built.spans[0].digest == a.digest and built.spans[1].deepstack[0].shape == (
+    assert built.spans[0].digest == a.digest and built.spans[1].deepstack[1].shape == (
         3,
         32,
     )
@@ -360,3 +360,101 @@ def test_muse_glimmer_family_shuffles_adapts_and_projects():
 
     muse = importlib.import_module("mlx_beam._vendor.mlx_lm.models.muse_glimmer")
     assert hasattr(muse.MuseGlimmerModel, "embed_inputs")
+
+
+GRANITE_CONFIG = {
+    "model_type": "granite4_vision",
+    "image_token_index": 62,
+    "image_grid_pinpoints": [[32, 64], [64, 32]],
+    "downsample_rate": "1/2",
+    "deepstack_layer_map": [[0, 0]],
+    "use_spatial_sampling": True,
+    "spatial_vision_layer": -1,
+    "spatial_target_layers": [1],
+    "vision_feature_select_strategy": "full",
+    "vision_config": {
+        "model_type": "siglip_vision_model",
+        "num_hidden_layers": 1,
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "image_size": 32,
+        "patch_size": 16,
+        "num_channels": 3,
+    },
+    "text_config": {
+        "model_type": "granite",
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 64,
+        "logits_scaling": 1.0,
+        "attention_multiplier": 0.25,
+        "embedding_multiplier": 2.0,
+        "residual_multiplier": 0.5,
+        "max_position_embeddings": 512,
+        "attention_bias": False,
+        "mlp_bias": False,
+        "rope_theta": 10000.0,
+    },
+}
+
+
+def tiny_granite_text():
+    from mlx_beam._vendor.mlx_lm.models import granite
+
+    mx.random.seed(4)
+    model = granite.Model(granite.ModelArgs.from_dict(GRANITE_CONFIG["text_config"]))
+    mx.eval(model.parameters())
+    return model
+
+
+def test_granite_vision_family_projects_ahead_of_its_target_layers():
+    """Granite adds nothing at the embedding: zero features at the
+    placeholders, one projected set per target layer - the base view, the
+    unpadded tile grid with a newline per row."""
+    from mlx_beam_vision.families import granite4_vision
+
+    mx.random.seed(5)
+    t = granite4_vision.build(GRANITE_CONFIG, None, dtype=mx.float32)
+    # One tile (32 x 32): 1 token from a 2x2 patch grid at rate 1/2, plus the newline.
+    one = mx.array(np.random.RandomState(0).randn(1, 3, 32, 32).astype(np.float32))
+    # A 32 x 64 image: base view plus a 1 x 2 tile grid -> 1 + (1 row x 2 + newline) = 4.
+    two = mx.array(np.random.RandomState(1).randn(3, 3, 32, 32).astype(np.float32))
+    encoded = t.encode([one, two], [(32, 32), (32, 64)])
+    assert [e.features.shape for e in encoded] == [(2, 32), (4, 32)]
+    assert all(mx.all(e.features == 0).item() for e in encoded)
+    assert [sorted(e.deepstack) for e in encoded] == [[0, 1], [0, 1]]
+    assert encoded[1].deepstack[0].shape == (4, 32) and encoded[1].deepstack[
+        1
+    ].shape == (4, 32)
+    assert provider.family_for(GRANITE_CONFIG) == "granite4_vision"
+    d = t.describe()
+    assert d["deepstack_layers"] == [0] and d["spatial_layers"] == [1]
+
+
+def test_granite_engine_path_matches_a_direct_forward():
+    from mlx_beam_vision.families import granite4_vision
+
+    from mlx_beam.engine import GenerationRequest
+
+    model = tiny_granite_text()
+    mx.random.seed(6)
+    t = granite4_vision.build(GRANITE_CONFIG, None, dtype=mx.float32)
+    tiles = mx.array(np.random.RandomState(2).randn(1, 3, 32, 32).astype(np.float32))
+    (enc,) = t.encode([tiles], [(32, 32)])
+    from mlx_beam.engine import ImageSpan
+
+    tokens = [3, 7, 62, 62, 5, 9]
+    span = ImageSpan(2, 4, enc.features, "cd" * 32, enc.deepstack)
+    with Engine(model) as engine:
+        out = [
+            e.token
+            for e in engine.submit(
+                GenerationRequest(tokens, max_tokens=5, spans=(span,))
+            )
+        ]
+    assert out == reference(model, tokens, [span], 5)

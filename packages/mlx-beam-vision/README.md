@@ -19,11 +19,11 @@ see `mlx_beam_vision/_vendor/VENDORED.md`):
 | `mistral3` | Mistral Small 3.x (Pixtral tower) | the image's rows are separate spans (`[IMG_BREAK]` between them) |
 | `gemma4` | Gemma 4 12B, E4B | image only; audio is not served yet |
 | `muse_glimmer` | Muse Glimmer | the projector's norm matches the text model's input norm |
+| `granite4_vision` | Granite Vision 4.1 | AnyRes tiles, window Q-Former projectors; nothing at the embedding, every projector's features added ahead of its text layer |
 
-Not yet: Granite Vision 4.1 (AnyRes tiles with a Q-Former downsampler and
-per-layer injection - the family is planned), audio and video input,
-quantized towers (the towers load at model precision; a package that
-ships a quantized tower is refused with a message).
+Not yet: audio and video input, quantized towers (the towers load at model
+precision; a package that ships a quantized tower is refused with a
+message).
 
 Every family is exercised in the tests on a tiny random tower against a
 direct forward; the real towers and processors are validated on Apple

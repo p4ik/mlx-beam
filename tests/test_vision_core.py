@@ -32,8 +32,9 @@ def features_for(image: Image, layers: int = 2):
     seed = int(image.digest[:8], 16)
     mx.random.seed(seed)
     feats = mx.random.normal((K, H))
-    extras = tuple(mx.random.normal((K, H)) * 0.1 for _ in range(layers))
-    mx.eval(feats, *extras)
+    # Ahead of layers 1 and 2 (what a Qwen tower adds after layers 0 and 1).
+    extras = {i + 1: mx.random.normal((K, H)) * 0.1 for i in range(layers)}
+    mx.eval(feats, *extras.values())
     return feats, extras
 
 
@@ -73,7 +74,7 @@ class FakeFrontend:
                             len(tokens) + K,
                             feats,
                             image.digest,
-                            extras if self.deepstack else (),
+                            extras if self.deepstack else {},
                         )
                     )
                     tokens += [PAD] * K
@@ -96,10 +97,11 @@ def reference(model, tokens, spans, n):
 
     def hook(i, x):
         for s in spans:
-            if i < len(s.deepstack):
-                x[0, s.start : s.end, :] = x[0, s.start : s.end, :] + s.deepstack[
-                    i
-                ].astype(x.dtype)
+            extra = s.extras.get(i)
+            if extra is not None:
+                x[0, s.start : s.end, :] = x[0, s.start : s.end, :] + extra.astype(
+                    x.dtype
+                )
         return x
 
     out = lm_head(inner(ids, cache=cache, input_embeddings=h, layer_hook=hook))

@@ -110,10 +110,11 @@ is stored quantized).
 
 `layer hook` - `models/qwen3_5.py`, `Qwen3_5TextModel.__call__`: one
 keyword argument, `layer_hook`, a callable applied to the hidden states
-after every decoder layer, index first. The engine's prefill hands in what
-a vision frontend adds at the image positions after the first layers
-(DeepStack: the Qwen3-VL tower's intermediate features); with the argument
-left out the loop is upstream's. The text model already took
+before every decoder layer, index first. The engine's prefill hands in
+what a vision frontend adds at the image positions ahead of certain layers
+(DeepStack: the Qwen3-VL tower's intermediate features ahead of layers 1
+to 3, Granite Vision's projected features ahead of its target layers);
+with the argument left out the loop is upstream's. The text model already took
 `input_embeddings` upstream; that is how the image features enter at the
 placeholder positions. Tests: `tests/test_vision_core.py`.
 
@@ -121,8 +122,11 @@ placeholder positions. Tests: `tests/test_vision_core.py`.
 keyword argument, `input_embeddings`, standing in for `embed_inputs(ids)`
 (the token embeddings after the model's scaleless RMSNorm; that method is
 new too, so the engine's prefill can build the text positions the same
-way). Upstream's other text models took the argument already; Qwen3.5,
-Mistral 3 and Gemma 4 need nothing here. Tests:
+way); `models/granite.py`, `GraniteModel` and `Model`: `input_embeddings`
+(standing in for `embed_tokens(ids)`, the multiplier still applies) and
+`layer_hook` as on Qwen3.5, for Granite Vision. Upstream's other text
+models took the argument already; Qwen3.5, Mistral 3 and Gemma 4 need
+nothing here. Tests:
 `packages/mlx-beam-vision/tests`.
 
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:

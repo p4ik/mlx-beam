@@ -39,7 +39,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Multi-token prediction** — The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
 - **Responses API** — Next to chat completions, stateless.
-- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4 and Muse Glimmer towers so far); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned.
+- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned.
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 

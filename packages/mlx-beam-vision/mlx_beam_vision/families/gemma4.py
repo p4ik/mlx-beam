@@ -14,7 +14,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_beam_vision._vendor.mlx_vlm.gemma4.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.gemma4.vision import VisionModel
 from mlx_beam_vision.families import Encoded
@@ -49,27 +48,41 @@ class Tower:
         self.embed_scale = text_hidden**0.5
         self.dtype = dtype
         self.model = VisionModel(self.config)
-        self.embedder = Embedder(self.config.hidden_size, text_hidden, self.config.rms_norm_eps)
+        self.embedder = Embedder(
+            self.config.hidden_size, text_hidden, self.config.rms_norm_eps
+        )
         self.loaded_from: list[str] = []
         if model_path is not None:
             self.load(model_path)
 
     def load(self, model_path: Path) -> None:
         raw = load_prefixed(model_path, TOWER_PREFIXES + EMBED_PREFIXES)
-        tower = next((p for p in TOWER_PREFIXES if any(k.startswith(p) for k in raw)), None)
-        embed = next((p for p in EMBED_PREFIXES if any(k.startswith(p) for k in raw)), None)
+        tower = next(
+            (p for p in TOWER_PREFIXES if any(k.startswith(p) for k in raw)), None
+        )
+        embed = next(
+            (p for p in EMBED_PREFIXES if any(k.startswith(p) for k in raw)), None
+        )
         if tower is None or embed is None:
-            raise FileNotFoundError(f"{model_path}: no vision tower and embedder in the index")
+            raise FileNotFoundError(
+                f"{model_path}: no vision tower and embedder in the index"
+            )
         weights = strip_prefix(raw, tower)
         if not self.config.use_clipped_linears:
-            weights = {k: v for k, v in weights.items() if not any(c in k for c in CLIP_KEYS)}
+            weights = {
+                k: v for k, v in weights.items() if not any(c in k for c in CLIP_KEYS)
+            }
         weights = {k: v for k, v in weights.items() if "rotary_emb" not in k}
         for w in (weights, strip_prefix(raw, embed)):
             if any(k.endswith(".scales") for k in w):
                 raise ValueError("a quantized vision tower is not supported yet")
         cast = lambda d: {k: v.astype(self.dtype) for k, v in d.items()}  # noqa: E731
-        self.model.load_weights(list(cast(self.model.sanitize(weights)).items()), strict=True)
-        self.embedder.load_weights(list(cast(strip_prefix(raw, embed)).items()), strict=True)
+        self.model.load_weights(
+            list(cast(self.model.sanitize(weights)).items()), strict=True
+        )
+        self.embedder.load_weights(
+            list(cast(strip_prefix(raw, embed)).items()), strict=True
+        )
         mx.eval(self.model.parameters(), self.embedder.parameters())
         self.loaded_from = sorted({k.split("/")[0] for k in raw})
 
@@ -107,7 +120,9 @@ def pixel_inputs(processed: dict):
     a stacked (N, C, H, W) array or a list of images of their own sizes,
     with `pixel_position_ids` when the processor patchified."""
     pv = processed["pixel_values"]
-    images = [mx.array(p) for p in pv] if isinstance(pv, list) else [mx.array(p) for p in pv]
+    images = (
+        [mx.array(p) for p in pv] if isinstance(pv, list) else [mx.array(p) for p in pv]
+    )
     pos = processed.get("pixel_position_ids")
     positions = None if pos is None else [mx.array(p) for p in pos]
     return images, positions

@@ -100,7 +100,7 @@ class VisionFrontend:
                         end,
                         enc.features[off : off + n],
                         image.digest,
-                        tuple(d[off : off + n] for d in enc.deepstack),
+                        {k: d[off : off + n] for k, d in enc.deepstack.items()},
                     )
                 )
                 off += n
@@ -119,8 +119,8 @@ class VisionFrontend:
                 raise ValueError("the processor's grids do not match the images")
             for i in missing:
                 enc = fresh[i]
-                mx.eval(enc.features, *enc.deepstack)
-                self.cache.put(keys[i], enc, [enc.features, *enc.deepstack])
+                mx.eval(enc.features, *enc.deepstack.values())
+                self.cache.put(keys[i], enc, [enc.features, *enc.deepstack.values()])
                 found[i] = enc
                 self.images_encoded += 1
         return found

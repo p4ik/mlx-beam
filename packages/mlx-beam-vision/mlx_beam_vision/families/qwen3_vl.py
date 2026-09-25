@@ -70,10 +70,12 @@ class Tower:
         out = []
         start = 0
         for n in counts:
+            # The tower's k-th DeepStack feature goes in after text layer
+            # k, i.e. ahead of layer k + 1.
             out.append(
                 Encoded(
                     features[start : start + n],
-                    tuple(d[start : start + n] for d in deepstack),
+                    {k + 1: d[start : start + n] for k, d in enumerate(deepstack)},
                 )
             )
             start += n
