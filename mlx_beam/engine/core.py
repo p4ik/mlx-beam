@@ -35,7 +35,7 @@ from mlx_beam.engine.prefix import (
     snapshot_window,
     window_layers,
 )
-from mlx_beam.engine.priming import PrimingPromptBatch
+from mlx_beam.engine.priming import PrimingPromptBatch, image_capabilities
 from mlx_beam.engine.proposer import trunk
 from mlx_beam.engine.request import (
     GenerationRequest,
@@ -185,6 +185,9 @@ class Engine:
         self._spec_coupling: dict[int, SeededSampler | None] = {}
         # uid -> the request's image spans, read by the prefill.
         self._spans: dict[int, tuple] = {}
+        # What the trunk takes of an image request; checked at submit so a
+        # frontend the model cannot serve is a 400, not a dead worker.
+        self.image_capabilities = image_capabilities(model)
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
@@ -412,6 +415,17 @@ class Engine:
         return completion_cap, reasoning_cap
 
     def _validate(self, request: GenerationRequest) -> None:
+        if request.spans:
+            can = self.image_capabilities
+            if not can["input_embeddings"]:
+                raise InvalidRequest(
+                    "this model takes no input embeddings; it cannot serve images"
+                )
+            if not can["layer_hook"] and any(s.extras for s in request.spans):
+                raise InvalidRequest(
+                    "this model has no layer hook; the frontend's per-layer "
+                    "image features cannot be applied"
+                )
         p = request.sampling
         # These raise inside the sampler, i.e. inside the worker.
         if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:

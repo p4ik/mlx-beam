@@ -60,6 +60,7 @@ class Served:
         allowed_origins: Sequence[str] = ("*",),
         chat_template_source: str = "model",
         frontend=None,
+        vision_refused: str | None = None,
     ):
         if reasoning_field not in chat.REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
@@ -74,6 +75,9 @@ class Served:
         # The modality frontend a separate package loaded for this
         # checkpoint (mlx-beam-vision), or None: text only.
         self.frontend = frontend
+        # Why a provider that claimed this checkpoint was not taken (its
+        # needs the text model does not meet); health carries it.
+        self.vision_refused = vision_refused
         self.started_at = time.time()
 
     def capabilities(self) -> dict:
@@ -104,8 +108,14 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
-        # What serves images, with its evidence; None: the core alone.
-        h["vision"] = None if self.frontend is None else self.frontend.describe()
+        # What serves images, with its evidence; None: the core alone; a
+        # refusal names what the provider needed and the model lacks.
+        if self.frontend is not None:
+            h["vision"] = self.frontend.describe()
+        elif self.vision_refused:
+            h["vision"] = {"refused": self.vision_refused}
+        else:
+            h["vision"] = None
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),

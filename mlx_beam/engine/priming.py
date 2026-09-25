@@ -25,6 +25,23 @@ def _inner_takes(inner, name: str) -> bool:
         return False
 
 
+IMAGE_NEEDS = ("input_embeddings", "layer_hook")
+
+
+def image_capabilities(model) -> dict[str, bool]:
+    """What the model's text trunk takes of what an image frontend hands
+    the prefill: `input_embeddings` (features in place of the placeholder
+    tokens' embeddings, every frontend) and `layer_hook` (per-layer extras
+    ahead of certain layers, DeepStack). Read from the signature, not the
+    config: a text model that lacks one cannot serve that frontend, and
+    the engine refuses the request before the worker sees it."""
+    try:
+        inner, _, _ = trunk(model)
+    except ValueError:
+        return {name: False for name in IMAGE_NEEDS}
+    return {name: _inner_takes(inner, name) for name in IMAGE_NEEDS}
+
+
 class PrimingPromptBatch(PromptProcessingBatch):
     """PromptProcessingBatch whose chunks prime the proposer bound to the
     generation batch class (`SpeculativeGenerationBatch.speculator`) and

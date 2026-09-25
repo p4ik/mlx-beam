@@ -35,6 +35,8 @@ modified = [
   "tool_parsers/mistral.py",
   "models/muse_glimmer.py",
   "models/granite.py",
+  "models/qwen3.py",
+  "models/qwen3_moe.py",
 ]
 
 [parts.optiq]

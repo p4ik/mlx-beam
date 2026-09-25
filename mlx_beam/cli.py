@@ -533,7 +533,7 @@ def serve(args) -> int:
         log.info("speculative: %s", engine.speculator.describe()["proposer"])
     # A separate package may serve this checkpoint's images (entry point
     # group mlx_beam.modalities); without one the core is text only.
-    frontend = modalities.load_frontend(
+    frontend, vision_refused = modalities.load_frontend(
         model,
         model_path,
         json.loads((model_path / "config.json").read_text()),
@@ -548,6 +548,7 @@ def serve(args) -> int:
         allowed_origins=args.allowed_origins,
         chat_template_source=template_source,
         frontend=frontend,
+        vision_refused=vision_refused,
     )
     health = served.health()
     applied = health["kv"]["applied"] or []

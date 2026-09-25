@@ -75,6 +75,15 @@ class VisionFrontend:
         self.cache = FeatureCache(cache_bytes)
         self.images_encoded = 0
 
+    @property
+    def needs(self) -> tuple[str, ...]:
+        """What the prefill must take of the text model for this tower's
+        spans: the features at the placeholder positions always, the
+        per-layer extras when the family adds them (DeepStack)."""
+        if getattr(self.tower, "per_layer", False):
+            return ("input_embeddings", "layer_hook")
+        return ("input_embeddings",)
+
     def _placeholder(self) -> int:
         return self.tower.image_token_id
 

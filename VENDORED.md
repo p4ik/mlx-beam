@@ -108,15 +108,19 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
 is stored quantized).
 
-`layer hook` - `models/qwen3_5.py`, `Qwen3_5TextModel.__call__`: one
-keyword argument, `layer_hook`, a callable applied to the hidden states
-before every decoder layer, index first. The engine's prefill hands in
-what a vision frontend adds at the image positions ahead of certain layers
-(DeepStack: the Qwen3-VL tower's intermediate features ahead of layers 1
-to 3, Granite Vision's projected features ahead of its target layers);
-with the argument left out the loop is upstream's. The text model already took
-`input_embeddings` upstream; that is how the image features enter at the
-placeholder positions. Tests: `tests/test_vision_core.py`.
+`layer hook` - `models/qwen3_5.py`, `Qwen3_5TextModel.__call__`;
+`models/qwen3.py`, `Qwen3Model.__call__`; `models/qwen3_moe.py`,
+`Qwen3MoeModel.__call__`: one keyword argument, `layer_hook`, a callable
+applied to the hidden states before every decoder layer, index first. The
+engine's prefill hands in what a vision frontend adds at the image
+positions ahead of certain layers (DeepStack: the Qwen3-VL tower's
+intermediate features ahead of layers 1 to 3 - on Qwen3-VL's own text
+models `qwen3`/`qwen3_moe` as much as on Qwen3.5's - and Granite Vision's
+projected features ahead of its target layers); with the argument left out
+the loop is upstream's. The text models already took `input_embeddings`
+upstream; that is how the image features enter at the placeholder
+positions. Tests: `tests/test_vision_core.py` (Qwen3.5 and Qwen3-VL's
+wrapper over `qwen3`).
 
 `input embeddings` - `models/muse_glimmer.py`, `MuseGlimmerModel`: one
 keyword argument, `input_embeddings`, standing in for `embed_inputs(ids)`

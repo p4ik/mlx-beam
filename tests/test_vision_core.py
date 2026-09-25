@@ -264,15 +264,124 @@ def test_served_reports_the_frontend_and_the_registry_finds_a_provider():
 
     modalities.register(Provider)
     try:
-        assert (
-            modalities.load_frontend(model, None, {"model_type": "qwen3_5"}, tok).name
-            == "fake"
+        found, why = modalities.load_frontend(
+            model, None, {"model_type": "qwen3_5"}, tok
         )
-        assert (
-            modalities.load_frontend(model, None, {"model_type": "llama"}, tok) is None
+        assert found.name == "fake" and why is None
+        assert modalities.load_frontend(model, None, {"model_type": "llama"}, tok) == (
+            None,
+            None,
         )
     finally:
         modalities._registered.remove(Provider)
+
+
+def test_a_frontend_the_text_model_cannot_serve_is_refused_at_load():
+    """The family may claim the checkpoint; whether the prefill can apply
+    its spans is read from the text model. A frontend that adds per-layer
+    extras is refused on a trunk without the layer hook, the reason goes
+    to health, and the request path says the same before the worker."""
+    from mlx_beam._vendor.mlx_lm.models import llama
+    from mlx_beam.engine import InvalidRequest
+
+    tok = StubTokenizer()
+    plain = llama.Model(
+        llama.ModelArgs(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=1,
+        )
+    )
+    mx.eval(plain.parameters())
+
+    class Needy(FakeFrontend):
+        needs = ("input_embeddings", "layer_hook")
+
+    class Provider:
+        __name__ = "needy-provider"
+
+        @staticmethod
+        def supports(config):
+            return True
+
+        @staticmethod
+        def load(model, model_path, config, tokenizer):
+            return Needy(tokenizer)
+
+    modalities.register(Provider)
+    try:
+        found, why = modalities.load_frontend(plain, None, {"model_type": "llama"}, tok)
+        assert found is None and "layer_hook" in why
+        assert (
+            modalities.load_frontend(
+                tiny_qwen35(), None, {"model_type": "qwen3_5"}, tok
+            )[1]
+            is None
+        )
+    finally:
+        modalities._registered.remove(Provider)
+    with Engine(plain) as engine:
+        served = Served(engine, tok, "tiny", vision_refused=why)
+        h = served.health()
+        assert h["capabilities"]["vision"] is False and h["vision"] == {"refused": why}
+        assert engine.image_capabilities == {
+            "input_embeddings": True,
+            "layer_hook": False,
+        }
+        span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32))})
+        with pytest.raises(InvalidRequest, match="layer hook"):
+            engine.submit(GenerationRequest([1, 62, 62, 2, 3], spans=[span]))
+        # Without extras the same model serves the span.
+        out = list(
+            engine.submit(
+                GenerationRequest(
+                    [1, 62, 62, 2, 3],
+                    spans=[ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64)],
+                    max_tokens=2,
+                )
+            )
+        )
+        assert len(out) == 2 and engine.health()["alive"]
+
+
+def test_qwen3_vl_wrapper_takes_deepstack_extras():
+    """Qwen3-VL's text model is `qwen3`, not Qwen3.5's: the hook is vendored
+    there too, and a span with per-layer extras runs through generation."""
+    from mlx_beam._vendor.mlx_lm.models import qwen3_vl
+
+    config = dict(
+        model_type="qwen3",
+        hidden_size=32,
+        num_hidden_layers=2,
+        intermediate_size=64,
+        num_attention_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        rope_theta=10000,
+        head_dim=16,
+        tie_word_embeddings=False,
+    )
+    model = qwen3_vl.Model(qwen3_vl.ModelArgs("qwen3_vl", config))
+    mx.eval(model.parameters())
+    with Engine(model) as engine:
+        assert engine.image_capabilities == {
+            "input_embeddings": True,
+            "layer_hook": True,
+        }
+        span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32)) * 0.1})
+        out = list(
+            engine.submit(
+                GenerationRequest([1, 62, 62, 2, 3], spans=[span], max_tokens=2)
+            )
+        )
+        assert len(out) == 2 and engine.health()["alive"]
 
 
 def test_a_model_that_norms_its_embeddings_takes_the_features_as_they_are():

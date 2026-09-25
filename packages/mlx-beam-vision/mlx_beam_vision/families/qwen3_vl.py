@@ -25,6 +25,9 @@ NAME = "qwen3_vl"
 
 
 class Tower:
+    # The extras ahead of certain text layers need the prefill's layer hook.
+    per_layer = True
+
     def __init__(self, config: dict, model_path: Path | None, dtype=mx.bfloat16):
         vc = config.get("vision_config") or {}
         self.config = VisionConfig.from_dict(vc)

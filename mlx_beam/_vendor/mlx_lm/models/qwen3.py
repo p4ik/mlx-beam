@@ -144,7 +144,11 @@ class Qwen3Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        layer_hook=None,
     ):
+        # layer_hook(index, hidden) before each layer: what a vision frontend
+        # adds at the image positions ahead of certain layers (DeepStack);
+        # VENDORED.md, layer hook.
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -154,7 +158,9 @@ class Qwen3Model(nn.Module):
             cache = [None] * len(self.layers)
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            if layer_hook is not None:
+                h = layer_hook(i, h)
             h = layer(h, mask, c)
 
         return self.norm(h)

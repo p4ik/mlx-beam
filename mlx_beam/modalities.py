@@ -50,6 +50,10 @@ class Built:
 
 class Frontend(Protocol):
     name: str
+    # What the prefill must take of the model for this frontend's spans:
+    # "input_embeddings" always, "layer_hook" when a family adds per-layer
+    # extras (DeepStack). A frontend without the attribute needs the first.
+    needs: tuple[str, ...]
 
     def build(
         self, messages: list[dict], images: Sequence[Image], template_kwargs: dict
@@ -80,19 +84,41 @@ def providers() -> list[Any]:
     return found
 
 
-def load_frontend(model, model_path, config: dict, tokenizer) -> Frontend | None:
-    """The first provider that supports this checkpoint, loaded; None when
-    no installed package does (the core stays text-only and says so)."""
+def unmet_needs(model, frontend: Any) -> list[str]:
+    """What this frontend needs of the prefill that the model's text trunk
+    does not take - read from the model, not promised by the family."""
+    from mlx_beam.engine.priming import image_capabilities
+
+    can = image_capabilities(model)
+    needs = getattr(frontend, "needs", ("input_embeddings",))
+    return [name for name in needs if not can.get(name, False)]
+
+
+def load_frontend(
+    model, model_path, config: dict, tokenizer
+) -> tuple[Frontend | None, str | None]:
+    """(frontend, reason): the first provider that supports this checkpoint
+    and whose needs the model's trunk meets, loaded; else None and, when a
+    provider was refused, why - the health carries it. No provider at all:
+    (None, None), the core stays text-only and says so."""
+    reason = None
     for provider in providers():
         try:
             if not provider.supports(config):
                 continue
             frontend = provider.load(model, model_path, config, tokenizer)
         except Exception as e:  # noqa: BLE001 - one provider's failure is its own
-            logger.warning(
-                "modality provider %s: %s", getattr(provider, "__name__", provider), e
+            reason = f"{getattr(provider, '__name__', provider)}: {e}"
+            logger.warning("modality provider %s", reason)
+            continue
+        missing = unmet_needs(model, frontend)
+        if missing:
+            reason = (
+                f"{frontend.name} needs {', '.join(missing)} of the text model, "
+                f"which {type(model).__name__} does not take"
             )
+            logger.warning("modality provider refused: %s", reason)
             continue
         logger.info("modality: %s", frontend.describe())
-        return frontend
-    return None
+        return frontend, None
+    return None, reason
