@@ -166,3 +166,17 @@ def test_boolean_subschemas_and_null_for_an_array():
 def test_a_call_to_an_undeclared_tool_is_text():
     calls, unparsed = parse('{"name": "rm_rf", "arguments": {"path": "/"}}')
     assert not calls and unparsed and "rm_rf" in unparsed[0]
+
+
+def test_single_quoted_strings_keep_their_apostrophes():
+    """Python-style quoting is read with its escapes: `it\\'s` is an
+    apostrophe, not a quote that ends the string; a backslash stays one; a
+    string left open is not mended at all (the text comes back as text)."""
+    calls, unparsed = parse(r"{'name': 'weather', 'arguments': {'city': 'it\'s'}}")
+    assert not unparsed and json.loads(calls[0]["function"]["arguments"]) == {
+        "city": "it's"
+    }
+    calls, _ = parse(r"{'name': 'weather', 'arguments': {'city': 'a\\b \"c\"'}}")
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": 'a\\b "c"'}
+    calls, unparsed = parse("{'name': 'weather', 'arguments': {'city': 'open}}")
+    assert not calls and unparsed

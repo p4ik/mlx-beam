@@ -157,6 +157,7 @@ def _coerce_one(value: Any, kinds: list[str]) -> Any:
 _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*|\s*```\s*$")
 _TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 _PY_LITERAL = re.compile(r"(?<![\w\"'])(True|False|None)(?![\w\"'])")
+_UNESCAPED_QUOTE = re.compile(r'(?<!\\)"')
 
 
 def _segments(text: str) -> list[tuple[str, bool]]:
@@ -187,14 +188,52 @@ def _segments(text: str) -> list[tuple[str, bool]]:
     return out
 
 
+def _requote(text: str) -> str:
+    """Python's single-quoted strings as JSON strings: each is read up to
+    its closing quote with `\\'` as an apostrophe and a bare `"` as a
+    quote to escape, decoded by JSON's own escape rules and written back
+    by json.dumps - so an apostrophe inside a value stays what it was.
+    Text with a string left open, or an escape JSON does not know, is
+    returned as it came; the ladder then reads it unmended (2026-09-25:
+    never changed arguments)."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch != "'":
+            out.append(ch)
+            i += 1
+            continue
+        j = i + 1
+        body = []
+        while j < n and text[j] != "'":
+            if text[j] == "\\" and j + 1 < n:
+                body.append("'" if text[j + 1] == "'" else text[j : j + 2])
+                j += 2
+            else:
+                body.append('\\"' if text[j] == '"' else text[j])
+                j += 1
+        if j >= n:
+            return text
+        try:
+            value = json.loads('"' + "".join(body) + '"')
+        except json.JSONDecodeError:
+            return text
+        out.append(json.dumps(value, ensure_ascii=False))
+        i = j + 1
+    return "".join(out)
+
+
 def repair_json_text(text: str) -> str:
     """The usual defects of model JSON mended, in the syntax only - the
     dialect's markers stay where they are and a string's content is never
     touched: a code fence, Python's literals, single-quoted strings and
     keys, a trailing comma, braces or brackets left open at the end."""
     out = _FENCE.sub("", text)
-    if "'" in out and '"' not in out:
-        out = out.replace("'", '"')
+    if "'" in out and not _UNESCAPED_QUOTE.search(out):
+        # No JSON string in the text: the quoting is Python's.
+        out = _requote(out)
     pieces = _segments(out)
     mended = []
     for segment, in_string in pieces:
