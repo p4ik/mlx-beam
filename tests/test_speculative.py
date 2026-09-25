@@ -968,21 +968,41 @@ def test_history_window_and_queue_cap(tmp_path, monkeypatch):
         assert not proposer._pending
 
 
+@pytest.mark.parametrize("kind", ["qwen", "qwen_yarn", "mla"])
 def test_a_restored_history_past_the_window_keeps_its_relative_positions(
-    monkeypatch,
+    monkeypatch, kind
 ):
     """A stored history longer than HEAD_HISTORY is cut to the window on
-    restore. The kept keys carry their old rotary positions; the cache
-    resumes at the window's length, so they are rotated back by the count
+    restore. The kept rows carry their old rotary positions; the cache
+    resumes at the window's length, so they are moved back by the count
     dropped - the next pair then sees them at the distances it would from
-    a head that started at the window."""
+    a head that started at the window. Which rows are rotated (MLA keeps
+    its rotated `k_pe` in the values) and how (YaRN multiplies an
+    amplitude in that must not be applied twice) come from the head."""
     from mlx_beam.engine import proposer as mod
+    from tests.test_model_classes import tiny
 
     monkeypatch.setattr(mod, "HEAD_HISTORY", 4)
-    model = tiny_qwen35()
-    args = model.language_model.args
-    head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
+    if kind == "mla":
+        model = tiny("glm4_moe_lite")
+        args = model.args
+        head = mod.NextNHead(args, type(model.model.layers[-1]), False, False)
+    else:
+        model = tiny_qwen35()
+        args = model.language_model.args
+        if kind == "qwen_yarn":
+            args.rope_scaling = {
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 16,
+                "mscale": 1.0,
+                "mscale_all_dim": 0.0,
+            }
+        head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
     mx.eval(head.parameters())
+    rope = head.layers[0].self_attn.rope
+    if kind == "qwen_yarn":
+        assert type(rope).__name__ == "YarnRoPE" and rope.mscale != 1.0
     prop = mod.BundledHeadProposer(model, head, 3, {})
     h = mx.random.normal((1, 8, args.hidden_size))
     ids = mx.array([[3, 7, 11, 13, 5, 9, 2, 8]])
@@ -991,7 +1011,7 @@ def test_a_restored_history_past_the_window_keeps_its_relative_positions(
     assert snapshot[0].shape[2] == 8
     prop.begin(1, 9, snapshot)
     assert prop._cache[1][0].offset == 4
-    # A one-layer head's keys depend on each pair alone: a head fed the
+    # A one-layer head's rows depend on each pair alone: a head fed the
     # last four pairs from scratch is the reference.
     prop.begin(2, 9, None)
     mx.eval(prop._feed(2, h[:, -4:], ids[:, -4:])[0])
@@ -1001,6 +1021,24 @@ def test_a_restored_history_past_the_window_keeps_its_relative_positions(
     want = prop._feed(2, next_h, next_t)[0]
     mx.eval(got, want)
     assert mx.allclose(got, want, atol=1e-5, rtol=1e-4).item()
+
+
+def test_a_history_no_rotation_can_rewind_is_kept_whole(monkeypatch, caplog):
+    from mlx_beam.engine import proposer as mod
+
+    monkeypatch.setattr(mod, "HEAD_HISTORY", 4)
+    model = tiny_qwen35()
+    args = model.language_model.args
+    head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
+    mx.eval(head.parameters())
+    head.layers[0].self_attn.rope = object()  # a module shift_positions does not know
+    prop = mod.BundledHeadProposer(model, head, 3, {})
+    keys = mx.zeros((1, 2, 8, 16))
+    values = mx.zeros((1, 2, 8, 16))
+    with caplog.at_level("WARNING", logger="beam.proposer"):
+        kept_k, kept_v = prop._windowed(keys, values)
+    assert kept_k.shape[2] == 8 and kept_v.shape[2] == 8
+    assert "kept whole" in caplog.text
 
 
 def nextn_checkpoint(tmp_path, model, form_in_manifest="glm_nextn"):

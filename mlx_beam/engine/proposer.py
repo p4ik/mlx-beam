@@ -24,6 +24,12 @@ import mlx.nn as nn
 
 from mlx_beam._vendor.mlx_lm.models.base import create_attention_mask
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache
+from mlx_beam._vendor.mlx_lm.models.rope_utils import (
+    Llama3RoPE,
+    ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
+)
 from mlx_beam.package import part, read_manifest, verify_part_file
 
 logger = logging.getLogger("beam.proposer")
@@ -399,6 +405,50 @@ HEAD_HISTORY = 8192
 PENDING_CAP = 512
 
 
+def _mla(attn) -> bool:
+    """Multi-head latent attention (GLM-4.7, DeepSeek-V3) keeps the unrotated
+    latent in the cache's keys and the rotated `k_pe` in its values."""
+    return hasattr(attn, "kv_a_proj_with_mqa")
+
+
+def shift_positions(rope, x: mx.array, delta: int) -> mx.array | None:
+    """`x`, rows already rotated at one position each, moved by `delta`
+    positions: the module's rotation alone, none of the amplitude a YaRN or
+    SuScaled module multiplies in on a forward call (the rows carry that
+    already). None for a module whose rotation is not a fixed function of
+    the position (a dynamic base) or is not known here."""
+    if isinstance(rope, nn.RoPE):
+        return mx.fast.rope(
+            x,
+            rope.dims,
+            traditional=rope.traditional,
+            base=rope.base,
+            scale=rope.scale,
+            offset=delta,
+        )
+    if isinstance(rope, (YarnRoPE, Llama3RoPE, ProportionalRoPE)):
+        return mx.fast.rope(
+            x,
+            rope.dims,
+            traditional=rope.traditional,
+            base=None,
+            scale=1.0,
+            offset=delta,
+            freqs=rope._freqs,
+        )
+    if isinstance(rope, SuScaledRoPE):
+        return mx.fast.rope(
+            x,
+            rope.dim,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=delta,
+            freqs=rope._freqs,
+        )
+    return None
+
+
 class BundledHeadProposer:
     """The checkpoint's MTP head as proposer. Per row it keeps the head's KV
     cache over the pairs (hidden, next token) the target went through -
@@ -475,28 +525,33 @@ class BundledHeadProposer:
         )
         return self.head(h_in, t_in, self._embed, cache), cache
 
-    def _rope(self):
-        """The head's rotary module, for keys that must change position."""
-        return getattr(getattr(self.head.layers[0], "self_attn", None), "rope", None)
-
     def _windowed(self, keys, values):
         """The last HEAD_HISTORY pairs of a restored history, as a head that
-        started at the window would hold them: the kept keys carry their
-        old positions, so each is rotated back by the count dropped - the
-        cache resumes at the window's length and the relative positions
-        stay what they were. Without a rotary module to do that with,
-        nothing is dropped (a wrong position is worse than a long history)."""
+        started at the window would hold them: the kept rows carry their
+        old rotary positions, so each is moved back by the count dropped -
+        the cache resumes at the window's length and the relative positions
+        stay what they were. Which part holds the rotation and how the
+        module rotates are read from the head's attention; a layout or a
+        rotary module this cannot read keeps the history whole (a wrong
+        position is worse than a long history)."""
         dropped = keys.shape[2] - HEAD_HISTORY
         if dropped <= 0:
             return keys, values
-        rope = self._rope()
-        if rope is None:
-            logger.warning("head history kept whole: no rotary module to rewind it")
+        attn = getattr(self.head.layers[0], "self_attn", None)
+        rope = getattr(attn, "rope", None)
+        kept_k, kept_v = keys[:, :, -HEAD_HISTORY:, :], values[:, :, -HEAD_HISTORY:, :]
+        rotated = kept_v if _mla(attn) else kept_k
+        # One position per row, so the move is the same -dropped for all.
+        moved = shift_positions(
+            rope, rotated.reshape(-1, 1, rotated.shape[-1]), -dropped
+        )
+        if moved is None:
+            logger.warning(
+                "head history kept whole: %s cannot be rewound", type(rope).__name__
+            )
             return keys, values
-        kept = keys[:, :, -HEAD_HISTORY:, :]
-        # One position per row, so the rotation is the same -dropped for all.
-        rewound = rope(kept.reshape(-1, 1, kept.shape[-1]), offset=-dropped)
-        return rewound.reshape(kept.shape), values[:, :, -HEAD_HISTORY:, :]
+        moved = moved.reshape(rotated.shape)
+        return (kept_k, moved) if _mla(attn) else (moved, kept_v)
 
     def begin(self, uid, prompt_len, snapshot):
         self.drop(uid)

@@ -82,7 +82,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   resumes it from there. Prompts longer than 8192 tokens are primed from
   their last 8192 positions on, and a stored history longer than that is
   cut to its last 8192 pairs on restore with their rotary positions
-  rewound, as a head that started at the window would hold them. `/health.speculative.proposer` counts
+  rewound, as a head that started at the window would hold them - the
+  rotated rows of the head's own layout (MLA keeps them in the values),
+  moved by the module's rotation alone (a YaRN amplitude is not applied
+  twice); a head whose rotation cannot be rewound keeps its history whole. `/health.speculative.proposer` counts
   `primed_pairs` and `histories_restored`. Measured before on the 27B
   head: 2.39 against 2.23 tokens per cycle with and without the prompt
   primed.
