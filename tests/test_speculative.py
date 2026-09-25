@@ -1147,7 +1147,7 @@ def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):
         assert proposer_from_args(args, model, path, log) is None
     assert "bundles a draft head" in caplog.text  # a hint, not a default
     args.draft_model = "some/repo"
-    with pytest.raises(ValueError, match="only 'bundled'"):
+    with pytest.raises(ValueError, match="only --draft-model bundled"):
         proposer_from_args(args, model, path, log)
     args.draft_model = "bundled"
     proposer = proposer_from_args(args, model, path, log)
@@ -1204,6 +1204,53 @@ def test_rollback_on_metal_matches_a_shorter_forward(family, head_dim, dtype, ke
         assert mx.allclose(g, w, atol=1e-5, rtol=1e-4)
         if keep > 1 or dtype == mx.bfloat16:
             assert mx.array_equal(got, want)
+
+
+def test_the_trunk_head_reproduces_the_model_logits_or_is_refused():
+    """The speculative batch decodes every row through the trunk's halves;
+    a family that scales or softcaps its logits after the projection must
+    come out bit-equal to its own forward, and one the composition does
+    not cover is refused at warm-up instead of sampling from the wrong
+    distribution."""
+    from mlx_beam._vendor.mlx_lm.models import granite
+    from mlx_beam.engine.proposer import check_head, trunk
+
+    args = granite.ModelArgs.from_dict(
+        dict(
+            model_type="granite",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            logits_scaling=8.0,
+            attention_multiplier=0.25,
+            embedding_multiplier=2.0,
+            residual_multiplier=0.5,
+            max_position_embeddings=512,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+        )
+    )
+    mx.random.seed(3)
+    model = granite.Model(args)
+    mx.eval(model.parameters())
+    x = mx.array([[3, 7, 11, 13]])
+    inner, head, _ = trunk(model)
+    assert mx.array_equal(model(x), head(inner(x)))
+    check_head(model, [3, 7, 11, 13])
+    # A family whose forward does something the trunk does not know.
+    own = type(model).__call__
+    model.__class__ = type(
+        "Odd",
+        (type(model),),
+        {"__call__": lambda self, *a, **k: own(self, *a, **k) * 2},
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        check_head(model, [3, 7, 11, 13])
 
 
 # -- the Mamba-2 rollback (Granite 4) ----------------------------------------

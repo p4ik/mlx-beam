@@ -30,7 +30,9 @@ from mlx_beam._vendor.mlx_lm.models.cache import (
 )
 
 # Bytes of a recurrent snapshot are counted like cache bytes.
-_ORDER = ("assistant", "user", "system")
+# Eviction order: assistant entries (one per finished turn) go before the
+# system entries (one per conversation, kept under their own cap).
+_ORDER = ("assistant", "system")
 
 
 def recurrent_layers(cache: list[Any]) -> list[int]:
@@ -132,8 +134,6 @@ class Hit:
     cache: list[Any]
     # tokens the restored cache already covers; the rest needs a prefill
     covered: int
-    # what the store found before cutting back (for the miss/hit accounting)
-    found: int
     kind: str  # "exact", "longer", "shorter"
     # the entry's checkpoints at or before ``covered``, still valid - and
     # for a recurrent model always one at ``covered`` itself
@@ -252,7 +252,7 @@ class PrefixStore:
                 kind = "shorter"
             else:
                 kind = "longer"
-            return Hit(cache, pos, shared, kind, carried)
+            return Hit(cache, pos, kind, carried)
         return None
 
     # -- insert and eviction ------------------------------------------------
@@ -362,10 +362,8 @@ class PrefixStore:
         return max(1, self.max_entries // 4)
 
     def _pop_victim(self):
-        # Assistant entries go first, then user, then system; within a type
-        # the least recently used. Surplus system entries go before anything.
-        if len(self._lru["system"]) > self.system_cap:
-            return self._lru["system"].popleft()
+        # Assistant entries go first, then system; within a type the least
+        # recently used (surplus system entries went in _evict already).
         for kind in _ORDER:
             if self._lru[kind]:
                 return self._lru[kind].popleft()

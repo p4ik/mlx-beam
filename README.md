@@ -52,7 +52,7 @@ Existing MLX servers either stop at the basics or grow things that have no place
 | Piece | State |
 |---|---|
 | CLI, packaging, CI | done |
-| Vendored mlx-lm base (pinned, four local changes) | done |
+| Vendored mlx-lm base (pinned; the local changes are listed in `VENDORED.md`) | done |
 | OpenAI-compatible server, continuous batching, quantized KV cache | done, text only |
 | Prefix cache with recurrent-state checkpoints | done, RAM tier |
 | Reasoning budget, request defaults, sampling controls | done |

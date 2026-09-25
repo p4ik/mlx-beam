@@ -80,7 +80,9 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "name(s), or none to leave the think markers in the content",
     )
     p.add_argument("--host", default="127.0.0.1", help="address to listen on")
-    p.add_argument("--port", type=int, default=8000, help="TCP port to listen on")
+    p.add_argument(
+        "--port", type=_positive_int, default=8000, help="TCP port to listen on"
+    )
     p.add_argument(
         "--allowed-origins",
         nargs="+",
@@ -112,20 +114,20 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     limits.add_argument(
         "--max-context",
-        type=int,
+        type=_positive_int,
         help="prompt plus generated tokens, a hard cap: a prompt whose reserve "
         "does not fit is a 400, a larger max_tokens is served capped at what "
         "the context holds (default: the model's own context length)",
     )
     limits.add_argument(
         "--max-prompt-tokens",
-        type=int,
+        type=_positive_int,
         help="prompt tokens, a hard cap below the context: a longer prompt is "
         "a 400; a request's max_prompt_tokens may only lower it",
     )
     limits.add_argument(
         "--max-completion-tokens",
-        type=int,
+        type=_positive_int,
         default=None,
         help="generated tokens when the client sends no max_tokens / "
         "max_completion_tokens / max_output_tokens; the request overrides "
@@ -133,14 +135,14 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     limits.add_argument(
         "--max-reasoning-tokens",
-        type=int,
+        type=_count,
         help="reasoning tokens (what usage.reasoning_tokens counts) when the "
         "client sends no max_reasoning_tokens; the think block is closed by "
         "force at the budget (default: unbounded)",
     )
     limits.add_argument(
         "--min-response-tokens",
-        type=int,
+        type=_count,
         default=0,
         help="tokens kept for the answer after the think block when the client "
         "sends no min_response_tokens; the reasoning budget is cut to leave "
@@ -153,7 +155,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     sampling.add_argument("--temp", type=float, help="temperature")
     sampling.add_argument("--top-p", type=float, help="nucleus sampling")
-    sampling.add_argument("--top-k", type=int, help="top-k sampling (0 = off)")
+    sampling.add_argument("--top-k", type=_count, help="top-k sampling (0 = off)")
     sampling.add_argument("--min-p", type=float, help="min-p sampling (0 = off)")
     kv = p.add_argument_group("KV cache")
     kv.add_argument(
@@ -164,10 +166,10 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     kv.add_argument(
         "--kv-group-size",
-        type=int,
-        default=64,
+        type=_positive_int,
         choices=(32, 64, 128),
-        help="group size of the KV quantization",
+        help="group size of the KV quantization (default: 64, or what the "
+        "checkpoint's kv_config carries; the flag beats the file)",
     )
     kv.add_argument(
         "--kv-config",
@@ -191,32 +193,32 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--max-queued",
-        type=int,
+        type=_positive_int,
         help="requests allowed to wait for a batch slot; one more is a 503 with "
         "Retry-After (default: unlimited)",
     )
     batching = p.add_argument_group("batching")
     batching.add_argument(
         "--decode-concurrency",
-        type=int,
+        type=_positive_int,
         default=8,
         help="sequences decoded in one batch",
     )
     batching.add_argument(
         "--prompt-concurrency",
-        type=int,
+        type=_positive_int,
         default=2,
         help="prompts prefilled in one batch",
     )
     batching.add_argument(
         "--prefill-step-size",
-        type=int,
+        type=_positive_int,
         default=2048,
         help="prompt tokens per model call while prefilling",
     )
     batching.add_argument(
         "--prefill-slice",
-        type=int,
+        type=_positive_int,
         default=512,
         help="prompt tokens a prefill runs before decode gets a turn",
     )
@@ -254,7 +256,7 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     )
     spec.add_argument(
         "--max-draft-tokens",
-        type=int,
+        type=_positive_int,
         default=3,
         help="cap on the drafts verified per cycle; the regulator picks each "
         "cycle's depth below it from the acceptance and the cycle cost it "
@@ -263,13 +265,13 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     cache = p.add_argument_group("prompt cache")
     cache.add_argument(
         "--prompt-cache-size",
-        type=int,
+        type=_positive_int,
         default=16,
         help="stored prefixes: a number of entries, not a size in bytes",
     )
     cache.add_argument(
         "--prompt-cache-bytes",
-        type=int,
+        type=_positive_int,
         help="RAM budget in bytes for the stored prefixes (default: unlimited); "
         "the store's own limit, separate from the caches of running requests",
     )
@@ -313,11 +315,39 @@ def _unit_interval(value: str, flag: str) -> float:
     return x
 
 
+def _positive_int(value: str) -> int:
+    """A count that must be at least 1: a prefill of width 0 never advances
+    and a concurrency of 0 admits nobody - argparse refuses them here
+    instead of the engine hanging on them."""
+    try:
+        x = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if x < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return x
+
+
+def _count(value: str) -> int:
+    """A count that may be 0 (off, none reserved)."""
+    try:
+        x = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
+    if x < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return x
+
+
 def chat_template_from_args(args) -> str | None:
-    """The --chat-template text: read from the file when the value names one."""
+    """The --chat-template text: read from the file when the value names one.
+    A value that looks like a file name but is none (a typo in the path)
+    is refused - rendering the path's text as the template would be a
+    silent fallback."""
     if not args.chat_template:
         return None
-    path = Path(args.chat_template)
+    value = args.chat_template
+    path = Path(value)
     try:
         is_file = path.is_file()
     except OSError:
@@ -325,7 +355,20 @@ def chat_template_from_args(args) -> str | None:
         is_file = False
     if is_file:
         return path.read_text(encoding="utf-8")
-    return args.chat_template
+    looks_like_path = (
+        "{{" not in value
+        and "{%" not in value
+        and (value.endswith((".jinja", ".j2", ".txt")) or "/" in value)
+    )
+    if looks_like_path:
+        raise StartupError(f"--chat-template {value}: no such file")
+    return value
+
+
+class StartupError(ValueError):
+    """A flag, file or environment the server cannot start with; `serve`
+    logs it and exits with 3, whether it surfaces before or after the
+    load. argparse's own refusals keep exit code 2."""
 
 
 def kv_policy_from_args(args):
@@ -359,20 +402,26 @@ def kv_policy_from_args(args):
                     raise ValueError(
                         f"one group size per policy, the list has {sorted(sizes)}"
                     )
-                if sizes:
+                # A flag beats the file (the help text says so): only an
+                # unset --kv-group-size takes the list's.
+                if sizes and args.kv_group_size is None:
                     group_size = sizes.pop()
             elif not isinstance(cfg, dict) or not isinstance(
                 cfg.get("layers", {}), dict
             ):
                 raise ValueError("expected an object with bits, group_size, layers")
             else:
-                bits = cfg.get("bits", bits)
-                group_size = cfg.get("group_size", group_size)
+                if bits is None:
+                    bits = cfg.get("bits")
+                if args.kv_group_size is None:
+                    group_size = cfg.get("group_size", group_size)
                 layers = {int(k): v for k, v in (cfg.get("layers") or {}).items()}
                 if "prefill" in cfg:
                     prefill, source = cfg["prefill"], "profile"
-        except (OSError, ValueError) as e:
-            raise SystemExit(f"--kv-config {args.kv_config}: {e}") from None
+        except (OSError, TypeError, ValueError) as e:
+            raise StartupError(f"--kv-config {args.kv_config}: {e}") from None
+    if group_size is None:
+        group_size = 64
     if getattr(args, "kv_prefill", None):
         prefill, source = args.kv_prefill, "flag"
     try:
@@ -384,7 +433,7 @@ def kv_policy_from_args(args):
             prefill_source=source,
         )
     except ValueError as e:
-        raise SystemExit(f"kv policy: {e}") from None
+        raise StartupError(f"kv policy: {e}") from None
 
 
 def policy_with_package_prefill(policy, args, model_path: Path, log):
@@ -401,15 +450,23 @@ def policy_with_package_prefill(policy, args, model_path: Path, log):
     if policy.prefill_source != "default" or not args.kv_config:
         return policy
     entry = part(read_manifest(model_path), "kv_config") or {}
-    mode = (entry.get("prefill") or {}).get("mode")
+    prefill = entry.get("prefill")
+    mode = prefill.get("mode") if isinstance(prefill, dict) else None
     if not mode or not entry.get("file"):
         return policy
     ours = Path(args.kv_config)
     if entry.get("sha256"):
-        same = sha256_of(ours) == entry["sha256"]
+        same = sha256_of(ours).lower() == str(entry["sha256"]).lower()
     else:
         same = ours.resolve() == (model_path / entry["file"]).resolve()
     if not same:
+        log.info(
+            "kv prefill stays %r: %s is not the profile the package measured "
+            "(%s); pass --kv-prefill to choose",
+            policy.prefill,
+            ours,
+            entry["file"],
+        )
         return policy
     log.info(
         "kv prefill %r from the package manifest (measured for %s)", mode, entry["file"]
@@ -428,7 +485,7 @@ def proposer_from_args(args, model, model_path: Path, log):
 
     if not args.draft_model:
         try:
-            files, _ = bundled_head_files(model_path)
+            files, _ = bundled_head_files(model_path, verify=False)
             log.info(
                 "%s bundles a draft head (%s); pass --draft-model bundled to use it",
                 args.model,
@@ -436,16 +493,55 @@ def proposer_from_args(args, model, model_path: Path, log):
             )
         except (OSError, ValueError):
             pass
+        if args.max_draft_tokens != 3:
+            log.info("--max-draft-tokens has no effect without --draft-model")
         return None
-    if args.draft_model != "bundled":
-        raise ValueError(
-            "only 'bundled' (the checkpoint's own draft head) is supported at "
-            "this stage; an external drafter comes with a later release"
-        )
-    if args.max_draft_tokens < 1:
-        raise ValueError("--max-draft-tokens must be at least 1")
+    check_draft_flags(args)
     head, info = load_bundled_head(model, model_path)
     return BundledHeadProposer(model, head, args.max_draft_tokens, info)
+
+
+def check_draft_flags(args) -> None:
+    """What --draft-model may name, checked before the load."""
+    if args.draft_model and args.draft_model != "bundled":
+        raise StartupError(
+            "only --draft-model bundled (the checkpoint's own draft head) is "
+            "supported at this stage; an external drafter comes with a later "
+            "release"
+        )
+
+
+def default_flags(args) -> dict:
+    """The request defaults the flags set (None: not set)."""
+    return {
+        "max_completion_tokens": args.max_completion_tokens,
+        "temperature": args.temp,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "chat_template_args": args.chat_template_args or None,
+        "max_reasoning_tokens": args.max_reasoning_tokens,
+        "min_response_tokens": args.min_response_tokens or None,
+    }
+
+
+def probe_port(host: str, port: int) -> None:
+    """Bind and release the listening socket once, before the load: an
+    occupied port or a bad host fails in a second, not after the weights."""
+    import socket
+
+    try:
+        family, kind, _, _, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+    except (OSError, IndexError) as e:
+        raise StartupError(f"cannot listen on {host}:{port}: {e}") from None
+    with socket.socket(family, kind) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(address)
+        except OSError as e:
+            raise StartupError(f"cannot listen on {host}:{port}: {e}") from None
 
 
 def serve(args) -> int:
@@ -461,14 +557,26 @@ def serve(args) -> int:
         level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(message)s"
     )
     log = logging.getLogger("beam")
-    # Flags are checked before minutes of loading are spent on a typo.
-    policy = kv_policy_from_args(args)
+    # Flags are checked before minutes of loading are spent on a typo: the
+    # KV policy, the template file, the draft flag, the request defaults
+    # the flags set, and the port.
+    try:
+        policy = kv_policy_from_args(args)
+        template = chat_template_from_args(args)
+        check_draft_flags(args)
+        RequestDefaults.resolve(None, flags=default_flags(args))
+        probe_port(args.host, args.port)
+    except (StartupError, ValueError, OSError) as e:
+        log.error("%s", e)
+        return 3
     log.info("loading %s", args.model)
     # Handed to the tokenizer at load: the tool markers are inferred from
     # the template that will actually render (the think markers come from
-    # the vocabulary).
-    template = chat_template_from_args(args)
+    # the vocabulary). Custom tokenizer code needs the same consent the
+    # model's does.
     tokenizer_config = {"chat_template": template} if template else {}
+    if args.trust_remote_code:
+        tokenizer_config["trust_remote_code"] = True
     model, tokenizer = load(
         args.model,
         tokenizer_config=tokenizer_config,
@@ -489,22 +597,15 @@ def serve(args) -> int:
         return 3
     try:
         proposer = proposer_from_args(args, model, model_path, log)
-    except (OSError, ValueError) as e:
+    except (OSError, KeyError, ValueError) as e:
         log.error("--draft-model %s: %s", args.draft_model, e)
         return 3
-    defaults = RequestDefaults.resolve(
-        model_path,
-        flags={
-            "max_completion_tokens": args.max_completion_tokens,
-            "temperature": args.temp,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "min_p": args.min_p,
-            "chat_template_args": args.chat_template_args or None,
-            "max_reasoning_tokens": args.max_reasoning_tokens,
-            "min_response_tokens": args.min_response_tokens or None,
-        },
-    )
+    try:
+        defaults = RequestDefaults.resolve(model_path, flags=default_flags(args))
+    except ValueError as e:
+        # The model's generation_config.json holds a value out of range.
+        log.error("request defaults: %s", e)
+        return 3
     engine = Engine(
         model,
         model_key=args.model,
