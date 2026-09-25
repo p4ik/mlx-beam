@@ -40,6 +40,17 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `--max-context` help text: only a prompt whose reserve does not fit is a
   400, a larger `max_tokens` is served capped.
 
+### Fixed
+- A stop sequence of more than one token no longer leaves its start in
+  the answer: the sequence's last token goes through the detokenizer so
+  the text-level match completes and cuts there (only an eos token is
+  dropped unseen). A prefix before an eos, or cut by the length limit, is
+  still text.
+- `logprobs.content` keeps every token of a multi-byte character: byte
+  tokens the detokenizer holds until the character completes are booked
+  with the token that completes it, instead of being dropped as
+  non-content.
+
 ## [0.1.0a4] - 2026-09-25
 
 ### Added

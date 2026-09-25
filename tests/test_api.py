@@ -1343,3 +1343,98 @@ def test_responses_cut_tail_next_to_a_recovered_call_is_the_incomplete_item():
     req.chat.stream = False
     whole = responses.ResponsesResponder(tok, req, gen.tokens).complete(iter(evs), 0)
     assert [i["status"] for i in whole["output"]] == ["completed", "incomplete"]
+
+
+def test_a_multi_token_stop_sequence_leaves_no_prefix_behind():
+    # The engine matches the sequence on token ids and ends on its last
+    # token; the automaton held the start as a possible prefix. The last
+    # token goes through the detokenizer so the word completes and is cut
+    # - only an eos token is dropped unseen.
+    tok = StubTokenizer()
+    for stream in (False, True):
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w1"}],
+                "stop": "w20 w34",
+                "stream": stream,
+            },
+            "m",
+        )
+        gen = chat.to_generation_request(tok, req)
+        assert (20, 34) in gen.stop_sequences
+        ev = [TokenEvent(20, -0.1), TokenEvent(34, -0.1, "stop")]
+        responder = chat.ChatResponder(tok, req, gen.tokens)
+        if stream:
+            chunks = list(responder.stream(iter(ev), 0))
+            text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        else:
+            text = responder.complete(iter(ev), 0)["choices"][0]["message"]["content"]
+        assert not text
+    # A prefix before an eos is text the model said; so is one cut by length.
+    for ev in (
+        [TokenEvent(20, -0.1), TokenEvent(EOS, -0.1, "stop")],
+        [TokenEvent(20, -0.1, "length")],
+    ):
+        asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=["w20 w34"])
+        assert "".join(asm.feed(e).content for e in ev) == "w20 "
+
+
+class _ByteTokenizer(StubTokenizer):
+    """Three tokens carry the bytes of one character (E2 82 AC = the euro
+    sign); the real byte-level detokenizer holds them until it completes."""
+
+    has_thinking = False
+    has_tool_calling = False
+
+    def __init__(self):
+        super().__init__()
+        self.raw = [w.encode() for w in self._words]
+        self.raw[40], self.raw[41], self.raw[42] = b"\xe2", b"\x82", b"\xac"
+
+    def __len__(self):
+        return len(self.raw)
+
+    def convert_ids_to_tokens(self, ids):
+        from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
+
+        to_char = {v: k for k, v in _byte_decoder().items()}
+        return ["".join(to_char[b] for b in self.raw[t]) for t in ids]
+
+    def decode(self, ids):
+        return b"".join(self.raw[t] for t in ids).decode("utf-8", "replace")
+
+    @property
+    def detokenizer(self):
+        from mlx_beam._vendor.mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+        return BPEStreamingDetokenizer(self)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs_keep_the_byte_tokens_of_a_character(stream):
+    tok = _ByteTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "stream": stream,
+        },
+        "m",
+    )
+    ev = [
+        TokenEvent(40, -0.1),
+        TokenEvent(41, -0.2),
+        TokenEvent(42, -0.3),
+        TokenEvent(EOS, -0.4, "stop"),
+    ]
+    responder = chat.ChatResponder(tok, req, [1])
+    if stream:
+        chunks = list(responder.stream(iter(ev), 0))
+        content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        entries = [e for c in chunks for e in c["choices"][0]["logprobs"]["content"]]
+    else:
+        choice = responder.complete(iter(ev), 0)["choices"][0]
+        content = choice["message"]["content"]
+        entries = choice["logprobs"]["content"]
+    assert content == "€"
+    assert [e["logprob"] for e in entries] == [-0.1, -0.2, -0.3]

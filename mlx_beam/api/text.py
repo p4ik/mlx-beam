@@ -253,6 +253,12 @@ class TextAssembler:
         # A fragment the detokenizer held when the forced close began.
         self._fragment = False
         self._fragment_checked = False
+        # The engine's stop matcher holds the eos ids and the stop words
+        # alike; only an eos token is dropped unseen (feed).
+        self._eos = set(getattr(tokenizer, "eos_token_ids", None) or ())
+        # Byte tokens of a character still forming: content or not is
+        # decided by the token that completes it (logprobs).
+        self._held: list[TokenEvent] = []
         self._parse_tools = ToolCallParser(
             getattr(tokenizer, "tool_parser", None),
             tools,
@@ -285,13 +291,17 @@ class TextAssembler:
         delta = TextDelta(tokens=1)
 
         if event.finish_reason == "stop":
-            # The stop token itself is never shown; what the detokenizer and
-            # the automaton still held is text - a marker that never
-            # completed is what the model said.
+            # An eos token is never shown. The last token of a stop
+            # sequence is: it goes through the detokenizer so the automaton
+            # sees the whole word and cuts there - held back as a prefix,
+            # its start would otherwise come out as text. What the
+            # detokenizer and the automaton still hold is text - a marker
+            # that never completed is what the model said.
+            if event.token not in self._eos:
+                self._detok.add_token(event.token)
             self._detok.finalize()
-            self._state, clean, current = TextStateMachine.step(
-                self._state, self._detok.last_segment
-            )
+            segment = self._detok.last_segment
+            self._state, clean, current = TextStateMachine.step(self._state, segment)
             if current is not None:
                 self._state, flushed, current = TextStateMachine.flush(self._state)
                 clean += flushed
@@ -305,9 +315,8 @@ class TextAssembler:
             self._detok.add_token(event.token)
             if event.finish_reason == "length":
                 self._detok.finalize()
-            self._state, clean, current = TextStateMachine.step(
-                self._state, self._detok.last_segment
-            )
+            segment = self._detok.last_segment
+            self._state, clean, current = TextStateMachine.step(self._state, segment)
             if event.forced and self._fragment:
                 clean = clean.replace("\ufffd", "", 1)
                 self._fragment = False
@@ -330,7 +339,7 @@ class TextAssembler:
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
             self.stopped = True
-            self.pending_events.append((event, bool(delta.content)))
+            self._book(event, "", bool(delta.content))
             self._prev = "normal"
             delta.finish_reason = "stop"
             if self._tool_text:
@@ -377,8 +386,8 @@ class TextAssembler:
             self._label = ""
             delta.content = closed + clean
         # A marker token releases no text; the stop token none either.
-        self.pending_events.append(
-            (event, bool(clean) and (current == "normal" or not self._route))
+        self._book(
+            event, segment, bool(clean) and (current == "normal" or not self._route)
         )
         self._prev = current
 
@@ -403,6 +412,24 @@ class TextAssembler:
         self._made_tool_call |= bool(calls)
         if unparsed:
             delta.content += "".join(unparsed)
+
+    def _book(self, event: TokenEvent, segment: str, content: bool) -> None:
+        """The event into `pending_events` with whether its text went to the
+        content. A token that released nothing because the detokenizer
+        still holds a cut UTF-8 sequence is not decided yet: it is booked
+        with the token that completes the character, under that one's
+        verdict. A marker releases a segment and is decided at once."""
+        if (
+            not segment
+            and event.finish_reason is None
+            and holds_incomplete_bytes(self._detok)
+        ):
+            self._held.append(event)
+            return
+        for held in self._held:
+            self.pending_events.append((held, content))
+        self._held = []
+        self.pending_events.append((event, content))
 
     def _take_lead(self) -> str:
         lead, self._lead = self._lead, ""
