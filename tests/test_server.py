@@ -51,7 +51,17 @@ def test_health_and_models(server):
     status, _, raw = call(server, "GET", "/v1/models")
     models = json.loads(raw)
     assert status == 200 and models["data"][0]["id"] == "tiny"
-    assert models["data"][0]["capabilities"]["tools"] is True
+    entry = models["data"][0]
+    assert entry["capabilities"]["tools"] is True
+    assert entry["owned_by"] == "mlx-beam" and entry["input_modalities"] == ["text"]
+    assert entry["context_length"] == entry["max_model_len"] == h["max_context"]
+    assert (
+        entry["max_completion_tokens"]
+        == h["api"]["defaults"]["max_completion_tokens"]["value"]
+    )
+    assert entry["capabilities"]["effort"] == {"source": "none"}
+    assert h["reasoning"]["start"] == "<think>" and h["tools"]["start"] == "<tool_call>"
+    assert set(h["tools"]["repairs"]) == {"strict", "repaired", "coerced", "failed"}
     assert h["api"]["reasoning_field"] == "reasoning"
     assert h["api"]["reasoning_keys_read"] == ["reasoning_content"]
     assert h["api"]["defaults"]["temperature"] == {"value": 0.0, "source": "mlx-lm"}
@@ -124,6 +134,35 @@ def test_completions_with_token_ids(server):
     out = json.loads(raw)
     assert status == 200 and out["object"] == "text_completion"
     assert out["usage"]["prompt_tokens"] == 3
+
+
+def test_metrics_expose_the_health_counters(server):
+    call(
+        server,
+        "POST",
+        "/v1/chat/completions",
+        {"messages": [{"role": "user", "content": "w1"}], "max_tokens": 2},
+    )
+    status, ctype, raw = call(server, "GET", "/metrics")
+    assert status == 200 and ctype.startswith("text/plain")
+    text = raw.decode()
+    _, _, h = call(server, "GET", "/health")
+    h = json.loads(h)
+    assert (
+        f'mlx_beam_generation_tokens_total{{model="tiny"}} {h["counters"]["generation_tokens"]}'
+        in text
+    )
+    assert 'mlx_beam_alive{model="tiny"} 1' in text
+    assert "# TYPE mlx_beam_prompt_cache_hits_total counter" in text
+    assert 'mlx_beam_tool_calls_total{model="tiny",rung="strict"}' in text
+    assert 'vllm:prompt_tokens_total{model="tiny"}' in text
+    assert "mlx_beam_speculative" not in text  # no proposer configured
+    # One HELP/TYPE pair per family, however many label values it has:
+    # the format's parsers refuse a second pair for the same name.
+    assert text.count("# TYPE mlx_beam_tool_calls_total counter") == 1
+    assert text.count('mlx_beam_tool_calls_total{model="tiny",rung=') >= 2
+    for line in text.splitlines():
+        assert not line.startswith("# TYPE") or text.count(line) == 1
 
 
 def test_responses(server):

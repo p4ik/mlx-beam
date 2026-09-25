@@ -97,7 +97,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 
 ## Request: fields a call may send
 
-Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`). A field left out falls back to the server's default for it.
+Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`); `/v1/messages` takes Anthropic's (`system`, content blocks, `tools` with `input_schema`, `stop_sequences`, `thinking.budget_tokens`, `top_k`) and answers in Anthropic's blocks, events and error envelope, `/v1/messages/count_tokens` counts the rendered prompt. A `cache_control` marker maps onto the prompt cache's checkpoints when it sits on a message's last block and is refused otherwise. A field left out falls back to the server's default for it.
 
 | Field | Values | What it does |
 |---|---|---|
@@ -105,7 +105,7 @@ Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completion
 | `max_prompt_tokens` | integer ≥ 1 | A prompt cap for this call; it may only lower the server's. |
 | `max_reasoning_tokens`, `thinking_token_budget`, `reasoning.max_tokens` | integer ≥ 0 | Reasoning tokens the think block may take; at the budget the block is closed by force and the answer keeps `min_response_tokens`. The first name wins when several are sent. |
 | `min_response_tokens` | integer ≥ 0 | Tokens kept for the answer after the think block. |
-| `reasoning_effort`, `reasoning.effort` | `none` / `off` / `false`, `minimal` / `low`, `medium`, `high` / `xhigh` / `max` / `ultra` | Mapped onto the levels the model's template accepts (`low`, `medium`, `xhigh`); `none` turns thinking off. A level the template rejects by name is retried through its aliases. |
+| `reasoning_effort`, `reasoning.effort` | `none` / `off` / `false`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` / `ultra` | `none` turns thinking off. Otherwise the word reaches the template the way the template takes it, measured at load (`/health.reasoning.effort`): a template that checks the word gets it when it is in its set, else the nearest rung it accepts (up first, then down); a template that takes the word unchecked gets it as sent; a template without the kwarg gets nothing. A word the template still rejects at request time is retried through its neighbours. |
 | `enable_thinking` | boolean, or the words `true` / `false` | Thinking on or off for this call; handed to the template. |
 | `chat_template_kwargs` | object | Extra variables for the template render, on top of `--chat-template-args` and the aliases above. |
 | `temperature`, `top_p`, `top_k`, `min_p` | 0-2, 0-1, integer (0 or -1 = off), 0-1 | Sampling; `temperature` 0 is greedy. |

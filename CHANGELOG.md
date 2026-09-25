@@ -43,6 +43,86 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
   what a partial rollback needs, the rollback replays the selective scan
   over the accepted prefix, bit for bit against a forward of those tokens.
+- Two marker families: Harmony (gpt-oss) and Muse (ATEM). The reasoning,
+  the answer and a tool call sit behind a label - the channel, or the
+  recipient after `<|start|>assistant` - and the text assembler routes by
+  what the label says: `analysis` / `self` to the reasoning field, `final`
+  / `user` to the content, a recipient naming a tool to a tool call. Tool
+  parsers for both (`harmony`: the JSON body of a commentary message;
+  `atem`: the `<atem:invoke>` block, values typed by the tool's schema).
+  A thinking budget closes the block the way these families do - by
+  opening the answer - and forces the whole sequence; `enable_thinking:
+  false` opens the answer in the prompt, since their templates have no
+  switch. A recipient marker (` to=`) is read only where the family puts
+  one - right after `<|start|>assistant` - so the same characters inside
+  an answer stay text. `/health.reasoning` names the family and its
+  markers, `/health.tools` the parser.
+- The reasoning effort follows what the loaded template does with it,
+  measured at load: the kwarg it reads (`reasoning_effort`,
+  `reasoning_strength`, ...), whether it checks the word, and the set it
+  accepts, reported under `/health.reasoning.effort` and in each model's
+  `capabilities.effort` in `/v1/models`. A template that checks gets the
+  client's word when it is in the set, else the nearest rung it accepts;
+  one that takes the word unchecked gets it as sent (the vocabulary such
+  models were trained on); one without the kwarg gets nothing, and one
+  whose kwarg takes a number (a token budget) gets no word either
+  (`capabilities.effort.takes: tokens`). Before, every word was mapped
+  onto one template's three names.
+- Anthropic's Messages API: `/v1/messages` (system field, content blocks
+  with text, thinking, tool_use and tool_result, tools with
+  `input_schema`, `tool_choice` auto or none, `stop_sequences`,
+  `thinking.budget_tokens`, `top_k`) answering in content blocks in the
+  order thinking, text, tool_use with Anthropic's stop reasons, usage
+  (`cache_read_input_tokens` from the prefix cache) and stream events
+  (`message_start`, per block start / delta / stop, `message_delta`,
+  `message_stop`, `ping`), errors in Anthropic's envelope; and
+  `/v1/messages/count_tokens`. Tool arguments go out in one
+  `input_json_delta` when the call closes. A `cache_control` marker on
+  any block is accepted and does nothing: the prefix store caches every
+  turn by itself, and a client that marks blocks is not refused for it.
+  `input_tokens` in the usage counts what was prefilled, the cached part
+  excluded, so the two add up to the prompt. A `stop_sequence` stop
+  reason names the sequence that ended the text.
+- A repair ladder for tool calls: the parser's own reading, validated
+  against the tool's declared schema; when the parser refuses, a reading
+  of the text with the usual defects of model JSON mended (a code fence,
+  Python's literals, single-quoted strings read with their escapes so an
+  apostrophe inside stays one, a trailing comma, braces left open - in
+  the syntax only, a string's content is never touched); when the
+  schema objects, values coerced where they plainly are the
+  declared type written another way ("42" for an integer, "true" for a
+  boolean, a JSON text for an object). Every rung is validated again,
+  nothing is invented, what a rung did is the call's `repair_actions`,
+  and a call no rung makes valid still comes back as text. The mending
+  applies to parsers that read JSON and to blocks the model closed: a
+  block cut off by `max_tokens` is not completed into a call the model
+  never made. A call to a tool the request did not declare is text, not
+  a call. `/health.tools.repairs` counts the rungs.
+- `/metrics` in Prometheus' text format from the same counters `/health`
+  reports (`mlx_beam_*`: requests, tokens, seconds, memory, the prefix
+  store, tool-call rungs, the speculator), plus the four `vllm:` names
+  dashboards read most.
+- `/v1/models` entries carry `context_length` and `max_model_len` (the
+  context the engine serves), `max_completion_tokens` (the default a
+  request may override), `input_modalities`, `owned_by: mlx-beam` and the
+  `capabilities` object with the effort measurement; chat and text
+  completions carry a `system_fingerprint` (model, version and KV layout
+  hashed).
+- A prefill valve. The next prefill call's peak is estimated from the
+  bytes per token the calls before cost on this machine (learned from the
+  allocator's peak) and held under the smaller of the device's
+  recommended working set and what the process holds plus what the
+  system has free - dynamic, for a memory other engines share. A call
+  that would not fit is cut to the width that does (on a grid of 64
+  tokens); below the narrowest width the round prefills nobody and
+  decoding goes on, instead of Metal failing with an error nothing can
+  catch. A stall that cannot end by itself - nothing decodes, so nothing
+  will free memory - first evicts the prefix store one entry at a time,
+  then refuses the widest waiting prompt with a 400 (it does not fit
+  beside what runs) instead of holding every prompt behind it for ever.
+  `/health.prefill_valve` reports the estimate, the ceiling, the calls
+  cut, the rounds stalled and the prompts refused. Thresholds and the
+  estimate's accuracy are to be measured on the Mac.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is
@@ -123,6 +203,20 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   markers of a request are read once instead of up to three times. A fixed
   request series against the tiny model gives the same bytes before and
   after (golden transcript), the suite is unchanged.
+- The `forced` flag of a token now covers the whole forced close, the part
+  after the end marker included (a line break, or the answer's opener).
+- The thinking budget of a label family (Harmony, Muse) counts from the
+  label, not the opener: `<|start|>assistant<|channel|>final` is the
+  answer, and only a label the family names as reasoning starts the
+  budget.
+- A request's `reasoning_effort` word lifts a server-side
+  `enable_thinking: false` when the request says nothing about thinking
+  itself (the client asked for effort, so it wants the reasoning);
+  `reasoning_effort: null` in a request clears the server's default word.
+  Where a request and a server default disagree, the request wins.
+- `/metrics` writes a metric's `# HELP` and `# TYPE` once, before its
+  first sample, as the exposition format requires; a metric with a
+  label per value used to repeat the pair, which its readers reject.
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing

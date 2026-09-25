@@ -35,7 +35,7 @@ from mlx_beam.api.errors import (
     text_field,
     unsupported,
 )
-from mlx_beam.api.reasoning import read_aliases
+from mlx_beam.api.reasoning import EFFORT_KWARGS, read_aliases
 from mlx_beam.api.text import TextAssembler, TextDelta
 from mlx_beam.engine.request import GenerationRequest
 
@@ -217,7 +217,8 @@ def parse_responses_request(
     if thinking is not None:
         template_kwargs["enable_thinking"] = thinking
     if level is not None:
-        template_kwargs["reasoning_effort"] = level
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
     chat = ChatRequest(
         messages=_normalise_messages(
             items_to_messages(body.get("input"), body.get("instructions"))

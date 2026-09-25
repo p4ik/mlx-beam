@@ -6,6 +6,7 @@ a token request on the engine's single worker.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
@@ -20,10 +21,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mlx_beam import __version__
-from mlx_beam.api import chat, completions, responses
+from mlx_beam.api import chat, completions, messages, metrics, repair, responses
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
-from mlx_beam.api.reasoning import renderer_reasoning_keys
+from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
 from mlx_beam.engine import (
     ContextTooLong,
     Engine,
@@ -74,6 +75,13 @@ class Served:
         # "model", "flag" or "default": where the chat template came from.
         self.chat_template_source = chat_template_source
         self.started_at = time.time()
+        # OpenAI's system_fingerprint: the same value for every answer this
+        # set-up gives - model, package version and KV layout hashed.
+        layout = json.dumps(
+            engine.health().get("kv", {}).get("applied"), sort_keys=True
+        )
+        digest = hashlib.sha256(f"{model_name}|{__version__}|{layout}".encode())
+        self.fingerprint = "fp_" + digest.hexdigest()[:12]
 
     def capabilities(self) -> dict:
         t = self.tokenizer
@@ -81,11 +89,53 @@ class Served:
             "chat": bool(getattr(t, "has_chat_template", True)),
             "tools": bool(getattr(t, "has_tool_calling", False)),
             "thinking": bool(getattr(t, "has_thinking", False)),
+            # What the template does with reasoning_effort, measured at
+            # load: the kwarg it reads, whether it checks the word, the set.
+            "effort": effort_capability(t).describe(),
             "vision": False,
             "audio": False,
         }
 
+    def reasoning_markers(self) -> dict:
+        """The think family and its markers as the tokenizer found them:
+        the evidence behind capabilities.thinking."""
+        t = self.tokenizer
+        if not getattr(t, "has_thinking", False):
+            return {"family": None}
+        return {
+            "family": getattr(t, "think_family", None),
+            "start": getattr(t, "think_start", None),
+            "end": getattr(t, "think_end", None),
+            "openers": list(getattr(t, "think_openers", None) or ()),
+            "label_end": getattr(t, "think_label_end", None),
+            "close_tokens": list(getattr(t, "think_close_tokens", None) or ()),
+            "answer_opener_tokens": list(
+                getattr(t, "answer_opener_tokens", None) or ()
+            ),
+        }
+
+    def tool_markers(self) -> dict:
+        t = self.tokenizer
+        if not getattr(t, "has_tool_calling", False):
+            return {"parser": None}
+        return {
+            "parser": getattr(t, "tool_parser_type", None),
+            "start": getattr(t, "tool_call_start", None),
+            "end": getattr(t, "tool_call_end", None),
+            "via_label": bool(getattr(t, "tool_call_via_label", False)),
+            # The repair ladder's counters since start: calls read as they
+            # were, after the JSON was mended, after values were coerced,
+            # and calls no rung made valid (returned as text).
+            "repairs": dict(repair.STATS),
+        }
+
     def models(self) -> dict:
+        caps = self.capabilities()
+        modalities = ["text"]
+        if caps["vision"]:
+            modalities.append("image")
+        if caps["audio"]:
+            modalities.append("audio")
         return {
             "object": "list",
             "data": [
@@ -93,8 +143,15 @@ class Served:
                     "id": self.model_name,
                     "object": "model",
                     "created": int(self.started_at),
-                    "owned_by": "local",
-                    "capabilities": self.capabilities(),
+                    "owned_by": "mlx-beam",
+                    # The context the engine serves (prompt plus generated),
+                    # under both names clients read, and the completion
+                    # default a request may override.
+                    "context_length": self.engine.max_context,
+                    "max_model_len": self.engine.max_context,
+                    "max_completion_tokens": self.defaults.max_completion_tokens,
+                    "input_modalities": modalities,
+                    "capabilities": caps,
                 }
             ],
         }
@@ -103,6 +160,9 @@ class Served:
         h = self.engine.health()
         h["model"] = self.model_name
         h["capabilities"] = self.capabilities()
+        h["reasoning"] = self.reasoning_markers()
+        h["reasoning"]["effort"] = effort_capability(self.tokenizer).describe()
+        h["tools"] = self.tool_markers()
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
@@ -132,9 +192,22 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(
         self, status: int, payload: dict, extra_headers: dict | None = None
     ) -> None:
-        body = json.dumps(payload).encode()
+        self._send_bytes(
+            status, json.dumps(payload).encode(), "application/json", extra_headers
+        )
+
+    def _send_text(self, status: int, text: str, content_type: str) -> None:
+        self._send_bytes(status, text.encode(), content_type)
+
+    def _send_bytes(
+        self,
+        status: int,
+        body: bytes,
+        content_type: str,
+        extra_headers: dict | None = None,
+    ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         for key, value in (extra_headers or {}).items():
             self.send_header(key, value)
@@ -146,10 +219,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _error_body(self, err: ApiError) -> dict:
+        # The messages endpoints answer in Anthropic's envelope.
+        if self.path.startswith("/v1/messages"):
+            return messages.anthropic_error(err)
+        return err.body()
+
     def _send_error(self, err: ApiError) -> None:
         # A full queue clears; a dead engine does not come back on its own.
         headers = {"Retry-After": "1"} if err.code == "queue_full" else None
-        self._send_json(err.status, err.body(), headers)
+        self._send_json(err.status, self._error_body(err), headers)
 
     def _cors(self) -> None:
         allowed = self.served.allowed_origins
@@ -228,6 +307,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200 if h["alive"] else 503, h)
         elif path == "/v1/models":
             self._send_json(200, self.served.models())
+        elif path == "/metrics":
+            text = metrics.render(self.served.health(), self.served.model_name)
+            self._send_text(200, text, "text/plain; version=0.0.4; charset=utf-8")
         else:
             self._send_error(ApiError("not found", status=404, type="not_found_error"))
 
@@ -235,6 +317,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         routes: dict[str, Callable[[dict], None]] = {
             "/v1/chat/completions": self._chat,
+            "/v1/messages": self._messages,
+            "/v1/messages/count_tokens": self._count_tokens,
             "/v1/completions": self._completions,
             "/v1/responses": self._responses,
             "/health/reset-peak": self._reset_peak,
@@ -273,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._streaming:
             self._send_error(err)
             return
-        self._sse(err.body(), "error" if self._sse_events else None)
+        self._sse(self._error_body(err), "error" if self._sse_events else None)
         if not self._sse_events:
             self._sse("[DONE]")
 
@@ -441,7 +525,11 @@ class Handler(BaseHTTPRequestHandler):
             tok, req, self.served.defaults, self.served.engine.max_context
         )
         responder = chat.ChatResponder(
-            tok, req, gen_request.tokens, reasoning_field=self.served.reasoning_field
+            tok,
+            req,
+            gen_request.tokens,
+            reasoning_field=self.served.reasoning_field,
+            fingerprint=self.served.fingerprint,
         )
         self._run(gen_request, responder, req.stream)
 
@@ -452,8 +540,34 @@ class Handler(BaseHTTPRequestHandler):
             body, self.served.model_name, self.served.defaults
         )
         gen_request = completions.to_generation_request(tok, req, self.served.defaults)
-        responder = completions.CompletionResponder(tok, req, gen_request.tokens)
+        responder = completions.CompletionResponder(
+            tok, req, gen_request.tokens, fingerprint=self.served.fingerprint
+        )
         self._run(gen_request, responder, req.stream)
+
+    def _messages(self, body: dict) -> None:
+        self._check_model(body)
+        tok = self.served.tokenizer
+        req = messages.parse_messages_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        gen_request = messages.to_generation_request(
+            tok, req, self.served.defaults, self.served.engine.max_context
+        )
+        responder = messages.MessagesResponder(
+            tok,
+            req,
+            gen_request.tokens,
+            route_thinking=self.served.reasoning_field != "none",
+        )
+        self._run(gen_request, responder, req.stream, sse_events=True)
+
+    def _count_tokens(self, body: dict) -> None:
+        self._check_model(body)
+        req = messages.parse_messages_request(
+            body, self.served.model_name, self.served.defaults
+        )
+        self._send_json(200, messages.count_tokens(self.served.tokenizer, req))
 
     def _responses(self, body: dict) -> None:
         self._check_model(body)

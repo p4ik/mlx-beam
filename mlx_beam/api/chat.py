@@ -20,12 +20,15 @@ from mlx_beam.api.errors import (
     unsupported,
 )
 from mlx_beam.api.reasoning import (
+    EFFORT_KWARGS,
     effort_candidates,
+    effort_capability,
     is_effort_rejection,
-    map_effort,
     mirror_reasoning,
+    normalise_effort,
     read_aliases,
     renderer_reasoning_keys,
+    translate_effort,
 )
 from mlx_beam.api.text import (
     TextAssembler,
@@ -269,8 +272,21 @@ def parse_chat_request(
     level, thinking = parse_thinking(aliases)
     if thinking is not None:
         template_kwargs["enable_thinking"] = thinking
+    # The effort word reaches the template in build_prompt, translated to
+    # what the loaded template takes (effort_capability), above a server
+    # default; an explicit chat_template_kwargs entry goes through as written.
     if level is not None:
-        template_kwargs["reasoning_effort"] = level
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
+        # A word asks for thinking: it beats a server default that switched
+        # it off (the request is the more specific), not the request's own
+        # enable_thinking.
+        if thinking is None:
+            template_kwargs.pop("enable_thinking", None)
+    elif "reasoning_effort" in aliases:
+        # Effort none: off, and no server-default effort word either.
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
     template_kwargs.update(object_field(body, "chat_template_kwargs"))
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
@@ -295,12 +311,13 @@ def parse_chat_request(
 
 
 def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
-    """(template level, enable_thinking) from the resolved aliases: an effort
-    of none switches thinking off, a level asks for it."""
+    """(effort word, enable_thinking) from the resolved aliases: an effort
+    of none switches thinking off, a word asks for it (and, in
+    parse_chat_request, lifts a server default that switched it off)."""
     thinking = aliases.get("enable_thinking")
     if "reasoning_effort" not in aliases:
         return None, thinking
-    level = map_effort(aliases["reasoning_effort"])
+    level = normalise_effort(aliases["reasoning_effort"])
     if level is None:
         return None, False if thinking is None else thinking
     return level, thinking
@@ -313,6 +330,16 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
+    cap = effort_capability(tokenizer)
+    effort_kwarg = cap.kwarg or "reasoning_effort"
+    if req.reasoning_effort and cap.kwarg and effort_kwarg not in kwargs:
+        # The client's word, as this template takes it: unchanged when it
+        # does not check, the nearest rung it accepts when it does; a
+        # template without the kwarg gets nothing.
+        value = translate_effort(req.reasoning_effort, cap)
+        if value is not None:
+            kwargs[effort_kwarg] = value
+            req.template_kwargs[effort_kwarg] = value
 
     def render(add_generation_prompt=True, **extra):
         return tokenizer.apply_chat_template(
@@ -322,7 +349,7 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             **{**kwargs, **extra},
         )
 
-    level = kwargs.get("reasoning_effort")
+    level = kwargs.get(effort_kwarg)
     try:
         tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
@@ -330,12 +357,15 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             raise ApiError(
                 f"the chat template rejected the messages: {e}", param="messages"
             ) from None
-        # The template knows the levels but not this name: climb the ladder
-        # and remember the rung that rendered, so every re-render agrees.
+        # The template rejects this word after all (it answers differently
+        # with tools in the context, say): climb the ladder and remember
+        # the rung that rendered, so every re-render agrees.
         tokens = None
-        for candidate in effort_candidates(level)[1:]:
+        rungs = list(effort_candidates(level)[1:])
+        rungs += [w for w in cap.levels if w not in rungs and w != level]
+        for candidate in rungs:
             try:
-                tokens = render(reasoning_effort=candidate)
+                tokens = render(**{effort_kwarg: candidate})
             except Exception as e2:  # noqa: BLE001
                 if not is_effort_rejection(e2):
                     raise ApiError(
@@ -343,20 +373,25 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
                         param="messages",
                     ) from None
                 continue
-            req.template_kwargs["reasoning_effort"] = candidate
+            req.template_kwargs[effort_kwarg] = candidate
             break
         if tokens is None:
             raise ApiError(
-                f"the chat template accepts none of the reasoning_effort levels "
-                f"{', '.join(effort_candidates(level))}: {e}",
+                f"the chat template accepts none of the {effort_kwarg} levels "
+                f"{', '.join([level, *rungs])}: {e}",
                 param="reasoning_effort",
             ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
     tokens = list(tokens)
     # The rung the ladder settled on, so this render agrees with the last.
-    settled = {k: v for k, v in req.template_kwargs.items() if k == "reasoning_effort"}
+    settled = {k: v for k, v in req.template_kwargs.items() if k == effort_kwarg}
     req.assistant_start = _assistant_start(render, tokens, settled)
+    opener = getattr(tokenizer, "answer_opener_tokens", None)
+    if opener and kwargs.get("enable_thinking") is False:
+        # A family whose template has no switch (Harmony, Muse): the answer
+        # is opened in the prompt, so the model writes it without a block.
+        tokens += list(opener)
     return tokens
 
 
@@ -501,16 +536,24 @@ def reasoning_limits(
     end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
     if not start or not end:
         return None
-    newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
-    # Closed the way the models were trained to close: a line break, the
-    # marker, a blank line.
-    close = newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+    close = getattr(tokenizer, "think_close_tokens", None)
+    if not close:
+        newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
+        # Closed the way the models were trained to close: a line break, the
+        # marker, a blank line.
+        close = (
+            newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+        )
+    label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
+    label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
     return ReasoningLimits(
         start=start,
         end=end,
         close=close,
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
+        labels=(label,) if label and label_end else (),
+        label_end=label_end if label else (),
     )
 
 
@@ -558,12 +601,16 @@ class ChatResponder:
         req: ChatRequest,
         prompt_tokens: list[int],
         reasoning_field: str = "reasoning",
+        fingerprint: str | None = None,
     ):
         if reasoning_field not in REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
         self._tokenizer = tokenizer
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        # The served configuration's id (model, version, KV layout): the
+        # same value for every answer the same set-up gives.
+        self.fingerprint = fingerprint
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self._sent_role = False
@@ -585,6 +632,7 @@ class ChatResponder:
             "object": kind,
             "created": self.created,
             "model": self.req.model,
+            "system_fingerprint": self.fingerprint,
         }
 
     def _message(self, d: TextDelta) -> dict:

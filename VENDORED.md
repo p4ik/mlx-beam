@@ -119,6 +119,37 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
 is stored quantized).
 
+`prefill valve` - `generate.py`, `BatchGenerator`: one constructor
+argument, `prefill_valve`, an object asked before every prefill call for
+the width the call may have (`width(tokens)`: the width, or None for no
+call this round) and told the width afterwards (`observe(tokens)`). The
+engine hands in `mlx_beam.engine.valve.PrefillValve`, which estimates the
+call's peak from bytes per token learned on this machine and holds it
+under min(recommended working set, held + free), cutting the width or
+stalling the round instead of letting Metal fail. `stalled_calls` counts
+the rounds held back. With the argument left out nothing changes. Tests:
+`tests/test_valve.py`.
+
+`marker families` - `tokenizer_utils.py`, `_infer_thinking`,
+`_infer_structural_markers`, `_infer_tool_parser`, `TokenizerWrapper`: two
+families next to upstream's think pairs, Gemma's channels and xtml.
+Harmony (gpt-oss: `<|channel|>` opens a label up to `<|message|>`, `analysis`
+is the reasoning, `final` the answer, a `commentary` with a `to=functions.*`
+recipient a tool call; the recipient may also precede the channel, so ` to=`
+opens a label as well) and Muse (ATEM: ` to=` after `<|start|>assistant`
+names the recipient - `self` reasons, a tool's name calls it, none answers).
+The wrapper reports the family (`think_family`), every opener
+(`think_openers`), the close a budget forces (`think_close_tokens`: the end
+marker plus the answer's opener, since neither family closes the block on
+its own), the answer's opener for a request with thinking off
+(`answer_opener_tokens`: these templates have no switch), whether the tool
+call comes through the label (`tool_call_via_label`) and the parser's name
+(`tool_parser_type`). Two parsers of ours in `tool_parsers/`: `harmony.py`
+(JSON body after the header) and `atem.py` (the `<atem:invoke>` block,
+values typed by the tool's schema). Routing by label is in
+`mlx_beam/api/text.py`. Tests: `tests/test_families.py` against the models'
+own chat templates (`tests/fixtures/templates`).
+
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
 two constructor arguments. `generation_batch` is the class built at the move
 to decoding (`PromptProcessingBatch.generate`) and for the empty batch;

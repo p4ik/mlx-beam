@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from mlx_beam._vendor.mlx_lm.generate import TextStateMachine
+from mlx_beam.api import repair
 from mlx_beam.engine.request import TokenEvent
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,31 @@ class TextDelta:
         return not (self.content or self.reasoning or self.tool_calls)
 
 
+def route_label(tokenizer, label: str) -> str:
+    """Where the text after a label goes: reasoning, normal (the answer) or
+    tool. Gemma's channels are all reasoning; Harmony's `analysis` is,
+    `final` is the answer, a `commentary` with a recipient (or a recipient
+    before the channel) a tool call; Muse's `self` is the reasoning, `user`
+    the answer, any other recipient a tool."""
+    family = getattr(tokenizer, "think_family", None)
+    label = label.strip()
+    if family == "harmony":
+        if "to=" in label or label.startswith("functions."):
+            return "tool"
+        return "reasoning" if label.startswith("analysis") else "normal"
+    if family == "muse":
+        if label == "self":
+            return "reasoning"
+        return "normal" if label in ("", "user", "assistant") else "tool"
+    return "reasoning"
+
+
 def initial_state(tokenizer, prompt_tokens: list[int]) -> tuple[str, str]:
     """A prompt that ends inside an open think block continues as reasoning -
-    or inside the opener's label, when the label's line end is still to
-    come; the second value is that open marker as the prompt carries it."""
+    or inside the opener's label, when the label's end is still to come;
+    the second value is that open marker as the prompt carries it. A label
+    already complete is routed: a prompt ending in the answer's opener
+    (thinking switched off) starts in the answer."""
     if getattr(tokenizer, "has_thinking", False):
         start = tokenizer.rfind_think_start(prompt_tokens)
         if start > tokenizer.rfind_think_end(prompt_tokens):
@@ -43,7 +65,21 @@ def initial_state(tokenizer, prompt_tokens: list[int]) -> tuple[str, str]:
             label_end = getattr(tokenizer, "think_label_end", None)
             if label_end and label_end not in opened:
                 return "label", opened
+            if label_end:
+                label = opened[len(tokenizer.think_start) :].split(label_end, 1)[0]
+                if route_label(tokenizer, label) != "reasoning":
+                    return "normal", ""
             return "reasoning", opened
+    frame = getattr(tokenizer, "frame_start", None)
+    if frame:
+        # The generation prompt of these families ends with the message's
+        # frame: what comes first is the recipient or the channel, not
+        # text - unless the prompt already opened the answer (thinking
+        # switched off appends the answer's opener).
+        opener = tuple(getattr(tokenizer, "answer_opener_tokens", None) or ())
+        if opener and tuple(prompt_tokens[-len(opener) :]) == opener:
+            return "normal", ""
+        return "frame", ""
     return "normal", ""
 
 
@@ -139,13 +175,26 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
     transitions: dict = {}
     thinking = getattr(tokenizer, "has_thinking", False)
     label_end = getattr(tokenizer, "think_label_end", None)
+    via_label = getattr(tokenizer, "tool_call_via_label", False)
+    # A family whose opener is plain text (` to=`) gets a `frame` state:
+    # entered by the marker that begins a message, left by the first
+    # structural marker after it. The textual opener counts there only -
+    # in the answer, `send(msg, to=addr)` is text.
+    frame = getattr(tokenizer, "frame_start", None)
     if thinking and label_end:
-        # A labelled opener (Gemma 4's channel): the label runs to the line
-        # end and is part of the marker, whatever tokens it comes as. The
-        # assembler finds that line end itself - the automaton reports one
-        # text per segment and only the state after it, so a line end it
-        # matched could not be told apart from the reasoning text behind it.
-        transitions.setdefault("normal", []).append((tokenizer.think_start, "label"))
+        # A labelled opener (Gemma 4's channel, Harmony's channel, Muse's
+        # recipient): the label runs to its end and is part of the marker,
+        # whatever tokens it comes as. The assembler finds that end itself
+        # - the automaton reports one text per segment and only the state
+        # after it, so an end it matched could not be told apart from the
+        # reasoning text behind it - and routes by what the label says.
+        openers = getattr(tokenizer, "think_openers", None) or (tokenizer.think_start,)
+        for opener in openers:
+            textual = not opener.startswith("<")
+            if frame:
+                transitions.setdefault("frame", []).append((opener, "label"))
+            if not (frame and textual):
+                transitions.setdefault("normal", []).append((opener, "label"))
         transitions["label"] = [(tokenizer.think_end, "normal")]
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
     elif thinking:
@@ -154,18 +203,35 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
         )
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
     if tools and getattr(tokenizer, "has_tool_calling", False):
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
-        if thinking:
-            transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+        if not via_label:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
+            if thinking:
+                transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
             [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
         )
     for w in getattr(tokenizer, "structural_markers", None) or ():
-        transitions.setdefault("normal", []).append((w, "normal"))
+        if frame and w == frame:
+            transitions.setdefault("normal", []).append((w, "frame"))
+            transitions.setdefault("frame", []).append((w, "frame"))
+        else:
+            transitions.setdefault("normal", []).append((w, "normal"))
+            if frame:
+                transitions.setdefault("frame", []).append((w, "normal"))
     for state in set(transitions) | {"normal"}:
         for w in stop_words or []:
             transitions.setdefault(state, []).append((w, None))
     return TextStateMachine(transitions or None)
+
+
+# Tool-call dialects whose call text is JSON throughout (what the text
+# repair may mend); the XML-like and Python-literal dialects keep their
+# values outside JSON quotes.
+JSON_DIALECTS = frozenset(
+    {"json_tools", "mistral", "harmony", "gemma4", "function_gemma", "kimi_k3"}
+)
 
 
 class ToolCallParser:
@@ -176,13 +242,19 @@ class ToolCallParser:
     that holds several calls without an end marker (Mistral) is cut at the
     longest prefix that parses, so the calls before a cut are kept."""
 
-    def __init__(self, tool_parser, tools, streaming: bool, start="", end=""):
+    def __init__(
+        self, tool_parser, tools, streaming: bool, start="", end="", dialect=None
+    ):
         self._parser = tool_parser
         self._tools = tools
         self._streaming = streaming
         self._start = start or ""
         self._end = end or ""
         self._idx = 0
+        # The text repair mends JSON; a dialect whose call text is XML or
+        # Python (values not in JSON quotes) would have its values changed
+        # by it, so the rung runs for the JSON dialects only.
+        self._json = dialect in JSON_DIALECTS
 
     def __call__(
         self, blocks: Iterable[tuple[str, bool]]
@@ -191,23 +263,27 @@ class ToolCallParser:
         and gets no end marker back."""
         calls: list[dict] = []
         unparsed: list[str] = []
-        for text, closed in blocks:
-            parsed = self._parse(text)
+        for block in blocks:
+            text, closed = block[0], block[1]
+            opener = block[2] if len(block) > 2 else None
+            parsed = self._parse(text, closed)
             if parsed is None and self._start and not self._end:
                 # Try the text up to each later start marker, longest first.
                 # A marker inside a JSON string is never a cut: the prefix
                 # ending inside the string does not parse.
                 for pos in self._marker_positions(text):
-                    head = self._parse(text[:pos])
+                    head = self._parse(text[:pos], closed)
                     if head is not None:
                         calls.extend(head)
-                        unparsed.append(self._raw(text[pos:], closed))
+                        unparsed.append(self._raw(text[pos:], closed, opener))
                         break
                 else:
-                    unparsed.append(self._raw(text, closed))
+                    unparsed.append(self._raw(text, closed, opener))
+                    repair.STATS["failed"] += 1
                 continue
             if parsed is None:
-                unparsed.append(self._raw(text, closed))
+                unparsed.append(self._raw(text, closed, opener))
+                repair.STATS["failed"] += 1
             else:
                 calls.extend(parsed)
         return calls, unparsed
@@ -220,27 +296,88 @@ class ToolCallParser:
             pos = text.find(self._start, pos + 1)
         return positions[::-1]
 
-    def _raw(self, text: str, closed: bool) -> str:
+    def _raw(self, text: str, closed: bool, opener: str | None = None) -> str:
         # The block's own marker is what the automaton removed; markers
-        # inside the text are the model's and stay where they are.
-        if text.startswith(self._start):
+        # inside the text are the model's and stay where they are. A label
+        # family hands back the opener the model used (`<|channel|>` or the
+        # recipient's ` to=`), not the parser's default.
+        start = opener if opener is not None else self._start
+        if text.startswith(start):
             return text + (self._end if closed else "")
-        return self._start + text + (self._end if closed else "")
+        return start + text + (self._end if closed else "")
 
-    def _parse(self, text: str) -> list[dict] | None:
+    def _read(self, text: str) -> list[dict]:
+        parsed = self._parser(text, self._tools)
+        return [dict(tc) for tc in (parsed if isinstance(parsed, list) else [parsed])]
+
+    def _parse(self, text: str, closed: bool = True) -> list[dict] | None:
+        """The repair ladder: the parser's own reading, validated against
+        the tool's schema; a reading of the mended text when the parser
+        refused; the values coerced to the declared types when the schema
+        objected. Every rung is validated again, what a rung did is the
+        call's `repair_actions`, and a call no rung makes valid is None. A
+        block the stream cut off (`closed` false) gets no mending: closing
+        its open string and brackets would make a call with truncated
+        values look valid."""
+        actions: list[str] = []
         try:
-            parsed = self._parser(text, self._tools)
-            out = []
-            for tc in parsed if isinstance(parsed, list) else [parsed]:
-                tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
-                tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-                item = {"id": tc_id, "type": "function", "function": tc}
-                out.append(item)
+            calls = self._read(text)
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
             # TypeError: a literal the parser evaluated (a set, bytes) that
             # JSON cannot carry; KeyError: a call without arguments.
-            logger.warning("tool call not parseable (%s): %r", e, text[:200])
-            return None
+            mended = repair.repair_json_text(text) if closed and self._json else text
+            if mended == text:
+                logger.warning("tool call not parseable (%s): %r", e, text[:200])
+                return None
+            try:
+                calls = self._read(mended)
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e2:
+                logger.warning("tool call not parseable (%s): %r", e2, text[:200])
+                return None
+            actions.append("json repaired")
+        out = []
+        for tc in calls:
+            if "arguments" not in tc or "name" not in tc:
+                return None
+            args = tc["arguments"]
+            own = list(actions)
+            schema = repair.schema_for(self._tools, tc["name"])
+            if schema is None and repair.declared_names(self._tools):
+                # A tool the request never declared: the model's text, not a
+                # call the client could run.
+                logger.warning("tool call to an undeclared tool %r", tc["name"])
+                return None
+            if schema is not None:
+                problems = repair.validate(args, schema)
+                if problems and isinstance(args, dict):
+                    args, coerced = repair.coerce(args, schema)
+                    own += coerced
+                    problems = repair.validate(args, schema)
+                if problems:
+                    logger.warning(
+                        "tool call %s fails its schema (%s): %r",
+                        tc["name"],
+                        "; ".join(problems),
+                        text[:200],
+                    )
+                    return None
+            tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
+            try:
+                tc["arguments"] = json.dumps(args, ensure_ascii=False)
+            except TypeError as e:
+                # A literal the parser evaluated (a set, bytes) JSON cannot carry.
+                logger.warning("tool call not parseable (%s): %r", e, text[:200])
+                return None
+            item = {"id": tc_id, "type": "function", "function": tc}
+            if own:
+                item["repair_actions"] = own
+            out.append(item)
+        rung = (
+            "coerced"
+            if any(len(i.get("repair_actions", ())) > len(actions) for i in out)
+            else ("repaired" if actions else "strict")
+        )
+        repair.STATS[rung] += 1
         if self._streaming:
             for item in out:
                 item["index"] = self._idx
@@ -261,6 +398,7 @@ class TextAssembler:
         tools_enabled: bool = True,
         lead: bool = True,
     ):
+        self._tokenizer = tokenizer
         self._detok = tokenizer.detokenizer
         # The automaton always runs, so reasoning is counted in every mode;
         # routing off puts the markers back into the text where they were cut.
@@ -272,15 +410,21 @@ class TextAssembler:
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
         self._label_end = getattr(tokenizer, "think_label_end", None) or ""
-        # The opener's label so far, until its line end shows up.
+        # The opener's label so far, until its line end shows up, and how
+        # many tokens it took (they count as reasoning only if it opens one).
         self._label = seeded[len(self._think_start) :] if start == "label" else ""
+        self._label_tokens = 0
         # A think block the template opened: with routing off the client
         # sees its opener once, up front - not for a raw prompt the client
         # wrote itself (completions), where the opener is already theirs.
         self._lead = seeded if lead and not route_thinking else ""
         self._tool_text = ""
         # (text, closed): a block still open when the stream ended was cut.
-        self._pending_tools: list[tuple[str, bool]] = []
+        self._pending_tools: list[tuple[str, bool, str | None]] = []
+        # The opener of a label that turned out a tool call (Harmony's
+        # channel or recipient): what an unparsable call is handed back with.
+        self._label_opener: str | None = None
+        self._tool_opener: str | None = None
         self._made_tool_call = False
         # A fragment the detokenizer held when the forced close began.
         self._fragment = False
@@ -297,13 +441,18 @@ class TextAssembler:
             streaming,
             start=getattr(tokenizer, "tool_call_start", None),
             end=getattr(tokenizer, "tool_call_end", None),
+            dialect=getattr(tokenizer, "tool_parser_type", None),
         )
         self.tokens = 0
         # Events since the last chunk went out, each with whether its text
         # went to the content; the responder drains them for logprobs.
         self.pending_events: list[tuple[TokenEvent, bool]] = []
-        # True once a text-level stop word ended the stream early.
+        # True once a text-level stop word ended the stream early, and
+        # which word it was (the longest that fits the text's tail).
         self.stopped = False
+        self.stopped_word: str | None = None
+        self._stop_words = sorted(stop_words or [], key=len, reverse=True)
+        self._tail = ""
         self.reasoning_tokens = 0
         # From the engine's last event: which limit cut what.
         self.thinking_truncated = False
@@ -329,6 +478,7 @@ class TextAssembler:
                 self._detok.add_token(event.token)
             self._detok.finalize()
             segment = self._detok.last_segment
+            self._tail = self._tail[-self._tail_len() :] + segment
             self._state, clean, current = TextStateMachine.step(self._state, segment)
             if current is not None:
                 self._state, flushed, current = TextStateMachine.flush(self._state)
@@ -344,6 +494,7 @@ class TextAssembler:
             if event.finish_reason == "length":
                 self._detok.finalize()
             segment = self._detok.last_segment
+            self._tail = self._tail[-self._tail_len() :] + segment
             self._state, clean, current = TextStateMachine.step(self._state, segment)
             if event.forced and self._fragment:
                 clean = clean.replace("\ufffd", "", 1)
@@ -358,6 +509,12 @@ class TextAssembler:
             # A stop word matched in the text: what came before it is the
             # last of the output, whatever state we were in - except a
             # label, which is the opener's and never text.
+            # The match ended inside the last segment; the tail keeps the
+            # longest stop word's worth of text before it, so the word that
+            # matched is in there whole (the longest that is, when nested).
+            self.stopped_word = next(
+                (w for w in self._stop_words if w in self._tail), None
+            )
             if self._prev == "reasoning" and self._route:
                 delta.reasoning = clean
             elif self._prev == "label" and self._route:
@@ -371,7 +528,7 @@ class TextAssembler:
             self._prev = "normal"
             delta.finish_reason = "stop"
             if self._tool_text:
-                self._pending_tools.append((self._tool_text, False))
+                self._pending_tools.append((self._tool_text, False, self._tool_opener))
                 self._tool_text = ""
             self._flush_tools(delta)
             if self._made_tool_call:
@@ -381,19 +538,49 @@ class TextAssembler:
             # The label is the opener's, not text; with routing off the
             # client gets the block as the model wrote it, label included.
             self.reasoning_tokens += 1
+            shown = ""
             if not self._route:
+                # With routing off the block goes out as the model wrote
+                # it, label and opener included - unless the label turns
+                # out a tool call, which is parsed, not shown.
                 opened = self._think_start if self._prev != "label" else ""
-                delta.content = (self._take_lead() or opened) + clean
+                shown = (self._take_lead() or opened) + clean
+                delta.content = shown
             if self._prev != "label":
                 self._label = ""
+                self._label_tokens = 0
+                # Which opener it was (the segment carried it): a call that
+                # does not parse is handed back behind the same one.
+                openers = getattr(self._tokenizer, "think_openers", None) or ()
+                self._label_opener = next((o for o in openers if o in segment), None)
+            self._label_tokens += 1
+            label = self._label
             rest = self._after_label(clean)
             if rest is not None:
-                # The line end may arrive in one segment with the label, or
-                # with the first reasoning text: what follows it is reasoning.
-                self._state = self._enter("reasoning")
-                current = "reasoning"
-                if self._route:
-                    delta.reasoning = rest
+                # The label's end may arrive in one segment with the label,
+                # or with the first text behind it: that text goes where
+                # the label says - reasoning, the answer, or a tool call
+                # (the header stays with the call's text for the parser).
+                label = (label + clean).split(self._label_end, 1)[0]
+                target = route_label(self._tokenizer, label)
+                if target == "tool" and "tool" not in self._state[2]:
+                    target = "normal"  # tools off: the model's text as is
+                self._state = self._enter(target)
+                current = target
+                if target == "reasoning":
+                    if self._route:
+                        delta.reasoning = rest
+                elif target == "tool":
+                    self.reasoning_tokens -= self._label_tokens
+                    self._tool_text = label + self._label_end + rest
+                    self._tool_opener = self._label_opener
+                    if shown:
+                        delta.content = delta.content[: -len(shown)]
+                else:
+                    # The label opened the answer: its tokens were no reasoning.
+                    self.reasoning_tokens -= self._label_tokens
+                    if not shown:  # with routing off `clean` already holds it
+                        delta.content += rest
         elif current == "reasoning":
             self.reasoning_tokens += 1
             if self._route:
@@ -405,8 +592,14 @@ class TextAssembler:
             self._tool_text += clean
         else:
             if self._prev == "tool":
-                self._pending_tools.append((self._tool_text, True))
+                # The end marker may sit inside a text segment (ATEM's is
+                # plain text): what the automaton released with it is the
+                # call's last text, not the answer's.
+                self._pending_tools.append(
+                    (self._tool_text + clean, True, self._tool_opener)
+                )
                 self._tool_text = ""
+                clean = ""
             closed = ""
             if self._prev in ("reasoning", "label") and not self._route:
                 # A block the prompt opened may close on the first token.
@@ -426,7 +619,7 @@ class TextAssembler:
 
         if event.finish_reason is not None:
             if current == "tool" and self._tool_text:
-                self._pending_tools.append((self._tool_text, False))
+                self._pending_tools.append((self._tool_text, False, self._tool_opener))
                 self._tool_text = ""
             delta.finish_reason = event.finish_reason
 
@@ -471,6 +664,9 @@ class TextAssembler:
             self.pending_events.append((held, content))
         self._held = []
         self.pending_events.append((event, content if own is None else own))
+
+    def _tail_len(self) -> int:
+        return max((len(w) for w in self._stop_words), default=0)
 
     def _take_lead(self) -> str:
         lead, self._lead = self._lead, ""

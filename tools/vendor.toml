@@ -19,7 +19,7 @@ include = [
   "chat_templates",
 ]
 # Files under dest that are ours, not upstream's (never diffed).
-local = ["__init__.py", "LICENSE"]
+local = ["__init__.py", "LICENSE", "tool_parsers/harmony.py", "tool_parsers/atem.py"]
 # Upstream files we changed on purpose; a diff anywhere else is an error.
 modified = [
   "generate.py",

@@ -5,10 +5,14 @@ import pytest
 from mlx_beam.api import chat, responses
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import (
-    map_effort,
+    EffortCapability,
+    effort_capability,
     mirror_reasoning,
+    normalise_effort,
+    probe_effort,
     read_aliases,
     renderer_reasoning_keys,
+    translate_effort,
 )
 from tests.stub_tokenizer import StubTokenizer
 
@@ -36,15 +40,66 @@ def test_aliases_resolve_and_the_explicit_name_wins():
     }
 
 
-def test_effort_table():
-    assert map_effort(None) is None
-    assert map_effort("none") is None and map_effort("off") is None
-    assert map_effort("minimal") == "low" and map_effort("LOW") == "low"
-    assert map_effort("medium") == "medium"
-    assert all(map_effort(e) == "xhigh" for e in ("high", "xhigh", "max", "ultra"))
+def test_effort_words():
+    assert normalise_effort(None) is None
+    assert normalise_effort("none") is None and normalise_effort("off") is None
+    # The client's word stays its word; what the template makes of it is
+    # decided against the template (translate_effort).
+    assert normalise_effort("minimal") == "minimal" and normalise_effort("LOW") == "low"
+    assert normalise_effort("ultra") == "ultra" and normalise_effort(True) == "xhigh"
     with pytest.raises(ApiError) as exc:
-        map_effort("turbo")
+        normalise_effort("turbo")
     assert exc.value.param == "reasoning_effort"
+
+
+def test_a_token_budget_kwarg_takes_no_effort_word():
+    # Seed-OSS reads `thinking_budget`, a count: the probe reports it and
+    # the client's word is not handed to it.
+    cap = EffortCapability("template", "thinking_budget", False)
+    assert not cap.takes_words and cap.describe()["takes"] == "tokens"
+    assert translate_effort("high", cap) is None
+
+
+def test_translation_follows_what_the_template_accepts():
+    checks = EffortCapability(
+        "template", "reasoning_effort", True, ("low", "medium", "xhigh", "high")
+    )
+    assert translate_effort("high", checks) == "high"
+    assert translate_effort("max", checks) == "xhigh"
+    assert translate_effort("ultra", checks) == "xhigh"
+    assert translate_effort("minimal", checks) == "low"
+    passes = EffortCapability("template", "reasoning_strength", False)
+    assert translate_effort("max", passes) == "max"
+    assert translate_effort("minimal", passes) == "minimal"
+    assert translate_effort("high", EffortCapability("none")) is None
+    only_high = EffortCapability("template", "reasoning_effort", True, ("high",))
+    assert translate_effort("minimal", only_high) == "high"
+    assert translate_effort("max", only_high) == "high"
+
+
+def test_probe_reads_the_kwarg_and_measures_the_set():
+    tok = StubTokenizer()
+    tok.chat_template = "{{ message.content }}"
+    assert probe_effort(tok).describe() == {"source": "none"}
+
+    class Passes(StubTokenizer):
+        chat_template = "Reasoning strength: {{ reasoning_strength }}"
+
+        def apply_chat_template(self, messages, reasoning_strength=None, **kw):
+            return super().apply_chat_template(messages, **kw)
+
+    cap = probe_effort(Passes())
+    assert cap.describe() == {
+        "source": "template",
+        "kwarg": "reasoning_strength",
+        "validates": False,
+    }
+
+    class Budget(StubTokenizer):
+        chat_template = "{% if thinking_budget %}{{ thinking_budget }}{% endif %}"
+
+    cap = probe_effort(Budget())
+    assert cap.kwarg == "thinking_budget" and not cap.validates and not cap.levels
 
 
 def test_parsed_request_carries_level_switch_and_limits():
@@ -54,8 +109,10 @@ def test_parsed_request_carries_level_switch_and_limits():
     req = chat.parse_chat_request(
         {"messages": MSGS, "reasoning": {"effort": "high", "max_tokens": 40}}, "m"
     )
-    assert req.reasoning_effort == "xhigh" and req.max_reasoning_tokens == 40
-    assert req.template_kwargs == {"reasoning_effort": "xhigh"}
+    assert req.reasoning_effort == "high" and req.max_reasoning_tokens == 40
+    # The template's kwarg is set when the prompt is built, against what
+    # the template takes; nothing is decided at parse time.
+    assert req.template_kwargs == {}
     req = chat.parse_chat_request(
         {
             "messages": MSGS,
@@ -74,13 +131,14 @@ def test_parsed_request_carries_level_switch_and_limits():
     r = responses.parse_responses_request(
         {"input": "w1", "reasoning": {"effort": "minimal", "max_tokens": 9}}, "m"
     )
-    assert r.chat.reasoning_effort == "low" and r.chat.max_reasoning_tokens == 9
+    assert r.chat.reasoning_effort == "minimal" and r.chat.max_reasoning_tokens == 9
 
 
 class LevelTokenizer(StubTokenizer):
     """A template that knows two levels and rejects the rest, Qwen-style."""
 
     accepted = ("medium", "xhigh")
+    chat_template = "{{ reasoning_effort }} {{ message.reasoning_content }}"
 
     def __init__(self):
         super().__init__()
@@ -93,19 +151,37 @@ class LevelTokenizer(StubTokenizer):
         return super().apply_chat_template(messages, **kw)
 
 
-def test_effort_ladder_climbs_only_on_an_effort_rejection():
+def test_a_checking_template_gets_the_nearest_rung_it_accepts():
     tok = LevelTokenizer()
+    cap = effort_capability(tok)
+    assert cap.validates and cap.levels == ("medium", "xhigh")
+    tok.seen.clear()
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
     chat.build_prompt(tok, req)
-    # The ladder: low refused, minimal refused, medium rendered; every
-    # render after that (the assistant-start probe) uses the rung found.
-    assert tok.seen[:3] == ["low", "minimal", "medium"]
-    assert set(tok.seen[3:]) <= {"medium"}
-    # The rung that rendered is kept, so the boundary renders agree.
+    # No ladder: the probe knew the set, `low` went up to `medium` at once;
+    # every render after that (the assistant-start probe) uses that rung.
+    assert set(tok.seen) == {"medium"}
     assert req.template_kwargs["reasoning_effort"] == "medium"
     tok.seen.clear()
     chat.to_generation_request(tok, req)
     assert set(tok.seen) == {"medium"}
+    req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "max"}, "m")
+    tok.seen.clear()
+    chat.build_prompt(tok, req)
+    assert set(tok.seen) == {"xhigh"}
+
+
+def test_effort_ladder_climbs_only_on_an_effort_rejection():
+    # The template rejects at request time what it took at load (tools in
+    # the context, say): the ladder climbs from the translated rung.
+    tok = LevelTokenizer()
+    effort_capability(tok)
+    tok.accepted = ("xhigh",)
+    tok.seen.clear()
+    req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
+    chat.build_prompt(tok, req)
+    assert tok.seen[0] == "medium" and tok.seen[-1] == "xhigh"
+    assert req.template_kwargs["reasoning_effort"] == "xhigh"
     tok = LevelTokenizer()
     tok.accepted = ()
     with pytest.raises(ApiError) as exc:
@@ -115,7 +191,7 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
                 {"messages": MSGS, "reasoning_effort": "high"}, "m"
             ),
         )
-    assert exc.value.param == "reasoning_effort" and "xhigh, max, high" in str(
+    assert exc.value.param == "reasoning_effort" and "high, xhigh, medium" in str(
         exc.value
     )
 
@@ -220,10 +296,30 @@ def test_mirroring_fills_only_the_keys_the_renderer_reads_and_the_client_left():
             {"reasoning_effort": "none"},
             {"enable_thinking": False},
         ),
+        # The request's effort replaces the server's; it reaches the template
+        # in build_prompt, translated - nothing sits in the kwargs yet.
         (
             {"reasoning_effort": "low"},
             {"reasoning_effort": "high"},
-            {"reasoning_effort": "xhigh"},
+            {},
+        ),
+        # A word lifts a server default that switched thinking off; the
+        # request's own enable_thinking stays what it said.
+        (
+            {"enable_thinking": False},
+            {"reasoning_effort": "high"},
+            {},
+        ),
+        (
+            {"enable_thinking": False},
+            {"reasoning_effort": "high", "enable_thinking": False},
+            {"enable_thinking": False},
+        ),
+        # Effort none clears a server effort word as well.
+        (
+            {"reasoning_effort": "low"},
+            {"reasoning_effort": "none"},
+            {"enable_thinking": False},
         ),
         ({"lang": "de"}, {}, {"lang": "de"}),
     ],
