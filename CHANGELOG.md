@@ -122,15 +122,23 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   is fetched). What serves the images is a separate package found
   through the entry-point group `mlx_beam.modalities`; without one the
   core answers image input with a 400 naming the `vision` extra, as
-  before. `/health.vision` and `capabilities.vision` say what was found.
+  before. A frontend states what it needs of the text model (input
+  embeddings; the layer hook for per-layer extras), read from the model
+  at load: a frontend the model cannot serve is refused and
+  `/health.vision` says why, and an image request the model cannot serve
+  is a 400, never a dead worker. `/health.vision` and
+  `capabilities.vision` say what was found.
 - `mlx-beam-vision`, the first package beside the core
   (`packages/mlx-beam-vision`, its own project on PyPI, installed by
   `mlx-beam[vision]`): five tower families vendored from mlx-vlm (MIT) -
   Qwen3-VL (which Qwen3.5 and Qwen3.8 carry unchanged, DeepStack
   included), Pixtral for Mistral 3 (an image's rows as separate spans),
   Gemma 4 (image), Muse Glimmer, Granite Vision 4.1 (AnyRes tiles, window
-  Q-Former projectors adding features ahead of their text layers) - each
-  with its projector after the reference implementation; the checkpoint's own processor through
+  Q-Former projectors adding features ahead of their text layers; its
+  checkpoints load as text through a `granite4_vision` model class, the
+  dense or the Mamba-2 hybrid text model by the config) - each with its
+  projector after the reference implementation; the checkpoint's own
+  processor through
   transformers renders the template and expands the placeholders; the
   tower's tensors come from the checkpoint's index (a package's own
   vision file included); encoder outputs are cached by image digest,
