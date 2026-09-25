@@ -608,7 +608,9 @@ def test_an_image_path_climbs_the_effort_ladder_and_reports_the_processor():
                 ],
             }
         ],
-        "reasoning_effort": "max",
+        # As a template kwarg: goes through as written, whatever the
+        # template's measured effort capability says.
+        "chat_template_kwargs": {"reasoning_effort": "xhigh"},
     }
     req = chat.parse_chat_request(body, "m", vision=True)
     tokens = chat.build_prompt(tok, req, Picky(tok))
