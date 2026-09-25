@@ -7,8 +7,8 @@ from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import (
     EffortCapability,
     effort_capability,
-    map_effort,
     mirror_reasoning,
+    normalise_effort,
     probe_effort,
     read_aliases,
     renderer_reasoning_keys,
@@ -41,15 +41,23 @@ def test_aliases_resolve_and_the_explicit_name_wins():
 
 
 def test_effort_words():
-    assert map_effort(None) is None
-    assert map_effort("none") is None and map_effort("off") is None
+    assert normalise_effort(None) is None
+    assert normalise_effort("none") is None and normalise_effort("off") is None
     # The client's word stays its word; what the template makes of it is
     # decided against the template (translate_effort).
-    assert map_effort("minimal") == "minimal" and map_effort("LOW") == "low"
-    assert map_effort("ultra") == "ultra" and map_effort(True) == "xhigh"
+    assert normalise_effort("minimal") == "minimal" and normalise_effort("LOW") == "low"
+    assert normalise_effort("ultra") == "ultra" and normalise_effort(True) == "xhigh"
     with pytest.raises(ApiError) as exc:
-        map_effort("turbo")
+        normalise_effort("turbo")
     assert exc.value.param == "reasoning_effort"
+
+
+def test_a_token_budget_kwarg_takes_no_effort_word():
+    # Seed-OSS reads `thinking_budget`, a count: the probe reports it and
+    # the client's word is not handed to it.
+    cap = EffortCapability("template", "thinking_budget", False)
+    assert not cap.takes_words and cap.describe()["takes"] == "tokens"
+    assert translate_effort("high", cap) is None
 
 
 def test_translation_follows_what_the_template_accepts():
@@ -293,6 +301,24 @@ def test_mirroring_fills_only_the_keys_the_renderer_reads_and_the_client_left():
             {"reasoning_effort": "low"},
             {"reasoning_effort": "high"},
             {},
+        ),
+        # A word lifts a server default that switched thinking off; the
+        # request's own enable_thinking stays what it said.
+        (
+            {"enable_thinking": False},
+            {"reasoning_effort": "high"},
+            {},
+        ),
+        (
+            {"enable_thinking": False},
+            {"reasoning_effort": "high", "enable_thinking": False},
+            {"enable_thinking": False},
+        ),
+        # Effort none clears a server effort word as well.
+        (
+            {"reasoning_effort": "low"},
+            {"reasoning_effort": "none"},
+            {"enable_thinking": False},
         ),
         ({"lang": "de"}, {}, {"lang": "de"}),
     ],

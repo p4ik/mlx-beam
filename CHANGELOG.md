@@ -17,8 +17,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   A thinking budget closes the block the way these families do - by
   opening the answer - and forces the whole sequence; `enable_thinking:
   false` opens the answer in the prompt, since their templates have no
-  switch. `/health.reasoning` names the family and its markers,
-  `/health.tools` the parser.
+  switch. A recipient marker (` to=`) is read only where the family puts
+  one - right after `<|start|>assistant` - so the same characters inside
+  an answer stay text. `/health.reasoning` names the family and its
+  markers, `/health.tools` the parser.
 - The reasoning effort follows what the loaded template does with it,
   measured at load: the kwarg it reads (`reasoning_effort`,
   `reasoning_strength`, ...), whether it checks the word, and the set it
@@ -26,8 +28,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `capabilities.effort` in `/v1/models`. A template that checks gets the
   client's word when it is in the set, else the nearest rung it accepts;
   one that takes the word unchecked gets it as sent (the vocabulary such
-  models were trained on); one without the kwarg gets nothing. Before,
-  every word was mapped onto one template's three names.
+  models were trained on); one without the kwarg gets nothing, and one
+  whose kwarg takes a number (a token budget) gets no word either
+  (`capabilities.effort.takes: tokens`). Before, every word was mapped
+  onto one template's three names.
 - Anthropic's Messages API: `/v1/messages` (system field, content blocks
   with text, thinking, tool_use and tool_result, tools with
   `input_schema`, `tool_choice` auto or none, `stop_sequences`,
@@ -37,9 +41,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   (`message_start`, per block start / delta / stop, `message_delta`,
   `message_stop`, `ping`), errors in Anthropic's envelope; and
   `/v1/messages/count_tokens`. Tool arguments go out in one
-  `input_json_delta` when the call closes. A `cache_control` marker is
-  accepted on a message's last block (a checkpoint boundary) and refused
-  elsewhere, never dropped in silence.
+  `input_json_delta` when the call closes. A `cache_control` marker on
+  any block is accepted and does nothing: the prefix store caches every
+  turn by itself, and a client that marks blocks is not refused for it.
+  `input_tokens` in the usage counts what was prefilled, the cached part
+  excluded, so the two add up to the prompt. A `stop_sequence` stop
+  reason names the sequence that ended the text.
 - A repair ladder for tool calls: the parser's own reading, validated
   against the tool's declared schema; when the parser refuses, a reading
   of the text with the usual defects of model JSON mended (a code fence,
@@ -49,8 +56,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   declared type written another way ("42" for an integer, "true" for a
   boolean, a JSON text for an object). Every rung is validated again,
   nothing is invented, what a rung did is the call's `repair_actions`,
-  and a call no rung makes valid still comes back as text.
-  `/health.tools.repairs` counts the rungs.
+  and a call no rung makes valid still comes back as text. The mending
+  applies to parsers that read JSON and to blocks the model closed: a
+  block cut off by `max_tokens` is not completed into a call the model
+  never made. A call to a tool the request did not declare is text, not
+  a call. `/health.tools.repairs` counts the rungs.
 - `/metrics` in Prometheus' text format from the same counters `/health`
   reports (`mlx_beam_*`: requests, tokens, seconds, memory, the prefix
   store, tool-call rungs, the speculator), plus the four `vllm:` names
@@ -69,9 +79,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   that would not fit is cut to the width that does (on a grid of 64
   tokens); below the narrowest width the round prefills nobody and
   decoding goes on, instead of Metal failing with an error nothing can
-  catch. `/health.prefill_valve` reports the estimate, the ceiling, the
-  calls cut and the rounds stalled. Thresholds and the estimate's
-  accuracy are to be measured on the Mac.
+  catch. A stall that cannot end by itself - nothing decodes, so nothing
+  will free memory - first evicts the prefix store one entry at a time,
+  then refuses the widest waiting prompt with a 400 (it does not fit
+  beside what runs) instead of holding every prompt behind it for ever.
+  `/health.prefill_valve` reports the estimate, the ceiling, the calls
+  cut, the rounds stalled and the prompts refused. Thresholds and the
+  estimate's accuracy are to be measured on the Mac.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is
@@ -91,6 +105,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ### Changed
 - The `forced` flag of a token now covers the whole forced close, the part
   after the end marker included (a line break, or the answer's opener).
+- The thinking budget of a label family (Harmony, Muse) counts from the
+  label, not the opener: `<|start|>assistant<|channel|>final` is the
+  answer, and only a label the family names as reasoning starts the
+  budget.
+- A request's `reasoning_effort` word lifts a server-side
+  `enable_thinking: false` when the request says nothing about thinking
+  itself (the client asked for effort, so it wants the reasoning);
+  `reasoning_effort: null` in a request clears the server's default word.
+  Where a request and a server default disagree, the request wins.
+- `/metrics` writes a metric's `# HELP` and `# TYPE` once, before its
+  first sample, as the exposition format requires; a metric with a
+  label per value used to repeat the pair, which its readers reject.
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing

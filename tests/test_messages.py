@@ -8,6 +8,7 @@ import pytest
 
 from mlx_beam.api import messages
 from mlx_beam.api.errors import ApiError
+from mlx_beam.engine.request import TokenEvent
 from tests.stub_tokenizer import (
     THINK_END,
     THINK_START,
@@ -23,7 +24,9 @@ TOOLS = [
         "name": "lookup",
         "description": "look something up",
         "input_schema": {"type": "object", "properties": {"words": {"type": "string"}}},
-    }
+    },
+    # What the stub parser names a call after its first word.
+    {"name": "w20", "input_schema": {"type": "object"}},
 ]
 
 
@@ -98,32 +101,34 @@ def test_request_blocks_become_messages_and_tools_map():
     assert c.messages[3] == {"role": "tool", "tool_call_id": "toolu_1", "content": "w4"}
     assert c.messages[4]["content"] == "w5"
     assert c.tools[0]["function"]["parameters"] == TOOLS[0]["input_schema"]
-    assert req.cache_marks == ["system[0]", "messages[2].content[1]"]
-    assert req.metadata == {"user_id": "u"}
+    # cache_control and metadata are accepted and ignored: the store
+    # caches at every boundary by itself, nothing is keyed on a client's id.
 
 
 def test_refusals_are_explicit():
     base = {"max_tokens": 4, "messages": [{"role": "user", "content": "w1"}]}
-    with pytest.raises(ApiError, match="cache_control sits on a block inside"):
-        messages.parse_messages_request(
-            {
-                **base,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "a",
-                                "cache_control": {"type": "ephemeral"},
-                            },
-                            {"type": "text", "text": "b"},
-                        ],
-                    }
-                ],
-            },
-            "m",
-        )
+    # cache_control on any block is fine (Claude Code marks blocks inside
+    # a message): accepted, not a refusal.
+    req = messages.parse_messages_request(
+        {
+            **base,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "a",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {"type": "text", "text": "b"},
+                    ],
+                }
+            ],
+        },
+        "m",
+    )
+    assert req.chat.messages[-1]["content"] == "ab"
     with pytest.raises(ApiError) as exc:
         messages.parse_messages_request({**base, "tool_choice": {"type": "any"}}, "m")
     assert exc.value.code == "unsupported"
@@ -206,8 +211,9 @@ def test_blocks_in_order_and_the_stream_events():
             "m",
         ),
     ).tokens
+    # Anthropic's input_tokens exclude what the cache served.
     assert final["usage"] == {
-        "input_tokens": len(prompt),
+        "input_tokens": len(prompt) - 3,
         "output_tokens": 10,
         "cache_read_input_tokens": 3,
         "cache_creation_input_tokens": 0,
@@ -244,3 +250,21 @@ def test_endpoints_and_the_error_envelope(server):  # noqa: F811
     }
     status, _, raw = call(server, "POST", "/v1/messages", {**body, "model": "other"})
     assert status == 404 and json.loads(raw)["error"]["type"] == "not_found_error"
+
+
+def test_stop_sequences_end_the_text_and_name_the_sequence():
+    tok = StubTokenizer()
+    req = messages.parse_messages_request(
+        {
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "w1"}],
+            "stop_sequences": ["w11"],
+        },
+        "m",
+    )
+    assert req.chat.stop == ["w11"]
+    responder = messages.MessagesResponder(tok, req, [1])
+    ev = [TokenEvent(10, -0.1), TokenEvent(11, -0.1), TokenEvent(12, -0.1)]
+    final = responder.complete(iter(ev), 0)
+    assert final["stop_reason"] == "stop_sequence" and final["stop_sequence"] == "w11"
+    assert final["content"] == [{"type": "text", "text": "w10 "}]

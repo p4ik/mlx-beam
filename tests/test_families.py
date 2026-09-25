@@ -127,6 +127,9 @@ def test_harmony_is_inferred_from_vocab_and_template():
     assert t.answer_opener_tokens == tuple(
         t._tokenizer.encode("<|channel|>final<|message|>")
     )
+    assert t.frame_start == "<|start|>assistant"
+    assert t.reasoning_label_tokens == tuple(t._tokenizer.encode("analysis"))
+    assert t.think_label_end_tokens == tuple(t._tokenizer.encode("<|message|>"))
 
 
 def test_muse_is_inferred_from_vocab_and_template():
@@ -136,6 +139,8 @@ def test_muse_is_inferred_from_vocab_and_template():
     assert t.think_label_end == "<|message|>" and t.think_openers == (" to=",)
     assert t.tool_call_via_label and t.tool_call_end == "</atem:function_calls>"
     assert t.answer_opener_tokens == tuple(t._tokenizer.encode("<|message|>"))
+    assert t.frame_start == "<|start|>assistant"
+    assert t.reasoning_label_tokens == tuple(t._tokenizer.encode("self"))
 
 
 # -- the stream ---------------------------------------------------------------
@@ -164,6 +169,8 @@ class ScriptTokenizer:
             "tool_call_via_label",
             "tool_parser",
             "structural_markers",
+            "frame_start",
+            "answer_opener_tokens",
         ):
             setattr(self, name, getattr(wrapped, name))
         self.eos_token_ids = set()
@@ -363,3 +370,28 @@ def test_effort_is_passed_through_by_templates_that_do_not_check():
         assert req.template_kwargs[kwarg] == "max"
         text = tok.apply_chat_template(messages, tokenize=False, **req.template_kwargs)
         assert line in text
+
+
+def test_a_recipient_marker_inside_the_answer_is_text():
+    """` to=` opens a label only at the message's frame - right after
+    `<|start|>assistant` - where the recipient goes. In the answer it is
+    what the model wrote (`send(msg, to=addr)`), not a label that swallows
+    the rest of the reply."""
+    pieces = [
+        "<|channel|>", "final", "<|message|>", "Use send(msg,", " to=", "addr)",
+        " and go.",
+    ]  # fmt: skip
+    content, reasoning, calls, _ = run(ScriptTokenizer(HARMONY, pieces), pieces)
+    assert content == "Use send(msg, to=addr) and go." and reasoning == "" and not calls
+    pieces = [
+        " to=", "user", "<|message|>", "Call send(x,", " to=", "y).",
+    ]  # fmt: skip
+    content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces)
+    assert content == "Call send(x, to=y)." and reasoning == "" and not calls
+    # At the frame the same text is the recipient, as before.
+    pieces = [
+        " to=", "self", "<|message|>", "think", "<|eom|>", "<|start|>", "assistant",
+        "<|message|>", "answer", " to=", "x",
+    ]  # fmt: skip
+    content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces)
+    assert reasoning == "think" and content == "answer to=x"

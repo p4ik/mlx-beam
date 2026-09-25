@@ -25,15 +25,16 @@ SCHEMA = {
 TOOLS = [{"type": "function", "function": {"name": "weather", "parameters": SCHEMA}}]
 
 
-def parse(text, tools=TOOLS):
+def parse(text, tools=TOOLS, closed=True, dialect="json_tools"):
     p = ToolCallParser(
         json_tools.parse_tool_call,
         tools,
         streaming=False,
         start="<tool_call>",
         end="</tool_call>",
+        dialect=dialect,
     )
-    calls, unparsed = p([(text, True)])
+    calls, unparsed = p([(text, closed)])
     return calls, unparsed
 
 
@@ -94,8 +95,12 @@ def test_what_the_schema_still_rejects_comes_back_as_text():
     )
     assert not calls and unparsed
     assert repair.STATS["failed"] == before + 3
-    # A tool the request did not declare: the parser's reading, unvalidated.
+    # A tool the request did not declare is text, not a call the client
+    # could run - unless the request declared no names at all (then the
+    # parser's reading stands, unvalidated).
     calls, unparsed = parse('{"name": "other", "arguments": {"z": 1}}')
+    assert not calls and unparsed
+    calls, unparsed = parse('{"name": "other", "arguments": {"z": 1}}', tools=[])
     assert calls and not unparsed
 
 
@@ -123,3 +128,41 @@ def test_a_repair_leaves_string_contents_alone(value):
     assert json.loads(calls[0]["function"]["arguments"])["city"] == value
     assert repair.repair_json_text('{"a": "unterminated') == '{"a": "unterminated"}'
     assert repair.repair_json_text('{"a": "') == '{"a": ""}'
+
+
+def test_a_call_the_stream_cut_off_is_not_mended_into_a_valid_one():
+    """max_tokens ended the block inside a string: closing it would hand
+    the tool a truncated value as if it were what the model meant. The
+    block comes back as text, with no end marker."""
+    cut = '{"name": "weather", "arguments": {"city": "Os'
+    calls, unparsed = parse(cut, closed=False)
+    assert not calls and unparsed == ["<tool_call>" + cut]
+    # The same text closed by the model is mended as before.
+    calls, unparsed = parse(cut + '"}', closed=True)
+    assert calls and json.loads(calls[0]["function"]["arguments"]) == {"city": "Os"}
+
+
+def test_the_text_repair_runs_for_json_dialects_only():
+    # An XML-like dialect keeps its values outside JSON quotes; the
+    # literal and comma rewrites would change them.
+    calls, unparsed = parse(
+        '{"name": "weather", "arguments": {"city": "Oslo"},}', dialect="qwen3_coder"
+    )
+    assert not calls and unparsed
+
+
+def test_boolean_subschemas_and_null_for_an_array():
+    """JSON Schema lets a property's schema be `true`; that is not a 500.
+    And null is not turned into `[null]` for an array."""
+    schema = {"type": "object", "properties": {"x": True, "y": {"type": "array"}}}
+    assert repair.validate({"x": 1, "y": []}, schema) == []
+    assert repair.validate({"y": None}, schema) == ["'y' is not array"]
+    args, actions = repair.coerce({"y": None, "x": 2}, schema)
+    assert args["y"] is None and not actions
+    args, actions = repair.coerce({"y": 5}, schema)
+    assert args["y"] == [5] and actions
+
+
+def test_a_call_to_an_undeclared_tool_is_text():
+    calls, unparsed = parse('{"name": "rm_rf", "arguments": {"path": "/"}}')
+    assert not calls and unparsed and "rm_rf" in unparsed[0]

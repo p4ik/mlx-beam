@@ -1618,6 +1618,9 @@ class BatchGenerator:
         self.starved_calls = 0
         # Rounds the prefill valve held back for memory.
         self.stalled_calls = 0
+        # Stalled rounds in a row; a prefill call that ran resets it. The
+        # caller reads it to relieve a stall that would never end by itself.
+        self.stall_streak = 0
 
         self._counters = BatchCounters()
 
@@ -1940,8 +1943,10 @@ class BatchGenerator:
                 # Not even the narrowest call fits under the memory ceiling
                 # now: nobody is prefilled this round, decoding goes on.
                 self.stalled_calls += 1
+                self.stall_streak += 1
                 self._last_prefill_s = 0.0
                 return prompt_responses, generation_responses
+            self.stall_streak = 0
             width = min(width, max(1, allowed // len(remaining)))
         full = min(self.prefill_step_size, self.prefill_slice)
         if max(remaining) >= full and width < full // 4:

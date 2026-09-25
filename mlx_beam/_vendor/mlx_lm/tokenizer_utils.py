@@ -357,12 +357,20 @@ FAMILY_MARKERS = {
         "close": "<|end|><|start|>assistant<|channel|>final<|message|>",
         "answer_opener": "<|channel|>final<|message|>",
         "structural": ("<|start|>assistant", "<|end|>"),
+        # The marker that begins a message: only right after it is a
+        # textual opener (` to=`) the frame's, not the answer's text.
+        "frame": "<|start|>assistant",
+        # The label after the opener that means reasoning; any other label
+        # (the answer's channel, a tool's name) opens no block.
+        "reasoning_label": "analysis",
     },
     "muse": {
         "openers": (" to=",),
         "close": "<|eom|><|start|>assistant<|message|>",
         "answer_opener": "<|message|>",
         "structural": ("<|start|>assistant", "<|message|>", "<|eom|>"),
+        "frame": "<|start|>assistant",
+        "reasoning_label": "self",
     },
 }
 
@@ -460,6 +468,17 @@ class TokenizerWrapper:
             tuple(tokenizer.encode(family["answer_opener"], add_special_tokens=False))
             if "answer_opener" in family
             else None
+        )
+        self._frame_start = family.get("frame")
+        label = family.get("reasoning_label")
+        label_end = THINK_LABEL_END.get(self._think_start) if self._think_start else None
+        self._reasoning_label_tokens = (
+            tuple(tokenizer.encode(label, add_special_tokens=False)) if label else ()
+        )
+        self._think_label_end_tokens = (
+            tuple(tokenizer.encode(label_end, add_special_tokens=False))
+            if label and label_end
+            else ()
         )
         self._tool_parser_type = None
 
@@ -589,6 +608,24 @@ class TokenizerWrapper:
         """What a prompt gets appended when thinking is switched off and the
         template has no switch of its own; None otherwise."""
         return self._answer_opener_tokens
+
+    @property
+    def reasoning_label_tokens(self):
+        """The label (after the opener) that means reasoning, as ids; empty
+        for a family without labels or whose opener needs none."""
+        return self._reasoning_label_tokens
+
+    @property
+    def think_label_end_tokens(self):
+        """The ids that end a label, for the budget; empty without labels."""
+        return self._think_label_end_tokens
+
+    @property
+    def frame_start(self):
+        """The structural marker that begins an assistant message in a family
+        whose opener is plain text (` to=`): the opener counts only right
+        after it. None for the others."""
+        return self._frame_start
 
     @property
     def tool_call_via_label(self):

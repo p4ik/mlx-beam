@@ -879,7 +879,12 @@ def _chat(tok, stream=False):
     req = chat.parse_chat_request(
         {
             "messages": [{"role": "user", "content": "w1"}],
-            "tools": [{"type": "function", "function": {"name": "w10"}}],
+            # The names the stub parsers produce: a call to a tool the
+            # request did not declare is the model's text, not a call.
+            "tools": [
+                {"type": "function", "function": {"name": n}}
+                for n in ("w10", "w20", "good", "other", "bad")
+            ],
             "stream": stream,
         },
         "m",

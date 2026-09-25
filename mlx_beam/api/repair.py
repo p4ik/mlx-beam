@@ -20,15 +20,33 @@ from typing import Any
 # Counters since start, for /health.tools.repairs.
 STATS = {"strict": 0, "repaired": 0, "coerced": 0, "failed": 0}
 
+# The JSON types whose check is a plain isinstance; integer and number
+# exclude bool by hand (bool is an int in Python).
 _TYPES = {
     "string": str,
-    "integer": int,
-    "number": (int, float),
     "boolean": bool,
     "object": dict,
     "array": list,
     "null": type(None),
 }
+
+
+def _spec(props: Any, key: str) -> dict:
+    """A property's schema as a dict: JSON Schema allows `true`/`false` as
+    a schema too, and a schema that is not a dict says nothing here."""
+    spec = props.get(key) if isinstance(props, dict) else None
+    return spec if isinstance(spec, dict) else {}
+
+
+def declared_names(tools: Any) -> set[str]:
+    """The names the request declared; empty when it named none (then any
+    call the model makes is passed on, there is nothing to hold it to)."""
+    names = set()
+    for tool in tools or ():
+        fn = tool.get("function", tool) if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            names.add(fn["name"])
+    return names
 
 
 def schema_for(tools: Any, name: str) -> dict | None:
@@ -60,15 +78,17 @@ def validate(args: Any, schema: dict) -> list[str]:
         return ["arguments are not an object"]
     problems = []
     props = schema.get("properties") or {}
+    if not isinstance(props, dict):
+        props = {}
     for key in schema.get("required") or ():
         if key not in args:
             problems.append(f"missing required {key!r}")
     for key, value in args.items():
-        spec = props.get(key)
-        if spec is None:
+        if key not in props:
             if schema.get("additionalProperties") is False:
                 problems.append(f"unknown key {key!r}")
             continue
+        spec = _spec(props, key)
         kinds = spec.get("type")
         if kinds is None:
             continue
@@ -85,7 +105,7 @@ def coerce(args: dict, schema: dict) -> tuple[dict, list[str]]:
     props = schema.get("properties") or {}
     out, actions = dict(args), []
     for key, value in args.items():
-        spec = props.get(key) or {}
+        spec = _spec(props, key)
         kinds = spec.get("type")
         if kinds is None:
             continue
@@ -122,13 +142,14 @@ def _coerce_one(value: Any, kinds: list[str]) -> Any:
                     return parsed
         elif kind == "string" and isinstance(value, (int, float, bool)):
             return json.dumps(value)
-        elif (
-            kind == "number" and isinstance(value, int) and not isinstance(value, bool)
-        ):
-            return float(value)
         elif kind == "integer" and isinstance(value, float) and value.is_integer():
             return int(value)
-        elif kind == "array" and not isinstance(value, (list, dict)):
+        elif (
+            kind == "array"
+            and value is not None
+            and not isinstance(value, (list, dict))
+        ):
+            # A lone scalar for a list is the list of it; null is no list.
             return [value]
     return value
 

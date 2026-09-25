@@ -31,6 +31,12 @@ class ReasoningLimits:
     seeded: bool = False
     # Reasoning tokens allowed, markers and close included; None: no budget.
     max_tokens: int | None = None
+    # Families whose opener is followed by a label (Harmony's channel,
+    # Muse's recipient): the label sequences that mean reasoning, and the
+    # tokens that end a label. An opener whose label is another (the
+    # answer's channel, a tool's name) does not open a block.
+    labels: tuple[tuple[int, ...], ...] = ()
+    label_end: tuple[int, ...] = ()
 
 
 def budget(
@@ -133,6 +139,8 @@ class ThinkingBudget:
         self._state = "reasoning" if limits.seeded else "normal"
         self._start = _Matcher(limits.start)
         self._end = _Matcher(limits.end)
+        self._label_end = _Matcher(limits.label_end)
+        self._label: list[int] = []
         self.reasoning_tokens = 0
         self.thinking_truncated = False
         # Set by observe(): the token just seen came from the force queue.
@@ -246,11 +254,30 @@ class ThinkingBudget:
                 self.reasoning_tokens += 1
                 self._gate_opener()
                 self._maybe_arm()
+        elif self._state == "label":
+            # The opener's label: reasoning only when it says so (Harmony's
+            # `analysis`, Muse's `self`); the answer's channel or a tool's
+            # name opens no block, and its tokens count for nothing.
+            self._label.append(token)
+            if self._label_end.feed(token):
+                label = tuple(self._label[: -len(self.limits.label_end)])
+                if label in self.limits.labels:
+                    self._state = "reasoning"
+                    self.reasoning_tokens += 1 + len(self._label)
+                    self._gate_opener()
+                    self._maybe_arm()
+                else:
+                    self._state = "normal"
+                self._label = []
         elif self._start.feed(token):
-            self._state = "reasoning"
-            self.reasoning_tokens += 1
-            self._gate_opener()
-            self._maybe_arm()
+            if self.limits.labels:
+                self._state = "label"
+                self._label = []
+            else:
+                self._state = "reasoning"
+                self.reasoning_tokens += 1
+                self._gate_opener()
+                self._maybe_arm()
         if finish_reason == "length" and self._state == "reasoning":
             self.thinking_truncated = True
 
@@ -265,6 +292,8 @@ class ThinkingBudget:
         may then verify that many tokens without calling it."""
         if self._block or self._pos < len(self._queue) or self._closing:
             return False
+        if self._state == "label":
+            return False  # the label decides whether counting starts
         limit = self.limits.max_tokens
         if limit is None:
             return True

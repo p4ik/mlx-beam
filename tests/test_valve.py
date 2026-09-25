@@ -3,6 +3,8 @@ token from the calls that move the peak, cuts a call to the width that
 fits under the ceiling, stalls below the narrowest, and lets everything
 through while it knows nothing."""
 
+import pytest
+
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator
 from mlx_beam.engine.valve import GRID, MIN_WIDTH, PrefillValve
 from tests.test_engine import tiny_hybrid
@@ -92,3 +94,54 @@ def test_generator_stalls_the_prefill_round_and_resumes():
             break
     assert len(tokens) == 3 and v.shrunk_calls == 0
     gen.close()
+
+
+class Stalled:
+    """A valve that never finds room: every width is None."""
+
+    stalled_calls = 0
+    shrunk_calls = 0
+    last_width = None
+    last_ceiling = 0
+    recommended = 0
+    bytes_per_token = 1.0
+    samples = 0
+
+    def width(self, wanted):
+        self.stalled_calls += 1
+        return None
+
+    def observe(self, tokens):
+        pass
+
+    def describe(self):
+        return {}
+
+
+def test_a_stall_that_cannot_end_evicts_the_store_then_refuses_the_prompt():
+    """Nobody decodes, the valve finds no room: first the store gives up
+    its entries (memory the prefill may have), then the widest prompt is
+    refused with a 400 instead of holding the worker for ever - and the
+    engine goes on serving."""
+    from mlx_beam.engine import ContextTooLong, Engine, GenerationRequest
+
+    model = tiny_hybrid()
+    with Engine(model, prefill_slice=2) as engine:
+        # One entry in the store, to be given up first.
+        list(engine.submit(GenerationRequest([3, 7, 11], max_tokens=2)))
+        assert engine.prefix_store.describe()["entries"] == 1
+        engine.prefill_valve = Stalled()
+        engine._gen.prefill_valve = engine.prefill_valve
+        stream = engine.submit(GenerationRequest(list(range(1, 40)), max_tokens=2))
+        with pytest.raises(ContextTooLong, match="does not fit in memory"):
+            for _ in stream:
+                pass
+        h = engine.health()
+        assert h["alive"] and h["prefill_valve"]["refused"] == 1
+        assert engine.prefix_store.describe()["evicted_for_memory"] == 1
+        assert engine.prefix_store.describe()["entries"] == 0
+        # Room again: the next request runs.
+        engine.prefill_valve = engine._gen.prefill_valve = PrefillValve(
+            active=lambda: 0, peak=lambda: 0, free=lambda: None, recommended=0
+        )
+        assert len(list(engine.submit(GenerationRequest([3, 7], max_tokens=2)))) == 2

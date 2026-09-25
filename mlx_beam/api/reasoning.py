@@ -56,15 +56,29 @@ class EffortCapability:
     kwarg: str | None = None
     validates: bool = False
     levels: tuple[str, ...] = ()
-    rejected: tuple[str, ...] = ()
+
+    @property
+    def takes_words(self) -> bool:
+        """Whether the kwarg takes an effort word at all: a `reasoning_*`
+        name does, a token budget (`thinking_budget`) does not."""
+        return bool(self.kwarg) and self.kwarg.startswith("reasoning_")
 
     def describe(self) -> dict:
         if self.source == "none":
             return {"source": "none"}
         out = {"source": self.source, "kwarg": self.kwarg, "validates": self.validates}
+        if not self.takes_words:
+            out["takes"] = "tokens"
         if self.validates:
             out["levels"] = list(self.levels)
         return out
+
+
+# message.thinking, message["thinking"], msg.get("thinking"): an access, not
+# the word in prose (an ellipsis before it is prose).
+_KEY_READ = re.compile(
+    r"""(?:(?<!\.)\.|\[\s*['"]|get\(\s*['"])(reasoning_content|thinking|reasoning)(?![\w])"""
+)
 
 
 def _template_source(tokenizer) -> str:
@@ -110,9 +124,7 @@ def probe_effort(tokenizer) -> EffortCapability:
             accepted.append(word)
         except Exception:  # noqa: BLE001 - the template's verdict is the data
             rejected.append(word)
-    return EffortCapability(
-        "template", kwarg, bool(rejected), tuple(accepted), tuple(rejected)
-    )
+    return EffortCapability("template", kwarg, bool(rejected), tuple(accepted))
 
 
 def effort_capability(tokenizer) -> EffortCapability:
@@ -156,8 +168,8 @@ def translate_effort(word: str, cap: EffortCapability) -> str | None:
     models were trained on) or accepts it; else the nearest accepted rung
     on the ordinal ladder, up first, then down. None: the template knows
     no effort, the kwarg stays out."""
-    if cap.source == "none":
-        return None
+    if cap.source == "none" or not cap.takes_words:
+        return None  # no kwarg, or one that takes a token count, not a word
     if not cap.validates or word in cap.levels:
         return word
     accepted = [w for w in cap.levels if w in ORDINAL or w in EFFORT_ALIASES]
@@ -167,19 +179,6 @@ def translate_effort(word: str, cap: EffortCapability) -> str | None:
     up = sorted((w for w in accepted if _rank(w) >= rank), key=_rank)
     down = sorted((w for w in accepted if _rank(w) < rank), key=_rank, reverse=True)
     return (up or down)[0]
-
-
-def map_effort(effort) -> str | None:
-    """The request's word for the template, or None for off; kept for the
-    callers that only need the switch."""
-    return normalise_effort(effort)
-
-
-# message.thinking, message["thinking"], msg.get("thinking"): an access, not
-# the word in prose (an ellipsis before it is prose).
-_KEY_READ = re.compile(
-    r"""(?:(?<!\.)\.|\[\s*['"]|get\(\s*['"])(reasoning_content|thinking|reasoning)(?![\w])"""
-)
 
 
 def is_effort_rejection(error: BaseException) -> bool:

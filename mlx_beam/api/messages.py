@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from mlx_beam.api.chat import (
@@ -38,9 +38,6 @@ from mlx_beam.engine.request import GenerationRequest
 class MessagesRequest:
     chat: ChatRequest
     stream: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
-    # Cache markers the client set, each mapped onto a message boundary.
-    cache_marks: list[str] = field(default_factory=list)
 
 
 # -- request -----------------------------------------------------------------
@@ -65,23 +62,7 @@ def _text_blocks(content: Any, where: str) -> str:
     return "".join(out)
 
 
-def _cache_control(block: dict, where: str, last: bool, marks: list[str]) -> None:
-    """A cache marker maps onto a checkpoint only at a message boundary:
-    the last block of a message is one, a block before it is not."""
-    cc = block.get("cache_control")
-    if cc is None:
-        return
-    if not last:
-        raise ApiError(
-            f"{where}.cache_control sits on a block inside a message; the prompt "
-            "cache checkpoints at message boundaries only - put it on the "
-            "message's last block",
-            param="messages",
-        )
-    marks.append(where)
-
-
-def _convert_message(m: Any, i: int, marks: list[str]) -> list[dict]:
+def _convert_message(m: Any, i: int) -> list[dict]:
     """One Anthropic message into the OpenAI-shaped messages the chat path
     renders: text and thinking stay with the turn, tool_use becomes the
     turn's tool_calls, each tool_result its own tool message."""
@@ -113,7 +94,6 @@ def _convert_message(m: Any, i: int, marks: list[str]) -> list[dict]:
     for j, block in enumerate(content):
         kind = block.get("type") if isinstance(block, dict) else None
         here = f"{where}.content[{j}]"
-        _cache_control(block, here, j == len(content) - 1, marks)
         if kind == "text":
             texts.append(str(block.get("text", "")))
         elif kind == "thinking":
@@ -194,20 +174,19 @@ def parse_messages_request(
     for key in ("mcp_servers", "container", "context_management"):
         if body.get(key) is not None:
             raise unsupported(key, key)
-    marks: list[str] = []
+    # `cache_control` on any block is accepted and ignored: the prefix
+    # store caches every turn at message boundaries by itself, and a client
+    # that marks blocks (Claude Code marks its system blocks) must not be
+    # refused for it.
     messages: list[dict] = []
     system = body.get("system")
     if system is not None:
-        if isinstance(system, list):
-            for j, block in enumerate(system):
-                if isinstance(block, dict):
-                    _cache_control(block, f"system[{j}]", j == len(system) - 1, marks)
         messages.append({"role": "system", "content": _text_blocks(system, "system")})
     raw = body.get("messages")
     if not isinstance(raw, list) or not raw:
         raise ApiError("messages must be a non-empty list", param="messages")
     for i, m in enumerate(raw):
-        messages.extend(_convert_message(m, i, marks))
+        messages.extend(_convert_message(m, i))
     tools = _tools_to_chat(body.get("tools"))
     choice = body.get("tool_choice")
     if isinstance(choice, dict):
@@ -254,13 +233,7 @@ def parse_messages_request(
         max_reasoning_tokens=max_reasoning,
         template_kwargs=template_kwargs,
     )
-    metadata = body.get("metadata")
-    return MessagesRequest(
-        chat=chat,
-        stream=chat.stream,
-        metadata=metadata if isinstance(metadata, dict) else {},
-        cache_marks=marks,
-    )
+    return MessagesRequest(chat=chat, stream=chat.stream)
 
 
 def to_generation_request(
@@ -295,16 +268,21 @@ class MessagesResponder:
         self.prompt_len = len(prompt_tokens)
         self.assembler = TextAssembler(
             tokenizer,
-            prompt_tokens=prompt_tokens,
+            # (assistant_start: set by build_prompt once the chat path carries
+            # it; 0 until the branches meet.)
+            prompt_tokens=prompt_tokens[getattr(req.chat, "assistant_start", 0) :],
+            stop_words=req.chat.stop,
             tools=req.chat.tools,
             streaming=False,
             route_thinking=route_thinking,
-            tools_enabled=req.chat.tools is not None,
+            tools_enabled=bool(req.chat.tools),
         )
 
     def _usage(self, cached: int) -> dict:
+        # Anthropic's input_tokens are the ones not served from a cache;
+        # the total is input_tokens plus the two cache counts.
         return {
-            "input_tokens": self.prompt_len,
+            "input_tokens": max(0, self.prompt_len - cached),
             "output_tokens": self.assembler.tokens,
             "cache_read_input_tokens": cached,
             "cache_creation_input_tokens": 0,
@@ -314,9 +292,8 @@ class MessagesResponder:
         if finish is None:
             return None, None
         if finish == "stop" and self.assembler.stopped:
-            # A client stop sequence matched in the text; the engine reports
-            # the stop, not which sequence, so that field stays null.
-            return "stop_sequence", None
+            # A client stop sequence matched in the text.
+            return "stop_sequence", self.assembler.stopped_word
         return STOP_REASONS.get(finish, "end_turn"), None
 
     def _message(self, content: list[dict], stop, cached: int) -> dict:

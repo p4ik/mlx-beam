@@ -122,6 +122,8 @@ class StoreStats:
     hits: int = 0
     tokens_found: int = 0
     tokens_restored: int = 0
+    # Entries dropped to make room for a prefill the valve had stalled.
+    evicted_for_memory: int = 0
     by_type: dict = field(default_factory=dict)
 
 
@@ -321,6 +323,18 @@ class PrefixStore:
                 return self._lru[kind].popleft()
         return None
 
+    def evict_one(self) -> bool:
+        """Drop the entry the eviction order names next, whatever the
+        budgets say - the memory a stalled prefill needs. False when the
+        store is empty."""
+        victim = self._pop_victim()
+        if victim is None:
+            return False
+        model, key = victim
+        self._nbytes -= self._trie.pop(model, key).nbytes
+        self.stats.evicted_for_memory += 1
+        return True
+
     def _evict(self) -> None:
         while len(self._lru["system"]) > self.system_cap:
             model, key = self._lru["system"].popleft()
@@ -341,5 +355,6 @@ class PrefixStore:
             "hits": s.hits,
             "tokens_found": s.tokens_found,
             "tokens_restored": s.tokens_restored,
+            "evicted_for_memory": s.evicted_for_memory,
             "by_type": {k: len(q) for k, q in self._lru.items()},
         }

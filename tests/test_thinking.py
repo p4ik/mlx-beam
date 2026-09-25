@@ -429,3 +429,40 @@ def test_seeded_block_below_its_close_keeps_the_answer_reserve_or_refuses():
                     [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=6
                 )
             )
+
+
+def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
+    """Harmony and Muse open the answer and a tool call with the same
+    marker as the reasoning block, followed by a label. The budget waits
+    for the label: `analysis` opens a block that counts, `final` does not
+    - so a natural close followed by the answer's channel is not a second
+    block, and no forced close lands in the answer."""
+    A, F, MSG = 40, 41, 42  # "analysis", "final", "<|message|>"
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=6,
+        labels=((A,),),
+        label_end=(MSG,),
+    )
+    tracker = ThinkingBudget(limits)
+    # Analysis: opener, label, its end, three free tokens - counted.
+    for t in (START, A, MSG, 10, 11):
+        tracker.observe(t, None)
+    assert tracker.in_reasoning and tracker.reasoning_tokens == 5
+    tracker.observe(END, None)  # the model closes by itself
+    assert not tracker.in_reasoning
+    # The answer's channel: the same opener, another label - no block.
+    for t in (START, F, MSG, 12, 13, 14, 15, 16):
+        tracker.observe(t, None)
+    assert not tracker.in_reasoning and tracker.reasoning_tokens == 5
+    assert not tracker.thinking_truncated
+    tracker.observe(17, "length")
+    assert not tracker.thinking_truncated
+    # And a budget that is up forces the close inside the block, never in
+    # the answer that follows it.
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, A, MSG, 10, 11, 12, 13, 14, 15, 16]).run(10)
+    assert END in out and tracker.thinking_truncated
+    assert out.index(END) <= 6

@@ -263,6 +263,15 @@ def parse_chat_request(
     if level is not None:
         for name in EFFORT_KWARGS:
             template_kwargs.pop(name, None)
+        # A word asks for thinking: it beats a server default that switched
+        # it off (the request is the more specific), not the request's own
+        # enable_thinking.
+        if thinking is None:
+            template_kwargs.pop("enable_thinking", None)
+    elif "reasoning_effort" in aliases:
+        # Effort none: off, and no server-default effort word either.
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
     template_kwargs.update(object_field(body, "chat_template_kwargs"))
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
@@ -288,7 +297,8 @@ def parse_chat_request(
 
 def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
     """(effort word, enable_thinking) from the resolved aliases: an effort
-    of none switches thinking off, a word asks for it."""
+    of none switches thinking off, a word asks for it (and, in
+    parse_chat_request, lifts a server default that switched it off)."""
     thinking = aliases.get("enable_thinking")
     if "reasoning_effort" not in aliases:
         return None, thinking
@@ -509,12 +519,16 @@ def reasoning_limits(
         close = (
             newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
         )
+    label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
+    label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
     return ReasoningLimits(
         start=start,
         end=end,
         close=close,
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
+        labels=(label,) if label and label_end else (),
+        label_end=label_end if label else (),
     )
 
 

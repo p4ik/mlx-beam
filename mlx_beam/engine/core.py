@@ -47,6 +47,12 @@ from mlx_beam.engine.valve import PrefillValve
 
 logger = logging.getLogger(__name__)
 
+# A prefill the valve stalls: rounds with the store empty and nothing
+# decoding before the widest prompt is refused, and the pause per stalled
+# round while something else may free memory.
+STALL_ROUNDS = 3
+STALL_SLEEP_S = 0.05
+
 
 class EngineDead(RuntimeError):
     """The worker thread has ended; the engine answers nothing any more."""
@@ -187,6 +193,8 @@ class Engine:
         # The prefill valve: the next call's peak estimated from the calls
         # before, held under min(recommended working set, held + free).
         self.prefill_valve = PrefillValve()
+        # Prompts refused because the stall could not end (health).
+        self.stalls_refused = 0
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -471,6 +479,7 @@ class Engine:
             "prefill_valve": {
                 **self.prefill_valve.describe(),
                 "stalled_rounds": gen.stalled_calls if gen is not None else 0,
+                "refused": self.stalls_refused,
             },
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
@@ -697,6 +706,45 @@ class Engine:
             except Exception:  # noqa: BLE001 - a lost partial is no failure
                 traceback.print_exc()
 
+    def _relieve_stall(self, gen: BatchGenerator) -> None:
+        """The valve let nobody prefill this round. Memory the store holds
+        is memory the prefill may have: one entry goes per stalled round.
+        With the store empty and nothing decoding (whose finish would free
+        its cache) the stall cannot end by itself: after STALL_ROUNDS the
+        widest prefilling row is refused with a 400 - the prompt does not
+        fit beside what runs - instead of holding every prompt behind it
+        for ever. While something decodes, the worker waits a little
+        rather than spinning."""
+        if self.prefix_store.evict_one():
+            mx.clear_cache()
+            return
+        if len(gen._generation_batch) > 0:
+            time.sleep(STALL_SLEEP_S)
+            return
+        if gen.stall_streak < STALL_ROUNDS:
+            time.sleep(STALL_SLEEP_S)
+            return
+        batch = gen._prompt_batch
+        if not batch.uids:
+            return
+        i = max(range(len(batch.uids)), key=lambda j: len(batch.tokens[j]))
+        uid, prefilled = batch.uids[i], len(batch.tokens[i])
+        error = ContextTooLong(
+            f"the prompt does not fit in memory beside what is running "
+            f"({prefilled} of it prefilled; the prefill valve found no room "
+            "for the narrowest call)"
+        )
+        gen.remove([uid])
+        stream = self._live.pop(uid, None)
+        self._bookkeeping.pop(uid, None)
+        self._stride.pop(uid, None)
+        self._budgets.pop(uid, None)
+        self._forget_row(uid)
+        gen.stall_streak = 0
+        self.stalls_refused += 1
+        if stream is not None:
+            stream.put(error)
+
     def _forget_row(self, uid: int) -> None:
         self._spec_rows.pop(uid, None)
         self._spec_bias.pop(uid, None)
@@ -779,6 +827,8 @@ class Engine:
 
                 prompt_responses, gen_responses = gen.next()
                 self._last_step = time.monotonic()
+                if gen.stall_streak:
+                    self._relieve_stall(gen)
 
                 for r in prompt_responses:
                     s = self._live.get(r.uid)

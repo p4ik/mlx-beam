@@ -24,10 +24,16 @@ def render(health: dict, model: str) -> str:
     """The exposition text for one health snapshot."""
     labels = {"model": model}
     out: list[str] = []
+    described: set[str] = set()
 
     def metric(name, kind, help_text, value, extra=None):
-        out.append(f"# HELP {name} {help_text}")
-        out.append(f"# TYPE {name} {kind}")
+        # HELP and TYPE once per family: a second pair for the same name
+        # (a metric with a label per value) is a parse error for the
+        # format's readers (Prometheus, promtool, Telegraf).
+        if name not in described:
+            out.append(f"# HELP {name} {help_text}")
+            out.append(f"# TYPE {name} {kind}")
+            described.add(name)
         out.append(_line(name, value, {**labels, **(extra or {})}))
 
     metric(
