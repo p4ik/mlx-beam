@@ -63,6 +63,8 @@ class Served:
         defaults: RequestDefaults | None = None,
         allowed_origins: Sequence[str] = ("*",),
         chat_template_source: str = "model",
+        frontend=None,
+        vision_refused: str | None = None,
     ):
         if reasoning_field not in chat.REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
@@ -74,6 +76,12 @@ class Served:
         self.allowed_origins = tuple(allowed_origins)
         # "model", "flag" or "default": where the chat template came from.
         self.chat_template_source = chat_template_source
+        # The modality frontend a separate package loaded for this
+        # checkpoint (mlx-beam-vision), or None: text only.
+        self.frontend = frontend
+        # Why a provider that claimed this checkpoint was not taken (its
+        # needs the text model does not meet); health carries it.
+        self.vision_refused = vision_refused
         self.started_at = time.time()
         # OpenAI's system_fingerprint: the same value for every answer this
         # set-up gives - model, package version and KV layout hashed.
@@ -92,7 +100,7 @@ class Served:
             # What the template does with reasoning_effort, measured at
             # load: the kwarg it reads, whether it checks the word, the set.
             "effort": effort_capability(t).describe(),
-            "vision": False,
+            "vision": self.frontend is not None,
             "audio": False,
         }
 
@@ -163,6 +171,14 @@ class Served:
         h["reasoning"] = self.reasoning_markers()
         h["reasoning"]["effort"] = effort_capability(self.tokenizer).describe()
         h["tools"] = self.tool_markers()
+        # What serves images, with its evidence; None: the core alone; a
+        # refusal names what the provider needed and the model lacks.
+        if self.frontend is not None:
+            h["vision"] = self.frontend.describe()
+        elif self.vision_refused:
+            h["vision"] = {"refused": self.vision_refused}
+        else:
+            h["vision"] = None
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
@@ -519,10 +535,17 @@ class Handler(BaseHTTPRequestHandler):
         self._check_model(body)
         tok = self.served.tokenizer
         req = chat.parse_chat_request(
-            body, self.served.model_name, self.served.defaults
+            body,
+            self.served.model_name,
+            self.served.defaults,
+            vision=self.served.frontend is not None,
         )
         gen_request = chat.to_generation_request(
-            tok, req, self.served.defaults, self.served.engine.max_context
+            tok,
+            req,
+            self.served.defaults,
+            self.served.engine.max_context,
+            frontend=self.served.frontend,
         )
         responder = chat.ChatResponder(
             tok,
@@ -573,10 +596,17 @@ class Handler(BaseHTTPRequestHandler):
         self._check_model(body)
         tok = self.served.tokenizer
         req = responses.parse_responses_request(
-            body, self.served.model_name, self.served.defaults
+            body,
+            self.served.model_name,
+            self.served.defaults,
+            vision=self.served.frontend is not None,
         )
         gen_request = responses.to_generation_request(
-            tok, req, self.served.defaults, self.served.engine.max_context
+            tok,
+            req,
+            self.served.defaults,
+            self.served.engine.max_context,
+            frontend=self.served.frontend,
         )
         responder = responses.ResponsesResponder(
             tok,

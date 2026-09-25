@@ -409,3 +409,33 @@ def test_parallel_continuations_of_one_turn_keep_its_end_in_the_engine():
         assert len(engine.prefix_store) == 1  # b's entry evicted a's
         hit = engine.prefix_store.fetch(engine.model_key, prefix + [60])
         assert hit is not None and hit.covered == len(prefix)
+
+
+def test_a_cancelled_prefill_is_stored_under_the_positions_it_computed():
+    """The row is dropped after one prefill slice: the entry the store gets
+    is keyed by the four computed positions, not the whole prompt - a
+    fetch of the prompt then covers exactly what the caches hold, and a
+    retry continues from there instead of skipping positions it never
+    computed."""
+    from mlx_beam._vendor.mlx_lm.generate import BatchGenerator
+    from mlx_beam.engine.request import ResultStream
+
+    model = tiny_llama()
+    engine = Engine(model, prefill_slice=4)
+    gen = BatchGenerator(model, prefill_slice=4, prefill_step_size=4)
+    prompt = [2, 6, 1, 2, 7, 3, 5, 4, 3, 3, 6, 7, 1, 2, 6, 5]
+    stream = ResultStream(
+        GenerationRequest(prompt, max_tokens=4), engine._request_cancel
+    )
+    try:
+        engine._admit(gen, stream)
+        progress, output = gen.next()
+        assert not output and progress[0].progress[0] == 4
+        stream.cancel()
+        engine._drop_cancelled(gen)
+    finally:
+        gen.close()
+    hit = engine.prefix_store.fetch(engine.model_key, prompt)
+    assert hit is not None
+    offsets = [c.offset for c in hit.cache]
+    assert hit.covered == 4 and offsets == [4] * len(offsets), (hit.covered, offsets)

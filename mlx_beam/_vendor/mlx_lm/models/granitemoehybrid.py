@@ -471,8 +471,18 @@ class GraniteMoeHybridModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+        layer_hook=None,
     ) -> mx.array:
-        hidden_states = self.embed_tokens(inputs) * self.embedding_multiplier
+        # input_embeddings stand in for embed_tokens(inputs) (a vision
+        # frontend's image positions among them); layer_hook(index, hidden)
+        # runs before each layer, what Granite Vision adds at the image
+        # positions ahead of its target layers. VENDORED.md, layer hook.
+        if input_embeddings is None:
+            hidden_states = self.embed_tokens(inputs)
+        else:
+            hidden_states = input_embeddings
+        hidden_states = hidden_states * self.embedding_multiplier
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -486,8 +496,10 @@ class GraniteMoeHybridModel(nn.Module):
         if self.ssm_idx is not None:
             mamba_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = attn_mask if layer.layer_type == "attention" else mamba_mask
+            if layer_hook is not None:
+                hidden_states = layer_hook(i, hidden_states)
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
         return self.norm(hidden_states)
@@ -507,8 +519,12 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+        layer_hook=None,
     ) -> mx.array:
-        out = self.model(inputs, cache=cache)
+        out = self.model(
+            inputs, cache=cache, input_embeddings=input_embeddings, layer_hook=layer_hook
+        )
 
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

@@ -547,6 +547,7 @@ def probe_port(host: str, port: int) -> None:
 def serve(args) -> int:
     import logging
 
+    from mlx_beam import modalities
     from mlx_beam._vendor.mlx_lm.utils import hf_repo_to_path, load
     from mlx_beam.api.defaults import RequestDefaults
     from mlx_beam.engine import Engine, EngineDead
@@ -631,6 +632,18 @@ def serve(args) -> int:
         return 3
     if engine.speculator is not None:
         log.info("speculative: %s", engine.speculator.describe()["proposer"])
+    # A separate package may serve this checkpoint's images (entry point
+    # group mlx_beam.modalities); without one the core is text only.
+    frontend, vision_refused = modalities.load_frontend(
+        model,
+        model_path,
+        json.loads((model_path / "config.json").read_text()),
+        tokenizer,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if frontend is not None and template_source != "model":
+        # The flag's template renders image requests too, not only text.
+        frontend.chat_template = tokenizer.chat_template
     served = Served(
         engine,
         tokenizer,
@@ -639,6 +652,8 @@ def serve(args) -> int:
         defaults=defaults,
         allowed_origins=args.allowed_origins,
         chat_template_source=template_source,
+        frontend=frontend,
+        vision_refused=vision_refused,
     )
     health = served.health()
     applied = health["kv"]["applied"] or []

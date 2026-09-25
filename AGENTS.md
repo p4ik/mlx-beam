@@ -86,7 +86,11 @@ choice["message"]["content"] = text if text else None
 - `CHANGELOG.md` keeps an `[Unreleased]` section for everything since the
   last tag. The last pull request before a tag turns it into
   `[<version>] - <date>` and opens a new `[Unreleased]` above; the release
-  workflow refuses a tag whose section is missing.
+  workflow refuses a tag whose section is missing. The measure is always
+  the last tag: `Fixed` is what that tag had wrong; a correction to
+  something added since it goes into that thing's `Added` entry, because
+  no one ever installed the broken version. One heading per kind; when
+  two branches meet, their sections are merged, not stacked.
 - Vendored parts are updated in their own commit (`vendor: <part> <old> -> <new>`).
 
 ## AI usage

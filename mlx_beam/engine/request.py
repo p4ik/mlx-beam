@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mlx_beam.engine.thinking import ReasoningLimits
@@ -37,6 +38,35 @@ class SamplingParams:
     seed: int | None = None
 
 
+@dataclass(frozen=True)
+class ImageSpan:
+    """An image's place in the prompt: the placeholder positions
+    [start, end) whose embeddings come from the image's features rather
+    than the vocabulary, the features (end - start, hidden) the frontend
+    computed, optional features added at the image positions ahead of
+    certain text layers (DeepStack: {layer index: features}, applied
+    before that layer runs), and the image's digest - the prefix cache
+    keys on it, so the same placeholders with another image never meet."""
+
+    start: int
+    end: int
+    features: Any
+    digest: str
+    deepstack: Any = field(default_factory=dict)
+
+    @property
+    def extras(self) -> dict:
+        """The per-layer features as a mapping, whatever form they came in
+        (a sequence means one per layer from the first)."""
+        if isinstance(self.deepstack, dict):
+            return self.deepstack
+        return dict(enumerate(self.deepstack))
+
+    def __post_init__(self):
+        if self.end <= self.start:
+            raise ValueError("an image span must cover at least one position")
+
+
 @dataclass
 class GenerationRequest:
     """Token ids in, tokens out. Text belongs to the API layer."""
@@ -61,6 +91,9 @@ class GenerationRequest:
     max_prompt_tokens: int | None = None
     # Think markers and the reasoning budget; None: no budget, no forcing.
     reasoning: ReasoningLimits | None = None
+    # Images in the prompt, by position; the prefill takes their features
+    # in place of the placeholder tokens' embeddings.
+    spans: Sequence[ImageSpan] = ()
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
@@ -72,6 +105,28 @@ class GenerationRequest:
             raise ValueError("top_logprobs must not be negative")
         if self.min_response_tokens < 0:
             raise ValueError("min_response_tokens must not be negative")
+        for span in self.spans:
+            if span.end > len(self.tokens):
+                raise ValueError("an image span reaches past the prompt")
+
+    @property
+    def cache_key(self) -> list[int]:
+        """What the prefix store keys on: the tokens, with every image
+        span's positions replaced by ids derived from the image's digest -
+        the same length, so boundaries keep their positions, and never a
+        vocabulary id, so text never matches an image. Every position is
+        its own 31-bit hash of the whole digest and the position, so the
+        span carries 31 bits of the image's identity per position - two
+        images share a key only if every one of those hashes collides, not
+        when one slice of the digest does."""
+        key = list(self.tokens)
+        for span in self.spans:
+            digest = bytes.fromhex(span.digest) if span.digest else b""
+            for i in range(span.start, span.end):
+                salt = (i - span.start).to_bytes(4, "little")
+                h = hashlib.blake2b(digest, digest_size=4, salt=salt).digest()
+                key[i] = -1 - (int.from_bytes(h, "little") % (2**31))
+        return key
 
 
 @dataclass(frozen=True)

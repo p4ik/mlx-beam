@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
 import time
@@ -15,6 +17,7 @@ from mlx_beam.api.errors import (
     ApiError,
     bool_field,
     missing_extra,
+    no_vision,
     object_field,
     text_field,
     unsupported,
@@ -40,6 +43,7 @@ from mlx_beam.api.text import (
 )
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 from mlx_beam.engine.thinking import ReasoningLimits, budget, close_tail
+from mlx_beam.modalities import Image
 
 # What a parser falls back to when no server defaults are handed in (tests).
 DEFAULTS = RequestDefaults()
@@ -69,6 +73,10 @@ class ChatRequest:
     # only from here - a `<think>` or a ` to=` inside a user message is
     # text, not an open block.
     assistant_start: int = 0
+    # Images in the order their parts appear in the messages, and the
+    # spans the frontend built for them (set by build_prompt).
+    images: list[Image] = field(default_factory=list)
+    spans: list = field(default_factory=list)
 
 
 def _number(body, key, default, lo=None, hi=None, kind=float):
@@ -165,7 +173,42 @@ def _reject_unsupported(body: dict) -> None:
         raise unsupported("tool_choice other than auto or none", "tool_choice")
 
 
-def _normalise_messages(messages: Any) -> list[dict]:
+def decode_image(part: dict, where: str) -> Image:
+    """The bytes of an image part: an OpenAI `image_url` (or a Responses
+    `input_image`) whose url is a `data:` URL. Nothing is fetched - a
+    remote URL is refused, the client sends the bytes. A `detail` field
+    is accepted and ignored: the processor decides the resolution."""
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if not isinstance(url, str):
+        raise ApiError(f"{where} needs an image_url", param="messages")
+    if not url.startswith("data:"):
+        raise ApiError(
+            f"{where}: only data: URLs are accepted; the server fetches nothing",
+            param="messages",
+        )
+    head, sep, payload = url[5:].partition(",")
+    if not sep or ";base64" not in head:
+        raise ApiError(f"{where}: the data URL must be base64", param="messages")
+    try:
+        # Line breaks between the base64 lines are how some encoders wrap.
+        data = base64.b64decode("".join(payload.split()), validate=True)
+    except (binascii.Error, ValueError):
+        raise ApiError(
+            f"{where}: the data URL is not valid base64", param="messages"
+        ) from None
+    if not data:
+        raise ApiError(f"{where}: the image is empty", param="messages")
+    return Image(data, head.split(";")[0] or "image/png")
+
+
+def _normalise_messages(messages: Any, images: list[Image] | None = None) -> list[dict]:
+    """Messages as the template renders them. Text parts fold into a
+    string; with `images` given, image parts are decoded into it and the
+    content stays a list of parts (`{"type": "image"}` in place), which is
+    what a vision template renders; without it, an image is refused with
+    the extra that serves it."""
     if not isinstance(messages, list) or not messages:
         raise ApiError("messages must be a non-empty list", param="messages")
     out = []
@@ -178,13 +221,21 @@ def _normalise_messages(messages: Any) -> list[dict]:
             m["role"] = "system"
         content = m.get("content")
         if isinstance(content, list):
-            texts = []
-            for part in content:
+            parts: list[dict] = []
+            with_image = False
+            for j, part in enumerate(content):
                 kind = part.get("type") if isinstance(part, dict) else None
+                where = f"messages[{i}].content[{j}]"
                 if kind == "text":
-                    texts.append(text_field(part, "text", f"messages[{i}].content"))
+                    parts.append(
+                        {"type": "text", "text": text_field(part, "text", where)}
+                    )
                 elif kind in ("image_url", "input_image"):
-                    raise missing_extra("image input", "vision")
+                    if images is None:
+                        raise no_vision()
+                    images.append(decode_image(part, where))
+                    parts.append({"type": "image"})
+                    with_image = True
                 elif kind in ("input_audio", "audio", "video_url"):
                     raise missing_extra("audio and video input", "audio")
                 else:
@@ -192,7 +243,7 @@ def _normalise_messages(messages: Any) -> list[dict]:
                         f"messages[{i}].content has an unknown part type {kind!r}",
                         param="messages",
                     )
-            m["content"] = "".join(texts)
+            m["content"] = parts if with_image else "".join(p["text"] for p in parts)
         elif content is None:
             # A turn made of tool calls has no content; a template that trims
             # or concatenates it must see "", not None.
@@ -246,11 +297,17 @@ def _normalise_tool_call(tc: Any, where: str) -> dict:
 
 
 def parse_chat_request(
-    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+    body: dict,
+    default_model: str,
+    defaults: RequestDefaults = DEFAULTS,
+    vision: bool = False,
 ) -> ChatRequest:
+    """`vision` says a frontend serves images: their parts are decoded and
+    kept; without one an image part is a 400 naming the extra."""
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     _reject_unsupported(body)
+    images: list[Image] | None = [] if vision else None
     # max_tokens is OpenAI's old name; it is accepted here and nowhere else.
     # An explicit null under the new name does not hide a value under the old.
     key = "max_completion_tokens"
@@ -290,7 +347,7 @@ def parse_chat_request(
     template_kwargs.update(object_field(body, "chat_template_kwargs"))
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
-        messages=_normalise_messages(body.get("messages")),
+        messages=_normalise_messages(body.get("messages"), images),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
         sampling=parse_sampling(body, defaults),
@@ -307,6 +364,7 @@ def parse_chat_request(
         min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
+        images=images or [],
     )
 
 
@@ -323,9 +381,14 @@ def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
     return level, thinking
 
 
-def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
+def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
+    """The prompt's token ids; with images, rendered and expanded by the
+    modality frontend (which also fills `req.spans`) - through the same
+    effort ladder and checks as text."""
     if not getattr(tokenizer, "has_chat_template", True):
         raise ApiError("this model has no chat template; use /v1/completions")
+    if req.images and frontend is None:
+        raise no_vision()
     mirror_reasoning(req.messages, renderer_reasoning_keys(tokenizer))
     kwargs = dict(req.template_kwargs)
     if req.tools:
@@ -342,6 +405,11 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             req.template_kwargs[effort_kwarg] = value
 
     def render(add_generation_prompt=True, **extra):
+        if req.images:
+            built = frontend.build(req.messages, req.images, {**kwargs, **extra})
+            req.spans = list(built.spans)
+            req.assistant_start = built.assistant_start
+            return built.tokens
         return tokenizer.apply_chat_template(
             req.messages,
             add_generation_prompt=add_generation_prompt,
@@ -349,14 +417,17 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             **{**kwargs, **extra},
         )
 
+    rejected = (
+        "the image input was refused"
+        if req.images
+        else "the chat template rejected the messages"
+    )
     level = kwargs.get(effort_kwarg)
     try:
         tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
         if not (level and is_effort_rejection(e)):
-            raise ApiError(
-                f"the chat template rejected the messages: {e}", param="messages"
-            ) from None
+            raise ApiError(f"{rejected}: {e}", param="messages") from None
         # The template rejects this word after all (it answers differently
         # with tools in the context, say): climb the ladder and remember
         # the rung that rendered, so every re-render agrees.
@@ -368,10 +439,7 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
                 tokens = render(**{effort_kwarg: candidate})
             except Exception as e2:  # noqa: BLE001
                 if not is_effort_rejection(e2):
-                    raise ApiError(
-                        f"the chat template rejected the messages: {e2}",
-                        param="messages",
-                    ) from None
+                    raise ApiError(f"{rejected}: {e2}", param="messages") from None
                 continue
             req.template_kwargs[effort_kwarg] = candidate
             break
@@ -385,8 +453,11 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
         raise ApiError("the prompt is empty", param="messages")
     tokens = list(tokens)
     # The rung the ladder settled on, so this render agrees with the last.
+    # With images the frontend said where the frame begins (a second build
+    # would move the spans); the probe is for text prompts.
     settled = {k: v for k, v in req.template_kwargs.items() if k == effort_kwarg}
-    req.assistant_start = _assistant_start(render, tokens, settled)
+    if not req.images:
+        req.assistant_start = _assistant_start(render, tokens, settled)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False:
         # A family whose template has no switch (Harmony, Muse): the answer
@@ -473,8 +544,9 @@ def to_generation_request(
     req: ChatRequest,
     defaults: RequestDefaults = DEFAULTS,
     max_context: int | None = None,
+    frontend=None,
 ) -> GenerationRequest:
-    prompt = build_prompt(tokenizer, req)
+    prompt = build_prompt(tokenizer, req, frontend)
     min_response = (
         defaults.min_response_tokens
         if req.min_response_tokens is None
@@ -498,7 +570,7 @@ def to_generation_request(
         # a Qwen template does; then check whether it did.
         if req.template_kwargs.get("enable_thinking") is not False:
             req.template_kwargs["enable_thinking"] = False
-            prompt = build_prompt(tokenizer, req)
+            prompt = build_prompt(tokenizer, req, frontend)
             completion_cap, _ = budget(
                 max_context, len(prompt), req.max_tokens, min_response
             )
@@ -511,7 +583,14 @@ def to_generation_request(
                 f"{completion_cap} for the answer",
                 code="context_length_exceeded",
             )
-    bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
+    if req.images:
+        # Boundaries come from re-rendering message prefixes as text; with
+        # images the placeholders expand in the processor, so no boundary
+        # is claimed - a whole-entry hit (the next turn) still works, the
+        # image's digest is part of the key.
+        bounds, system_end = [], None
+    else:
+        bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
     return GenerationRequest(
         tokens=prompt,
         max_tokens=req.max_tokens,
@@ -519,6 +598,7 @@ def to_generation_request(
         stop_sequences=stop_sequence_ids(tokenizer, req.stop),
         boundaries=bounds,
         system_end=system_end,
+        spans=tuple(req.spans),
         top_logprobs=req.top_logprobs if req.logprobs else 0,
         min_response_tokens=min_response,
         max_prompt_tokens=req.max_prompt_tokens,

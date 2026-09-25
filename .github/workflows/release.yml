@@ -76,10 +76,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.1.0
         with:
           python-version: "3.12"
-      - run: uv sync --extra dev
+      - run: uv sync --extra dev --extra vision
       - run: uvx pre-commit run --all-files
       - run: uv run beam doctor --json
       - run: uv run pytest -q
+      - run: uv run pytest -q packages/mlx-beam-vision/tests
 
   build:
     # A push to main was tested in its pull request; a tag or a dispatch is
@@ -95,11 +96,16 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v10.1.0
       - run: uv build
+      # The vision package: the same version from the same tag, its own
+      # wheel and sdist, uploaded with the core's to its own PyPI project.
+      - run: uv build --package mlx-beam-vision
       - run: ls -l dist/
       - name: The built version must match the trigger
         id: version
         run: |
-          built=$(ls dist/*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
+          built=$(ls dist/mlx_beam-*.whl | sed -E 's#.*/mlx_beam-([^-]+)-.*#\1#')
+          vision=$(ls dist/mlx_beam_vision-*.whl | sed -E 's#.*/mlx_beam_vision-([^-]+)-.*#\1#')
+          test "$built" = "$vision" || { echo "::error::core $built and vision $vision differ"; exit 1; }
           echo "built version: $built"
           echo "version=$built" >> "$GITHUB_OUTPUT"
           case "$GITHUB_EVENT_NAME" in

@@ -38,12 +38,25 @@ def unsupported(what: str, param: str | None = None) -> ApiError:
 
 
 def missing_extra(feature: str, extra: str) -> ApiError:
-    """The feature lives outside the core (vision and audio as their own
-    package, structured output behind a guard). No install line until the
-    extra exists: this release provides none of them."""
+    """The feature lives outside the core (audio as its own package,
+    structured output behind a guard). No install line until the extra
+    exists: this release provides neither."""
     return ApiError(
         f"{feature} needs the '{extra}' extra, which this release does not "
         "provide yet",
+        code="extra_not_installed",
+    )
+
+
+def no_vision() -> ApiError:
+    """Images are served by the vision package for a checkpoint with a
+    tower the text trunk can take; this server has no such frontend -
+    the package is missing, or the checkpoint brings no tower, or the
+    provider was refused, and /health.vision says which."""
+    return ApiError(
+        "image input needs the 'vision' extra (mlx-beam[vision]) and a "
+        "checkpoint with a vision tower; this server serves text only - "
+        "/health.vision says why",
         code="extra_not_installed",
     )
 

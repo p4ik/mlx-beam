@@ -1,0 +1,6 @@
+mlx-beam-vision
+Copyright 2026 the mlx-beam contributors
+
+This product includes software developed as part of mlx-vlm
+(https://github.com/Blaizzy/mlx-vlm), MIT License; see
+mlx_beam_vision/_vendor/VENDORED.md and mlx_beam_vision/_vendor/mlx_vlm/LICENSE.

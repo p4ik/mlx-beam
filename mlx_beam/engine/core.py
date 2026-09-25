@@ -36,8 +36,8 @@ from mlx_beam.engine.prefix import (
     snapshot_window,
     window_layers,
 )
-from mlx_beam.engine.priming import PrimingPromptBatch
-from mlx_beam.engine.proposer import check_head
+from mlx_beam.engine.priming import PrimingPromptBatch, image_capabilities
+from mlx_beam.engine.proposer import check_head, trunk
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -191,6 +191,11 @@ class Engine:
         # row present here may speculate; its thinking budget, if any, is
         # checked per cycle.
         self._spec_coupling: dict[int, SeededSampler | None] = {}
+        # uid -> the request's image spans, read by the prefill.
+        self._spans: dict[int, tuple] = {}
+        # What the trunk takes of an image request; checked at submit so a
+        # frontend the model cannot serve is a 400, not a dead worker.
+        self.image_capabilities = image_capabilities(model)
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
@@ -361,6 +366,10 @@ class Engine:
 
     def submit(self, request: GenerationRequest) -> ResultStream:
         self._validate(request)
+        for span in request.spans:
+            # Materialised here, on the caller's stream: a graph left lazy
+            # would be evaluated on the worker's stream, which cannot see it.
+            mx.eval(span.features, *span.extras.values())
         stream = ResultStream(request, self._request_cancel)
         stream.completion_cap, stream.reasoning_cap = self.admit(request)
         with self._lock:
@@ -439,6 +448,17 @@ class Engine:
         return completion_cap, reasoning_cap
 
     def _validate(self, request: GenerationRequest) -> None:
+        if request.spans:
+            can = self.image_capabilities
+            if not can["input_embeddings"]:
+                raise InvalidRequest(
+                    "this model takes no input embeddings; it cannot serve images"
+                )
+            if not can["layer_hook"] and any(s.extras for s in request.spans):
+                raise InvalidRequest(
+                    "this model has no layer hook; the frontend's per-layer "
+                    "image features cannot be applied"
+                )
         p = request.sampling
         # These raise inside the sampler, i.e. inside the worker.
         if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:
@@ -480,6 +500,17 @@ class Engine:
     def _request_cancel(self, request_id: str) -> None:
         with self._lock:
             self._cancelled.add(request_id)
+
+    def _prompt_batch_class(self):
+        """The prefill class: the one that runs the trunk without the lm_head
+        and serves image spans and the draft head, whenever the model
+        exposes its trunk; a model that does not keeps upstream's prefill
+        (and cannot serve images)."""
+        try:
+            trunk(self.model)
+        except ValueError:
+            return None
+        return PrimingPromptBatch.bound(lambda uid: self._spans.get(uid, ()))
 
     def _may_speculate(self, uid: int, tokens: int) -> bool:
         """Whether a cycle of `tokens` may run for the row now: the row was
@@ -586,6 +617,7 @@ class Engine:
         self._budgets.clear()
         self._observed.clear()
         self._spec_coupling.clear()
+        self._spans.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -596,7 +628,7 @@ class Engine:
     def _admit(self, gen: BatchGenerator, stream: ResultStream) -> None:
         req = stream.request
         try:
-            hit = self.prefix_store.fetch(self.model_key, list(req.tokens))
+            hit = self.prefix_store.fetch(self.model_key, req.cache_key)
             if hit is None:
                 cache, covered, carried = (
                     make_request_cache(self.model, self.kv_policy),
@@ -646,6 +678,8 @@ class Engine:
         stream.prompt_cached = covered
         stream.put(PromptProgress(0, len(rest), covered))
         self._live[uid] = stream
+        if req.spans:
+            self._spans[uid] = tuple(req.spans)
         # Copies of the store's own checkpoint dicts: a sidecar written into
         # a row's checkpoints must never land in the entry it came from.
         self._bookkeeping[uid] = (covered, {p: dict(c) for p, c in carried.items()})
@@ -726,6 +760,16 @@ class Engine:
             return
         self._bookkeeping[uid][1][position] = snap
 
+    @staticmethod
+    def _store_key(request: GenerationRequest, tokens: list[int]) -> list[int]:
+        """What the store files a finished (or cut) row under: the request's
+        cache key (image spans as digests) over the prompt positions the
+        row computed - a prefill cut short by a cancel holds fewer than the
+        prompt, and the entry's length is the key's - plus what was
+        generated."""
+        n = len(request.tokens)
+        return request.cache_key[: min(len(tokens), n)] + list(tokens[n:])
+
     def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
         """The draft head's history at the end of a row, next to the entry's
         end state: the next turn of the conversation resumes it whole."""
@@ -749,6 +793,8 @@ class Engine:
         last = max([covered, *taken])
         if position // stride <= last // stride or position in checkpoints:
             return
+        if any(s.start < position < s.end for s in self._spans.get(uid, ())):
+            return  # never inside an image: a cut there would split it
         self._checkpoint(gen, uid, position, windows=False)
         if position not in checkpoints:
             return  # a plain model: nothing was stored
@@ -780,7 +826,8 @@ class Engine:
             partial = {}
             gen.remove(uids)
         for u in uids:
-            self._live.pop(u).put(None)
+            stream = self._live.pop(u)
+            stream.put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
@@ -799,7 +846,7 @@ class Engine:
                 cache = for_store(cache)
                 self.prefix_store.insert(
                     self.model_key,
-                    list(tokens),
+                    self._store_key(stream.request, list(tokens)),
                     cache,
                     checkpoints=checkpoints,
                     cache_type="assistant",
@@ -831,7 +878,7 @@ class Engine:
         entry of its own when the request marked one."""
         own_recurrent_state(r.prompt_cache)
         stored = for_store(r.prompt_cache)
-        tokens = list(r.all_tokens)
+        tokens = self._store_key(s.request, list(r.all_tokens))
         self._head_checkpoint(r.uid, checkpoints, len(tokens))
         self.prefix_store.insert(
             self.model_key,
@@ -886,6 +933,7 @@ class Engine:
         self._stride.pop(uid, None)
         self._budgets.pop(uid, None)
         self._observed.pop(uid, None)
+        self._spans.pop(uid, None)
         self._forget_row(uid)
         gen.stall_streak = 0
         self.stalls_refused += 1
@@ -894,6 +942,7 @@ class Engine:
 
     def _forget_row(self, uid: int) -> None:
         self._spec_coupling.pop(uid, None)
+        self._spans.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
@@ -975,7 +1024,7 @@ class Engine:
             stop_tokens=[],
             generation_batch=batch_class,
             on_step=self._on_step,
-            prompt_batch=PrimingPromptBatch if self.speculator is not None else None,
+            prompt_batch=self._prompt_batch_class(),
             prefill_valve=self.prefill_valve,
             **self._gen_args,
         )

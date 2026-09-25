@@ -208,10 +208,15 @@ class MuseGlimmerModel(nn.Module):
             out.append(made[t])
         return out
 
-    def __call__(self, inputs: mx.array, cache=None):
-        h = self.embed_tokens(inputs)
+    def embed_inputs(self, inputs: mx.array) -> mx.array:
         # Scaleless RMSNorm on the embeddings (not Gemma's sqrt scaling).
-        h = mx.fast.rms_norm(h, None, self.embed_eps)
+        return mx.fast.rms_norm(self.embed_tokens(inputs), None, self.embed_eps)
+
+    def __call__(self, inputs: mx.array, cache=None, input_embeddings=None):
+        # input_embeddings stand in for embed_inputs(inputs): the normed
+        # token embeddings, with a vision frontend's image features (normed
+        # by its own scaleless norm) in place of the placeholders. VENDORED.md.
+        h = self.embed_inputs(inputs) if input_embeddings is None else input_embeddings
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -232,8 +237,8 @@ class Model(nn.Module):
         if not self.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache=None):
-        out = self.model(inputs, cache=cache)
+    def __call__(self, inputs: mx.array, cache=None, input_embeddings=None):
+        out = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -245,8 +250,10 @@ class Model(nn.Module):
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            # Drop the vision tower — this is a text-only port.
-            if k.startswith(("vision_tower", "vision_adapter", "vision_projection")):
+            # Drop the vision tower (either layout) — this is a text-only port.
+            if k.removeprefix("model.").startswith(
+                ("vision_tower", "vision_adapter", "vision_projection")
+            ):
                 continue
             # Meta/MLX nest the text tower under language_model.*
             if k.startswith("language_model.model."):

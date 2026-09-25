@@ -152,15 +152,24 @@ class GraniteModel(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings=None,
+        layer_hook=None,
     ):
-        h = self.embed_tokens(inputs) * self.embedding_multiplier
+        # input_embeddings stand in for embed_tokens(inputs) (a vision
+        # frontend's image positions among them); layer_hook(index, hidden)
+        # runs before each layer, what Granite Vision adds at the image
+        # positions ahead of its target layers. VENDORED.md, layer hook.
+        h = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
+        h = h * self.embedding_multiplier
 
         if cache is None:
             cache = [None] * len(self.layers)
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            if layer_hook is not None:
+                h = layer_hook(i, h)
             h = layer(h, mask, cache=c)
 
         return self.norm(h)
@@ -180,8 +189,12 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache=None,
+        input_embeddings=None,
+        layer_hook=None,
     ):
-        out = self.model(inputs, cache)
+        out = self.model(
+            inputs, cache, input_embeddings=input_embeddings, layer_hook=layer_hook
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
