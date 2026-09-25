@@ -241,11 +241,26 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         "for an external drafter is not supported yet",
     )
     spec.add_argument(
+        "--exact-verify",
+        choices=("off", "kernels", "positions"),
+        default="off",
+        help="how the verify runs: 'off' checks the k+1 drafts in one forward "
+        "(the fast path; /health.speculative.exact says whether that forward "
+        "gives the same logits as one-token forwards on this machine); "
+        "'kernels' runs that forward through projections and attention that "
+        "keep single-row arithmetic for a block (vendored from mlx-vlm) and "
+        "keeps them only if the warm-up finds them bit-equal, else falls back "
+        "to 'off' and says so; 'positions' feeds one token per forward and "
+        "stops at the first rejected draft - exact by construction at plain "
+        "decoding's cost, the reference for the other two",
+    )
+    spec.add_argument(
         "--max-draft-tokens",
         type=_positive_int,
         default=3,
-        help="cap on the drafts verified per cycle (default: 3, the fixed depth "
-        "at this stage; a lower value lowers it)",
+        help="cap on the drafts verified per cycle; the regulator picks each "
+        "cycle's depth below it from the acceptance and the cycle cost it "
+        "measures (default: 3, the depth with the best gain measured on a 27B)",
     )
     cache = p.add_argument_group("prompt cache")
     cache.add_argument(
@@ -606,6 +621,7 @@ def serve(args) -> int:
         max_prompt_tokens=args.max_prompt_tokens,
         max_queued=args.max_queued,
         proposer=proposer,
+        exact_verify=args.exact_verify,
         max_draft_tokens=args.max_draft_tokens,
     )
     try:

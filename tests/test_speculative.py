@@ -13,11 +13,14 @@ import pytest
 from mlx_beam._vendor.mlx_lm.models import qwen3_5, qwen3_next
 from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_beam.engine import Engine, EngineDead, GenerationRequest
+from mlx_beam.engine.prefix import HEAD
 from mlx_beam.engine.proposer import (
     BundledHeadProposer,
     MTPHead,
+    NextNHead,
     load_bundled_head,
     shift_norms,
+    trunk,
 )
 from mlx_beam.engine.request import SamplingParams
 from mlx_beam.engine.speculative import rollback_recurrent
@@ -43,9 +46,12 @@ def plain_transcript(model, prompt, n):
 
 
 class OracleProposer:
-    """Drafts from a script: `start(transcript)` hands it the plain greedy
+    """Drafts from a script: `start(transcript)` hands it the plain
     continuation, `plan(call)` says how many of a call's drafts are right
-    before a wrong one follows."""
+    before a wrong one follows. It follows each row's position through the
+    script: a plain step feeds one token of the script (`follow`), a cycle
+    `1 + accepted` (`commit`); the prompt's last token, fed by the generation
+    batch's first step, is followed with no hidden state before it."""
 
     kind = "oracle"
 
@@ -55,24 +61,54 @@ class OracleProposer:
         self.calls = 0
         self.commits = []
         self.dropped = []
+        self.followed = []
+        # (position, scripted, committed): where the engine left the script.
+        self.diverged = []
+        self._current = []
+        self._pos = {}
 
-    def propose(self, uid, hidden, token):
-        seq, pos = self._current, self._pos
+    def propose(self, uid, hidden, token, choose=None, depth=None):
+        seq, pos = self._current, self._pos.get(uid, 0)
         if not seq:
             return mx.array([], dtype=mx.uint32)  # unscripted: decode plainly
         self.calls += 1
         t = int(token.item())
-        assert seq[pos] == t, (seq[pos], t, pos)
+        if seq[pos] != t:
+            # The engine committed a token the script does not have. Where
+            # the block verify is not bit-equal to plain steps (Metal) that
+            # is the kernel's doing, not the bookkeeping's: recorded, the
+            # script ends and the row decodes plainly. A test that needs the
+            # script to hold asserts `not diverged` - a raise here would end
+            # the worker instead of the test.
+            self.diverged.append((pos, seq[pos], t))
+            self._current = []
+            return mx.array([], dtype=mx.uint32)
         right = self.plan(self.calls)
         drafts = []
-        for i in range(self.depth):
-            true = seq[pos + 1 + i] if pos + 1 + i < len(seq) else 0
+        for i in range(self.depth if depth is None else depth):
+            if pos + 1 + i >= len(seq):
+                break  # the script ends here: nothing to draft beyond it
+            true = seq[pos + 1 + i]
             drafts.append(true if i < right else (true + 1) % 64)
         return mx.array(drafts, dtype=mx.uint32)
 
     def commit(self, uid, hidden, tokens):
         self.commits.append(list(tokens))
-        self._pos += 1 + len(tokens)
+        self._pos[uid] = self._pos.get(uid, 0) + 1 + len(tokens)
+
+    def follow(self, uid, hidden, token):
+        self.followed.append(uid)
+        if hidden is not None:  # None: the prompt's last token, not the script's
+            self._pos[uid] = self._pos.get(uid, 0) + 1
+
+    def begin(self, uid, prompt_len, snapshot):
+        pass
+
+    def prime(self, uid, hidden, tokens, start):
+        pass
+
+    def snapshot(self, uid):
+        return None
 
     def drop(self, uid):
         self.dropped.append(uid)
@@ -81,12 +117,36 @@ class OracleProposer:
         return {"kind": self.kind}
 
     def start(self, seq):
-        self._current, self._pos = seq, 0
+        self._current, self._pos = seq, {}
 
 
 def warm_script(model):
     """What the warm-up row generates: the oracle must script it too."""
     return plain_transcript(model, [1], 8)
+
+
+def bit_exact(spec: dict) -> bool:
+    """Whether this verify commits exactly the plain tokens on this
+    machine. Per position it does by construction; the block path only
+    where the width probe found the same bytes - on the CPU always, on
+    Metal not (the quantized matmul from two rows on, the multi-query
+    attention); the kernel path where its self-check held and the mode
+    stayed. Bit-equality is evidence only where it can fail: the CPU
+    cannot refute it, the Mac can."""
+    if spec["mode"] == "positions":
+        return True
+    if spec["mode"] == "kernels":
+        return True
+    return bool(spec["exact"]["block_equals_positions"])
+
+
+def assert_plain(engine, out, truth):
+    """`out` is the plain transcript wherever the verify is bit-exact on
+    this machine (`bit_exact`); elsewhere the row still has to run through
+    to its length - the tokens are the kernel's, not the bookkeeping's."""
+    assert len(out) == len(truth), (len(out), len(truth))
+    if bit_exact(engine.speculator.describe()):
+        assert out == truth
 
 
 def run_speculative(model, proposer, **kw):
@@ -116,11 +176,13 @@ def test_committed_tokens_equal_plain_greedy(name, plan):
     with engine:
         oracle.start(truth)
         out = collect(engine.submit(GenerationRequest(prompt, max_tokens=n)))
-    assert out == truth
     spec = engine.speculator.describe()
     assert spec["cycles"] > 0
-    if name == "everything":
-        assert spec["accepted"] == spec["drafted"]
+    assert len(out) == n
+    if bit_exact(spec):
+        assert out == truth and not oracle.diverged
+        if name == "everything":
+            assert spec["accepted"] == spec["drafted"]
     if name == "nothing":
         assert spec["accepted"] == 0
 
@@ -131,8 +193,19 @@ def test_health_reports_the_cycle_counters():
     engine = run_speculative(model, oracle)
     with engine:
         h = engine.health()["speculative"]
-        assert h["proposer"]["kind"] == "oracle" and h["depth"] == 3
+        assert h["proposer"]["kind"] == "oracle" and h["max_depth"] == 3
         assert h["cycles"] >= 1 and h["parked"] is False
+        reg = h["regulator"]
+        # After the warm-up the regulator starts over: nothing measured,
+        # the priors in place, the cap as the depth to come.
+        assert reg["cost_ms"]["plain"] is None and not reg["cost_ms"]["cycle"]
+        assert len(reg["acceptance_by_position"]) == 3 and reg["reason"] is None
+        oracle.start(plain_transcript(model, [3, 7, 11], 12))
+        collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=12)))
+        reg = engine.health()["speculative"]["regulator"]
+        # One plain step measured first, then cycles at the cap.
+        assert reg["cost_ms"]["plain"] is not None and reg["cost_ms"]["cycle"]
+        assert 1 <= reg["depth"] <= 3
 
 
 def test_finish_inside_a_block_trims_the_block():
@@ -191,30 +264,213 @@ def test_two_rows_decode_plainly_and_alone_speculates_again():
     assert engine.speculator.describe()["plain_steps"] > 0
 
 
-def test_non_greedy_and_processed_rows_decode_plainly():
+class FixedDraftProposer:
+    """Drafts the same tokens on every call: what the target makes of a
+    draft must not depend on what was drafted."""
+
+    kind = "fixed"
+
+    def __init__(self, drafts):
+        self.drafts = list(drafts)
+        self.depth = len(self.drafts)
+
+    def propose(self, uid, hidden, token, choose=None, depth=None):
+        return mx.array(self.drafts[:depth], dtype=mx.uint32)
+
+    def commit(self, uid, hidden, tokens):
+        pass
+
+    def follow(self, uid, hidden, token):
+        pass
+
+    def begin(self, uid, prompt_len, snapshot):
+        pass
+
+    def prime(self, uid, hidden, tokens, start):
+        pass
+
+    def snapshot(self, uid):
+        return None
+
+    def drop(self, uid):
+        pass
+
+    def describe(self):
+        return {"kind": self.kind}
+
+    def start(self, seq):
+        pass
+
+
+SAMPLED = SamplingParams(temperature=0.9, top_k=16, seed=17)
+
+
+@pytest.mark.parametrize("mode", ["off", "positions"])
+def test_sampled_row_speculates_and_matches_its_plain_seeded_transcript(mode):
+    """Keyed by position, the draws inside a verify cycle are the draws a
+    plain step would have made: the transcript of a seeded request is the
+    same with and without the proposer, however the drafts fall."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    n = 24
+    with Engine(model) as plain:
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=n, sampling=SAMPLED))
+        )
+        assert truth != collect(plain.submit(GenerationRequest(prompt, max_tokens=n)))
+    oracle = OracleProposer(lambda call: [0, 3, 1, 2][call % 4])
+    engine = run_speculative(model, oracle, exact_verify=mode)
+    with engine:
+        oracle.start(truth)
+        out = collect(
+            engine.submit(GenerationRequest(prompt, max_tokens=n, sampling=SAMPLED))
+        )
+    assert_plain(engine, out, truth)
+    spec = engine.speculator.describe()
+    assert spec["cycles"] > 0 and spec["accepted"] > 0
+
+
+def test_unseeded_sampled_row_speculates():
     model = tiny_qwen35()
     oracle = OracleProposer(lambda call: 3)
     engine = run_speculative(model, oracle)
     with engine:
-        before = engine.speculator.cycles
         oracle.start([])
-        collect(
+        before = engine.speculator.cycles
+        # Unscripted, the oracle drafts nothing: the fixed proposer below
+        # is what runs the cycles.
+        engine.speculator.proposer = FixedDraftProposer([1, 2, 3])
+        out = collect(
             engine.submit(
                 GenerationRequest(
-                    [3, 7, 11], max_tokens=6, sampling=SamplingParams(temperature=0.8)
+                    [3, 7, 11], max_tokens=12, sampling=SamplingParams(temperature=0.8)
                 )
             )
         )
-        collect(
-            engine.submit(
-                GenerationRequest(
-                    [3, 7, 11],
-                    max_tokens=6,
-                    sampling=SamplingParams(repetition_penalty=1.3),
-                )
-            )
+        assert len(out) == 12
+        assert engine.speculator.cycles > before
+
+
+def test_every_draft_leaves_the_sampled_transcript_alone():
+    """The enumeration oracle: with the first draft run through the whole
+    vocabulary, the committed tokens are the target's own draws every time
+    - accepted when the draft hit them, replaced when it did not."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    vocab = TINY_QWEN35_WRAPPED["text_config"]["vocab_size"]
+    with Engine(model) as plain:
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=6, sampling=SAMPLED))
         )
-        assert engine.speculator.cycles == before
+    proposer = FixedDraftProposer([0, truth[2], truth[3]])
+    engine = Engine(model, proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    hits = 0
+    with engine:
+        engine.speculator.regulator.fixed = 3  # every cycle the full chain
+        for draft in range(vocab):
+            proposer.drafts[0] = draft
+            accepted = engine.speculator.accepted
+            out = collect(
+                engine.submit(GenerationRequest(prompt, max_tokens=4, sampling=SAMPLED))
+            )
+            assert_plain(engine, out, truth[:4])
+            if draft == truth[1]:
+                hits += 1
+                assert engine.speculator.accepted - accepted >= 3
+    assert hits == 1
+
+
+def chi_square(counts, expected):
+    return sum((c - e) ** 2 / e for c, e in zip(counts, expected, strict=True))
+
+
+# Chi-square critical values at p = 0.001 by degrees of freedom.
+CRITICAL_001 = {
+    1: 10.83, 2: 13.82, 3: 16.27, 4: 18.47, 5: 20.52, 6: 22.46, 7: 24.32,
+    8: 26.12, 9: 27.88, 10: 29.59, 11: 31.26, 12: 32.91, 13: 34.53,
+    14: 36.12, 15: 37.70, 16: 39.25,
+}  # fmt: skip
+
+
+def test_committed_draws_follow_the_target_under_an_adversarial_draft():
+    """Chi-square over the first two tokens of 2048 seeds, drafted wrong on
+    purpose (always token 0, never in the top): the first token is a plain
+    step's draw, the second the verify's; their joint distribution is the
+    target's own, top-k-filtered at each position. Every pair falls in a
+    bucket, buckets with an expected count under 5 are pooled."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    proposer = FixedDraftProposer([0, 0, 0])
+    engine = Engine(model, proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    n = 2048
+    pairs = []
+    with engine:
+        engine.speculator.regulator.fixed = 3  # never parks on the losses
+        for seed in range(n):
+            p = SamplingParams(temperature=1.0, top_k=4, seed=seed)
+            out = collect(
+                engine.submit(GenerationRequest(prompt, max_tokens=2, sampling=p))
+            )
+            pairs.append(tuple(out))
+        assert engine.speculator.cycles >= n and engine.speculator.accepted == 0
+
+    def top4(tokens):
+        logits = model(mx.array([tokens]))[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        top = mx.argsort(-logprobs)[:4].tolist()
+        return dict(zip(top, mx.softmax(logprobs[mx.array(top)]).tolist(), strict=True))
+
+    firsts = top4(prompt)
+    expected = {
+        (a, b): n * pa * pb
+        for a, pa in firsts.items()
+        for b, pb in top4([*prompt, a]).items()
+    }
+    assert set(pairs) <= set(expected)
+    counts = {key: pairs.count(key) for key in expected}
+    big = [k for k, e in expected.items() if e >= 5]
+    small = [k for k in expected if k not in big]
+    observed = [counts[k] for k in big]
+    wanted = [expected[k] for k in big]
+    if small:
+        observed.append(sum(counts[k] for k in small))
+        wanted.append(sum(expected[k] for k in small))
+    assert chi_square(observed, wanted) < CRITICAL_001[len(observed) - 1], (
+        observed,
+        wanted,
+    )
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        SamplingParams(repetition_penalty=1.3),
+        SamplingParams(presence_penalty=2.0, frequency_penalty=0.5),
+    ],
+)
+def test_penalised_row_speculates_and_matches_plain(sampling):
+    """A penalty reads the context: the verify hands every position the
+    context a plain step would have, so the transcript is the same."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=16)))
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+    assert truth != free
+    oracle = OracleProposer(lambda call: [3, 1, 0, 2][call % 4])
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(truth)
+        before = engine.speculator.cycles
+        out = collect(
+            engine.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+        assert_plain(engine, out, truth)
+        assert engine.speculator.cycles > before
 
 
 def test_logit_bias_row_speculates_and_matches_plain():
@@ -237,7 +493,7 @@ def test_logit_bias_row_speculates_and_matches_plain():
         out = collect(
             engine.submit(GenerationRequest(prompt, max_tokens=16, sampling=bias))
         )
-        assert out == truth
+        assert_plain(engine, out, truth)
         assert engine.speculator.cycles > before
 
 
@@ -257,8 +513,64 @@ def test_thinking_budget_row_speculates_while_inert():
         out = collect(
             engine.submit(GenerationRequest(prompt, max_tokens=16, reasoning=limits))
         )
-        assert out == truth
+        assert_plain(engine, out, truth)
         assert engine.speculator.cycles > before
+
+
+def _flags(events):
+    return [(e.token, e.forced, e.thinking_truncated, e.finish_reason) for e in events]
+
+
+def test_budget_row_speculates_after_the_forced_close():
+    """A seeded block cut at its budget: the close itself is forced in
+    plain steps (the processor's state changes there), the answer after
+    it speculates although the opener stays masked for its rest - the mask
+    is applied per verify position. Tokens and flags equal the plain run."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=32)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end, nl = unused[:3]
+        limits = ReasoningLimits((start,), (end,), (nl, end), seeded=True, max_tokens=6)
+        req = GenerationRequest(prompt, max_tokens=32, reasoning=limits)
+        truth = list(plain.submit(req))
+    tokens = [e.token for e in truth]
+    assert tokens[5:7] == [nl, end] and len(tokens) == 32
+    oracle = OracleProposer(lambda call: [3, 2, 3, 1][call % 4])
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(tokens)
+        before = engine.speculator.describe()
+        out = list(engine.submit(req))
+        after = engine.speculator.describe()
+    assert _flags(out) == _flags(truth)
+    # Cycles ran in the answer: more than one per plain step would allow.
+    assert after["cycles"] - before["cycles"] >= 4
+    assert after["accepted"] > before["accepted"]
+
+
+def test_budget_that_arms_inside_a_block_is_left_to_plain_steps():
+    """A budget one cycle away from arming holds the row in plain steps for
+    that stretch and speculates again once the close is through: the same
+    transcript as without a proposer, budget counter included."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=24)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end = unused[:2]
+        limits = ReasoningLimits((start,), (end,), (end,), seeded=True, max_tokens=9)
+        req = GenerationRequest(prompt, max_tokens=24, reasoning=limits)
+        truth = list(plain.submit(req))
+    tokens = [e.token for e in truth]
+    assert tokens[9] == end and truth[-1].thinking_truncated
+    oracle = OracleProposer(lambda call: 3)
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(tokens)
+        out = list(engine.submit(req))
+    assert _flags(out) == _flags(truth)
 
 
 def test_cancel_inside_a_cycle_keeps_the_worker():
@@ -285,11 +597,16 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
     class Silent:
         kind, depth = "silent", 3
 
-        def propose(self, uid, hidden, token):
+        def propose(self, uid, hidden, token, choose=None, depth=None):
             return mx.array([], dtype=mx.uint32)
 
         def commit(self, *a):
             pass
+
+        follow = begin = prime = commit
+
+        def snapshot(self, uid):
+            return None
 
         def drop(self, uid):
             pass
@@ -448,7 +765,7 @@ def test_random_head_keeps_plain_greedy_output(tmp_path):
     with engine:
         out = collect(engine.submit(GenerationRequest(prompt, max_tokens=32)))
         h = engine.health()["speculative"]
-    assert out == truth
+    assert_plain(engine, out, truth)
     assert h["proposer"]["kind"] == "mtp" and h["cycles"] >= 8
     assert h["proposer"]["rows_with_history"] == 0  # dropped at finish
 
@@ -494,6 +811,326 @@ def test_head_history_holds_exactly_the_confirmed_pairs(tmp_path):
         assert mx.array_equal(got[..., :4, :], want[..., :4, :])
     proposer.drop(7)
     assert 7 not in proposer._cache and proposer.describe()["rows_with_history"] == 0
+
+
+def head_engine(tmp_path, model, **kw):
+    path = synthetic_head_checkpoint(tmp_path, model, "beam")
+    head, info = load_bundled_head(model, path)
+    proposer = BundledHeadProposer(model, head, 3, info)
+    engine = Engine(model, proposer=proposer, **kw)
+    engine.warmup_tokens = [1]
+    return engine, proposer
+
+
+def head_pairs(model, tokens):
+    """(hidden at every position but the last, the tokens after them): the
+    pairs a head primed over `tokens` holds, from one forward."""
+    inner, _, _ = trunk(model)
+    hidden = inner(mx.array([tokens]))
+    return hidden[:, :-1, :], tokens[1:]
+
+
+def test_prefill_primes_the_head_and_the_store_keeps_its_history(tmp_path):
+    """The prompt's pairs go through the head in the prefill; at the end of
+    the row the head's history - every position of the transcript but the
+    last, whose hidden state waits as the tail - sits in the store entry."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9, 2, 8]
+    truth = plain_transcript(model, prompt, 6)
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=6)))
+        assert_plain(engine, out, truth)
+        d = proposer.describe()
+        # The chunk holds all but the last prompt token: one pair less.
+        assert d["primed_pairs"] == len(prompt) - 2
+        assert d["rows_with_history"] == 0
+        entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+        keys, values, tail = entry.checkpoints[len(prompt) + len(out)][HEAD]
+        assert keys.shape[2] == len(prompt) + len(out) - 1
+        assert tail is not None and tail.shape == (1, 1, 32)
+        assert entry.nbytes >= keys.nbytes + values.nbytes + tail.nbytes
+        # The same pairs, fed to a fresh head in one call, give the same cache.
+        hidden, nexts = head_pairs(model, prompt + out)
+        reference = [KVCache()]
+        mx.eval(proposer.head(hidden, mx.array([nexts]), proposer._embed, reference))
+        ref_keys, ref_values = reference[0].keys_and_values()
+        assert mx.allclose(keys, ref_keys, atol=1e-5, rtol=1e-4)
+        assert mx.allclose(values, ref_values, atol=1e-5, rtol=1e-4)
+
+
+def test_next_turn_resumes_the_head_history_from_the_store(tmp_path):
+    """A conversation continued: the store restores the entry whole and the
+    head's history with it; the prefill primes only the new tokens. The
+    transcript stays the plain one."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        first = collect(engine.submit(GenerationRequest(prompt, max_tokens=5)))
+        primed = proposer.describe()["primed_pairs"]
+        turn2 = prompt + first + [21, 22, 23, 24]
+        truth = plain_transcript(model, turn2, 5)
+        stream = engine.submit(GenerationRequest(turn2, max_tokens=5))
+        out = collect(stream)
+        assert_plain(engine, out, truth)
+        assert stream.prompt_cached == len(prompt) + len(first)
+        d = proposer.describe()
+        assert d["histories_restored"] == 1
+        # Three new tokens in the chunk (the fourth is fed by the first
+        # step): the tail's pair plus two pairs inside the chunk.
+        assert d["primed_pairs"] - primed == 3
+        entry = engine.prefix_store._trie.get(engine.model_key, turn2 + out)
+        keys, _, tail = entry.checkpoints[len(turn2) + len(out)][HEAD]
+        assert keys.shape[2] == len(turn2) + len(out) - 1 and tail is not None
+
+
+def test_boundary_checkpoint_carries_the_head_and_a_prefix_hit_resumes_it(tmp_path):
+    """A request that shares only the system block resumes the head from
+    the boundary's sidecar; one that shares nothing starts the head empty."""
+    model = tiny_qwen35()
+    system = [3, 7, 11, 13, 5, 9, 2, 8]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        first = collect(
+            engine.submit(
+                GenerationRequest(
+                    system + [30, 31, 32], max_tokens=4, boundaries=[len(system)]
+                )
+            )
+        )
+        entry = engine.prefix_store._trie.get(
+            engine.model_key, system + [30, 31, 32] + first
+        )
+        keys, _, tail = entry.checkpoints[len(system)][HEAD]
+        assert keys.shape[2] == len(system) - 1 and tail is not None
+        other = system + [40, 41, 42, 43]
+        truth = plain_transcript(model, other, 4)
+        stream = engine.submit(
+            GenerationRequest(other, max_tokens=4, boundaries=[len(system)])
+        )
+        assert collect(stream) == truth
+        assert stream.prompt_cached == len(system)
+        assert proposer.describe()["histories_restored"] == 1
+        stream = engine.submit(GenerationRequest([50, 51, 52, 53], max_tokens=2))
+        collect(stream)
+        assert stream.prompt_cached == 0
+        assert proposer.describe()["histories_restored"] == 1
+
+
+def test_head_history_survives_plain_steps_beside_another_row(tmp_path):
+    """Two rows decode plainly (no verify beside another row); the pairs
+    they go through are queued and the histories are whole at the end."""
+    model = tiny_qwen35()
+    a, b = [3, 7, 11, 13], [5, 9, 13, 17, 21]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        sa = engine.submit(GenerationRequest(a, max_tokens=8))
+        sb = engine.submit(GenerationRequest(b, max_tokens=8))
+        oa, ob = collect(sa), collect(sb)
+        for prompt, out in ((a, oa), (b, ob)):
+            entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+            keys, _, tail = entry.checkpoints[len(prompt) + len(out)][HEAD]
+            assert keys.shape[2] == len(prompt) + len(out) - 1 and tail is not None
+
+
+def test_history_window_and_queue_cap(tmp_path, monkeypatch):
+    """A prompt longer than the window is primed from its last positions
+    on, as a fresh head that saw only those; a queue past its cap restarts
+    the history from the queue alone."""
+    from mlx_beam.engine import proposer as proposer_mod
+
+    monkeypatch.setattr(proposer_mod, "HEAD_HISTORY", 4)
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9, 2, 8, 6, 4]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=3)))
+        # Window 4 of 10: pairs at positions 6 and 7 from the chunk (8 sits
+        # on the prompt's last token, fed by the first step).
+        assert proposer.describe()["primed_pairs"] == 2
+        entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+        keys, _, _ = entry.checkpoints[len(prompt) + len(out)][HEAD]
+        assert keys.shape[2] == 4 + len(out) - 1
+    monkeypatch.setattr(proposer_mod, "PENDING_CAP", 3)
+    (tmp_path / "second").mkdir()
+    engine, proposer = head_engine(tmp_path / "second", model)
+    with engine:
+        sa = engine.submit(GenerationRequest([3, 7, 11], max_tokens=8))
+        sb = engine.submit(GenerationRequest([5, 9, 13], max_tokens=8))
+        oa, _ = collect(sa), collect(sb)
+        entry = engine.prefix_store._trie.get(engine.model_key, [3, 7, 11] + oa)
+        keys, _, _ = entry.checkpoints[3 + len(oa)][HEAD]
+        # Two rows decode plainly, the queue fills past the cap and goes
+        # into the head as it fills: the history stays whole (the prompt's
+        # pairs and every plain step's), nothing pending, nothing dropped.
+        assert keys.shape[2] == 3 + len(oa) - 1
+        assert not proposer._pending
+
+
+@pytest.mark.parametrize("kind", ["qwen", "qwen_yarn", "mla"])
+def test_a_restored_history_past_the_window_keeps_its_relative_positions(
+    monkeypatch, kind
+):
+    """A stored history longer than HEAD_HISTORY is cut to the window on
+    restore. The kept rows carry their old rotary positions; the cache
+    resumes at the window's length, so they are moved back by the count
+    dropped - the next pair then sees them at the distances it would from
+    a head that started at the window. Which rows are rotated (MLA keeps
+    its rotated `k_pe` in the values) and how (YaRN multiplies an
+    amplitude in that must not be applied twice) come from the head."""
+    from mlx_beam.engine import proposer as mod
+    from tests.test_model_classes import tiny
+
+    monkeypatch.setattr(mod, "HEAD_HISTORY", 4)
+    if kind == "mla":
+        model = tiny("glm4_moe_lite")
+        args = model.args
+        head = mod.NextNHead(args, type(model.model.layers[-1]), False, False)
+    else:
+        model = tiny_qwen35()
+        args = model.language_model.args
+        if kind == "qwen_yarn":
+            args.rope_scaling = {
+                "type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 16,
+                "mscale": 1.0,
+                "mscale_all_dim": 0.0,
+            }
+        head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
+    mx.eval(head.parameters())
+    rope = head.layers[0].self_attn.rope
+    if kind == "qwen_yarn":
+        assert type(rope).__name__ == "YarnRoPE" and rope.mscale != 1.0
+    prop = mod.BundledHeadProposer(model, head, 3, {})
+    h = mx.random.normal((1, 8, args.hidden_size))
+    ids = mx.array([[3, 7, 11, 13, 5, 9, 2, 8]])
+    mx.eval(prop._feed(0, h, ids)[0])
+    snapshot = prop.snapshot(0)
+    assert snapshot[0].shape[2] == 8
+    prop.begin(1, 9, snapshot)
+    assert prop._cache[1][0].offset == 4
+    # A one-layer head's rows depend on each pair alone: a head fed the
+    # last four pairs from scratch is the reference.
+    prop.begin(2, 9, None)
+    mx.eval(prop._feed(2, h[:, -4:], ids[:, -4:])[0])
+    next_h = mx.random.normal((1, 1, args.hidden_size))
+    next_t = mx.array([[6]])
+    got = prop._feed(1, next_h, next_t)[0]
+    want = prop._feed(2, next_h, next_t)[0]
+    mx.eval(got, want)
+    assert mx.allclose(got, want, atol=1e-5, rtol=1e-4).item()
+
+
+def test_a_history_no_rotation_can_rewind_is_kept_whole(monkeypatch, caplog):
+    from mlx_beam.engine import proposer as mod
+
+    monkeypatch.setattr(mod, "HEAD_HISTORY", 4)
+    model = tiny_qwen35()
+    args = model.language_model.args
+    head = mod.MTPHead(args, type(model.language_model.model.layers[1]))
+    mx.eval(head.parameters())
+    head.layers[0].self_attn.rope = object()  # a module shift_positions does not know
+    prop = mod.BundledHeadProposer(model, head, 3, {})
+    keys = mx.zeros((1, 2, 8, 16))
+    values = mx.zeros((1, 2, 8, 16))
+    with caplog.at_level("WARNING", logger="beam.proposer"):
+        kept_k, kept_v = prop._windowed(keys, values)
+    assert kept_k.shape[2] == 8 and kept_v.shape[2] == 8
+    assert "kept whole" in caplog.text
+
+
+def nextn_checkpoint(tmp_path, model, form_in_manifest="glm_nextn"):
+    """A tiny GLM checkpoint whose NextN layer sits in `mtp/weights.safetensors`
+    under the checkpoint's own names (`model.layers.<N>.*`, experts one by
+    one, `kv_b_proj` whole), the way a package built from the base ships
+    it; the manifest names the form."""
+    from mlx_beam.package import sha256_of
+    from tests.test_model_classes import CLASSES
+
+    args = model.args
+    head = NextNHead(args, type(model.model.layers[-1]), own_embed=True, own_head=True)
+    mx.eval(head.parameters())
+    flat = dict(nn.utils.tree_flatten(head.parameters()))
+    n = args.num_hidden_layers
+    hf = {}
+    for k, v in flat.items():
+        if k.startswith("layers.0."):
+            k = k[len("layers.0.") :]
+        if k == "norm.weight":
+            k = "shared_head.norm.weight"
+        elif k == "head.weight":
+            k = "shared_head.head.weight"
+        hf[f"model.layers.{n}.{k}"] = v
+    prefix = f"model.layers.{n}"
+    for m in ("gate_proj", "down_proj", "up_proj"):
+        stacked = hf.pop(f"{prefix}.mlp.switch_mlp.{m}.weight")
+        for e in range(args.n_routed_experts):
+            hf[f"{prefix}.mlp.experts.{e}.{m}.weight"] = stacked[e]
+    wk = hf.pop(f"{prefix}.self_attn.embed_q.weight")
+    wv = hf.pop(f"{prefix}.self_attn.unembed_out.weight")
+    kv_b = mx.concatenate([wk.swapaxes(-1, -2), wv], axis=1)
+    hf[f"{prefix}.self_attn.kv_b_proj.weight"] = kv_b.reshape(-1, args.kv_lora_rank)
+    (tmp_path / "mtp").mkdir()
+    (tmp_path / "extras").mkdir()
+    head_file = tmp_path / "mtp" / "weights.safetensors"
+    mx.save_safetensors(str(head_file), hf)
+    cfg = dict(CLASSES["glm4_moe_lite"]["cfg"])
+    cfg["extras"] = {"manifest": "extras/manifest.json"}
+    entry = {"file": "mtp/weights.safetensors", "sha256": sha256_of(head_file)}
+    if form_in_manifest:
+        entry["form"] = form_in_manifest
+    (tmp_path / "extras" / "manifest.json").write_text(
+        json.dumps({"format": "beam", "version": 1, "parts": {"mtp": entry}})
+    )
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    return head, tmp_path
+
+
+def test_nextn_head_loads_from_the_checkpoint_names_and_drafts(tmp_path):
+    """The second head form: a NextN layer read through the trunk's own
+    sanitize (experts stacked, latent projection split), quantized like a
+    Qwen head, norms untouched; the engine drafts with it and the
+    transcript stays the plain one."""
+    from tests.test_model_classes import tiny
+
+    model = tiny("glm4_moe_lite")
+    original, path = nextn_checkpoint(tmp_path, model)
+    head, info = load_bundled_head(model, path)
+    assert isinstance(head, NextNHead)
+    assert info["form"] == "glm_nextn" and not info["norms_shifted"]
+    assert info["own_embedding"] and info["own_head"] and info["bits"] == 4
+    assert isinstance(head.eh_proj, nn.Linear) and not isinstance(
+        head.eh_proj, nn.QuantizedLinear
+    )
+    assert isinstance(head.head, nn.QuantizedLinear)
+    assert isinstance(head.embed_tokens, nn.QuantizedEmbedding)
+    # The round trip through the checkpoint's names is exact.
+    assert mx.array_equal(
+        head.layers[0].self_attn.embed_q.weight,
+        original.layers[0].self_attn.embed_q.weight,
+    )
+    assert mx.array_equal(head.enorm.weight, original.enorm.weight)
+    prompt = [3, 7, 11, 13, 5, 9]
+    truth = plain_transcript(model, prompt, 24)
+    proposer = BundledHeadProposer(model, head, 3, info)
+    assert proposer._lm_head is head.head
+    engine = Engine(model, proposer=proposer)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=24)))
+        h = engine.health()["speculative"]
+    assert_plain(engine, out, truth)
+    assert h["cycles"] >= 4 and h["proposer"]["form"] == "glm_nextn"
+
+
+def test_manifest_form_must_match_the_tensors(tmp_path):
+    from tests.test_model_classes import tiny
+
+    model = tiny("glm4_moe_lite")
+    _, path = nextn_checkpoint(tmp_path, model, form_in_manifest="qwen_mtp")
+    with pytest.raises(ValueError, match="form says 'qwen_mtp'"):
+        load_bundled_head(model, path)
 
 
 def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):
@@ -614,3 +1251,195 @@ def test_the_trunk_head_reproduces_the_model_logits_or_is_refused():
     )
     with pytest.raises(ValueError, match="disagree"):
         check_head(model, [3, 7, 11, 13])
+
+
+# -- the Mamba-2 rollback (Granite 4) ----------------------------------------
+
+
+def mamba2_layer(dtype=mx.float32):
+    from mlx_beam._vendor.mlx_lm.models import granitemoehybrid
+    from tests.test_model_classes import CLASSES
+
+    mx.random.seed(93)
+    args = granitemoehybrid.ModelArgs.from_dict(CLASSES["granitemoehybrid"]["cfg"])
+    layer = granitemoehybrid.GraniteMoeHybridMamba2Mixer(args)
+    layer.set_dtype(dtype)
+    layer.eval()
+    mx.eval(layer.parameters())
+    return layer
+
+
+@pytest.mark.parametrize("keep", [1, 2, 3])
+def test_mamba2_rollback_matches_a_shorter_forward(keep):
+    """The Mamba-2 replay from the stash: a four-token verify rolled back to
+    `keep` tokens equals a forward of just those tokens from the same state
+    - conv window and SSM state alike. The selective-scan update runs the
+    same ops on both sides, so the states match to the last bit here."""
+    layer = mamba2_layer()
+    x = mx.random.normal((1, 9, 64))
+    spec, plain = ArraysCache(2), ArraysCache(2)
+    mx.eval(
+        layer(x[:, :5], mask=None, cache=spec), layer(x[:, :5], mask=None, cache=plain)
+    )
+    spec.stash = {}
+    mx.eval(layer(x[:, 5:], mask=None, cache=spec))
+    assert spec.stash["kind"] == "mamba2"
+    rollback_recurrent(spec, keep, 4)
+    spec.stash = None
+    mx.eval(layer(x[:, 5 : 5 + keep], mask=None, cache=plain))
+    mx.eval(*spec.cache, *plain.cache)
+    # Bit-equal where the layer's own four-token forward is bit-equal to four
+    # single steps from the same state (the CPU); on Metal the chunked scan
+    # and the step differ in the last bits, and the replay follows the step.
+    probe_block, probe_steps = ArraysCache(2), ArraysCache(2)
+    mx.eval(
+        layer(x[:, :5], mask=None, cache=probe_block),
+        layer(x[:, :5], mask=None, cache=probe_steps),
+    )
+    mx.eval(layer(x[:, 5:9], mask=None, cache=probe_block))
+    for i in range(5, 9):
+        mx.eval(layer(x[:, i : i + 1], mask=None, cache=probe_steps))
+    exact = all(
+        mx.array_equal(a, b).item()
+        for a, b in zip(probe_block.cache, probe_steps.cache, strict=True)
+    )
+    for got, want in zip(spec.cache, plain.cache, strict=True):
+        assert mx.allclose(got, want, atol=1e-5, rtol=1e-4)
+        if exact:
+            assert mx.array_equal(got, want)
+
+
+# -- the sliding-window rollback -----------------------------------------------
+
+
+@pytest.mark.parametrize("keep", [1, 2, 3, 4])
+@pytest.mark.parametrize("fill", [3, 8, 13])
+def test_window_rollback_matches_a_shorter_feed(keep, fill):
+    """A rotated ring cannot trim (its stale tail stays), so the verify
+    restores the state before the cycle and writes the kept tokens again.
+    The window then holds exactly what feeding those tokens alone would
+    have left - before the ring is full, at the fill line, and rotated."""
+    from mlx_beam._vendor.mlx_lm.models.cache import BatchRotatingKVCache
+    from mlx_beam.engine.speculative import rollback_window
+
+    mx.random.seed(7)
+    keys = mx.random.normal((1, 1, fill + 4, 4))
+    values = mx.random.normal((1, 1, fill + 4, 4))
+    spec, plain = (BatchRotatingKVCache(8, [0]) for _ in range(2))
+    for i in range(fill):  # one token at a time, the decode path
+        for c in (spec, plain):
+            c.update_and_fetch(keys[..., i : i + 1, :], values[..., i : i + 1, :])
+    before = tuple(v[:] if isinstance(v, mx.array) else v for v in spec.state)
+    spec.update_and_fetch(keys[..., fill:, :], values[..., fill:, :])  # the verify
+    rollback_window(spec, before, keep, 4)
+    plain.update_and_fetch(
+        keys[..., fill : fill + keep, :], values[..., fill : fill + keep, :]
+    )
+    for c in (spec, plain):
+        c._temporal_order()
+    got_k, got_v = spec.keys_and_values()
+    want_k, want_v = plain.keys_and_values()
+    assert spec.offset.tolist() == plain.offset.tolist()
+    assert mx.array_equal(
+        got_k[..., -min(8, fill + keep) :, :], want_k[..., -min(8, fill + keep) :, :]
+    )
+    assert mx.array_equal(
+        got_v[..., -min(8, fill + keep) :, :], want_v[..., -min(8, fill + keep) :, :]
+    )
+
+
+# -- the exact verify: class swap, context, width check -----------------------
+
+
+def test_exact_install_swaps_the_quantized_projections_and_back():
+    import mlx.nn as nn
+
+    from mlx_beam.engine import exact
+    from tests.test_model_classes import tiny
+
+    model = tiny("gpt_oss")
+    nn.quantize(model, group_size=32, bits=8)
+    mx.eval(model.parameters())
+    counts = exact.install(model)
+    assert counts["linear"] > 0 and counts["switch"] > 0
+    kinds = {type(m).__name__ for _, m in model.named_modules()}
+    assert "ExactQuantizedLinear" in kinds and "QuantizedLinear" not in kinds
+    x = mx.array([[3, 7, 11, 13]])
+    # Outside the context the swapped classes run the stock path: same bytes.
+    before = model(x)
+    exact.uninstall(model)
+    kinds = {type(m).__name__ for _, m in model.named_modules()}
+    assert "ExactQuantizedLinear" not in kinds and "QuantizedLinear" in kinds
+    assert mx.array_equal(before, model(x))
+
+
+def test_width_check_reports_the_probe_and_the_kernel_path():
+    from mlx_beam.engine import KVPolicy, exact
+    from mlx_beam.engine.speculative import width_check
+    from tests.test_model_classes import tiny
+
+    model = tiny("mistral3")
+    plain = width_check(model, KVPolicy(), [3, 7, 11, 13, 17, 19, 23, 29], 4)
+    assert plain["width"] == 4 and plain["path"] == "block"
+    assert set(plain) >= {
+        "block_equals_positions",
+        "max_abs_logit_diff",
+        "argmax_equal",
+    }
+    exact.install(model)
+    kernels = width_check(
+        model, KVPolicy(), [3, 7, 11, 13, 17, 19, 23, 29], 4, exact=True
+    )
+    assert kernels["path"] == "kernels"
+    # The probe reports, it does not promise: on the CPU the per-position
+    # projections and per-query attention are bit-equal by construction, on
+    # Metal 0.32.2 they are not (measured 2026-09-25) and the engine falls
+    # back to the block verify with the reason in health. What must hold is
+    # that the two readings agree.
+    assert isinstance(kernels["block_equals_positions"], bool)
+    assert kernels["block_equals_positions"] == (kernels["max_abs_logit_diff"] == 0.0)
+
+
+def test_positions_verify_stops_feeding_at_the_length_limit():
+    """The per-position verify checks the row's limits on each token before
+    it feeds the next: what the store gets is exactly what was emitted, no
+    position beyond the cut (the block path trims for this instead)."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11]
+    truth = plain_transcript(model, prompt, 12)
+    oracle = OracleProposer(lambda call: 3)
+    engine = run_speculative(model, oracle, exact_verify="positions")
+    engine.speculator.regulator.fixed = 3
+    with engine:
+        oracle.start(truth)
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=2)))
+    assert out == truth[:2]
+    entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+    assert entry is not None
+    offsets = [c.offset for c in entry.cache if hasattr(c, "offset")]
+    assert offsets and all(o == entry.length for o in offsets), (entry.length, offsets)
+
+
+def test_positions_verify_hands_the_penalties_the_cycle_so_far():
+    """A presence or frequency penalty at the cycle's later positions sees
+    the tokens fed before it in the cycle, as a plain step would: the
+    logprobs match plain decoding, not only the tokens."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    sampling = SamplingParams(presence_penalty=2.0, frequency_penalty=0.5)
+    with Engine(model) as plain:
+        truth = list(
+            plain.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+    oracle = OracleProposer(lambda call: 3)
+    engine = run_speculative(model, oracle, exact_verify="positions")
+    engine.speculator.regulator.fixed = 3
+    with engine:
+        oracle.start([e.token for e in truth])
+        got = list(
+            engine.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+    assert [e.token for e in got] == [e.token for e in truth]
+    assert [e.logprob for e in got] == pytest.approx(
+        [e.logprob for e in truth], abs=1e-6
+    )

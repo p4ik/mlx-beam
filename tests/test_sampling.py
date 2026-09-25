@@ -8,6 +8,7 @@ from mlx_beam.engine.sampling import (
     SamplerPool,
     SeededSampler,
     greedy_sampler,
+    position_key,
     top_logprobs,
 )
 from tests.test_engine import collect, tiny_hybrid
@@ -53,6 +54,50 @@ def test_seeded_sampler_ignores_the_global_state():
     # XTC with probability 1 removes every candidate above the threshold but
     # the least likely of them: index 3 (0.15) and the tail below stay.
     assert set(draws(SeededSampler(xtc))) == {3, 4}
+
+
+def chi_square(counts, expected):
+    return sum((c - e) ** 2 / e for c, e in zip(counts, expected, strict=True))
+
+
+def test_seeded_draws_follow_the_filtered_distribution():
+    """4096 draws under 4096 position keys against the top-k-filtered,
+    tempered distribution: chi-square over the four survivors, and the
+    tail never appears. Critical value at 3 degrees of freedom and
+    p = 0.001 is 16.27."""
+    p = SamplingParams(temperature=0.7, top_k=4, seed=5)
+    sampler = SeededSampler(p)
+    probs = mx.array([[0.3, 0.25, 0.2, 0.15, 0.1]])
+    logprobs = mx.log(probs)
+    n = 4096
+    tokens = [int(sampler(logprobs).item()) for _ in range(n)]
+    assert sampler.position == n
+    counts = [tokens.count(t) for t in range(5)]
+    assert counts[4] == 0
+    kept = probs[0, :4] ** (1 / 0.7)
+    expected = (kept / kept.sum() * n).tolist()
+    assert chi_square(counts[:4], expected) < 16.27
+
+
+def test_draws_are_keyed_by_position_not_by_call():
+    """The n-th call and `draw(.., n)` are the same token; a sampler that
+    skips ahead with `advance` continues where the other one is - so a
+    verify cycle that draws several positions at once and a plain step
+    that draws one produce the same transcript."""
+    p = SamplingParams(temperature=1.0, top_k=4, seed=21)
+    logprobs = mx.log(mx.array([[0.3, 0.25, 0.2, 0.15, 0.1]]))
+    a, b = SeededSampler(p), SeededSampler(p)
+    called = [int(a(logprobs).item()) for _ in range(12)]
+    drawn = [int(b.draw(logprobs, n).item()) for n in range(12)]
+    assert called == drawn and b.position == 0
+    b.advance(7)
+    assert int(b(logprobs).item()) == called[7] and b.position == 8
+    # A seed given at construction stands in for the request's.
+    c = SeededSampler(SamplingParams(temperature=1.0, top_k=4), seed=21)
+    assert [int(c(logprobs).item()) for _ in range(12)] == called
+    # Distinct keys per (seed, position); neighbouring seeds do not overlap.
+    keys = {tuple(position_key(s, n).tolist()) for s in (0, 1, 2) for n in range(4)}
+    assert len(keys) == 12
 
 
 def test_top_logprobs_are_sorted_best_first():

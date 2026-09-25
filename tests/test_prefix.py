@@ -123,7 +123,7 @@ def test_chat_boundaries_from_the_template():
     )
     prompt = chat.build_prompt(tok, req)
     assert prompt == [2, 5, 1, 2, 6, 3, 7, 4, 6, 5, 7]
-    bounds = chat.prompt_boundaries(tok, req, prompt)
+    bounds, _ = chat.boundaries_and_system_end(tok, req, prompt)
     # The system block ends after the first user header (the header is the
     # same for any next user message); the first user turn ends after the
     # assistant header that follows it.

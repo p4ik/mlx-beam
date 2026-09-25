@@ -7,6 +7,42 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- One tiny model per architecture class in the test suite - attention
+  sinks (gpt-oss), sliding window with NoPE full layers (Muse), MLA
+  (GLM-4.7), Mamba-2 + attention (Granite 4), plain attention behind a
+  vision wrapper (Mistral 3) - each pushed through batched decode, the KV
+  policy, the prefix store across a boundary and the speculative verify
+  (`tests/test_model_classes.py`).
+- The KV policy checks what a layer can carry before the engine starts:
+  attention sinks have no quantized SDPA, an MLA attention reads its
+  latent projection back from the cache as an array. Bits on such a layer
+  are refused at start with the reason, instead of a worker that dies at
+  the first decode step; `/health.kv` lists `quantizable_layers` and the
+  `exceptions` with their reason (sliding-window and recurrent layers among
+  them).
+- Sliding-window layers under the prefix store and the speculative verify.
+  A rotated ring cannot trim (its stale tail would stay), so a boundary
+  checkpoint now holds the window's state next to the recurrent state and
+  a request that shares a system prompt longer than the window restores
+  it from there; the verify restores the state before a cycle and writes
+  the accepted tokens again. Before, a store entry longer than the window
+  was usable only as an exact match, and a full window ended the
+  speculative path with an error that took the engine down.
+- `--exact-verify`: `positions` runs the verify one token per forward and
+  stops at the first rejected draft - exact by construction at plain
+  decoding's cost, the reference; `kernels` runs the block forward through
+  projections and attention that keep single-row arithmetic (kernels
+  vendored from mlx-vlm, MIT) and keeps them only when the warm-up finds
+  them bit-equal to single forwards on this machine, else falls back to
+  the block verify and says so. In every mode `/health.speculative.exact`
+  reports the warm-up width check: does the block forward give the same
+  logits as single forwards here (`block_equals_positions`,
+  `max_abs_logit_diff`, `argmax_equal`). On Metal (mlx 0.32.2) the kernel
+  path does not pass its own check yet and the fallback is what runs;
+  `positions` is the mode that is exact there.
+- The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
+  what a partial rollback needs, the rollback replays the selective scan
+  over the accepted prefix, bit for bit against a forward of those tokens.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is
@@ -22,8 +58,71 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   when it came from there.
 - The site's pages share one navigation; the current page is marked and
   links that leave the site say so.
+- Speculative decoding for sampled requests. The target draws every
+  verify position by Gumbel-max under a key per position, the draft head
+  drafts under the same keys, and a draft is accepted when it equals the
+  target's draw: no residual distribution, no draft probabilities, and
+  the committed token has the target's own distribution whatever was
+  drafted (chi-square over 2048 seeds against a draft that is always
+  wrong; every possible first draft enumerated against the plain
+  transcript). A seeded request gives the same tokens with and without
+  the draft head. Logit bias, repetition, presence and frequency
+  penalties apply per verify position over the context that position
+  would have seen; a thinking budget speculates whenever its state cannot
+  change within the cycle, the opener mask included - only the forced
+  close itself runs in plain steps.
+- The draft head keeps its history over the whole conversation. The
+  prefill runs the trunk without the `lm_head` over each prompt chunk
+  (its logits were discarded before) and feeds the hidden states to the
+  head as pairs with the next token; every plain step queues its pair, so
+  a row that decoded beside another for a while still drafts with a whole
+  history when it is alone again; the history at each message boundary
+  and at the end of a row is stored beside the prefix-cache entry, and a
+  conversation that continues, or a request that shares the system block,
+  resumes it from there. Prompts longer than 8192 tokens are primed from
+  their last 8192 positions on, and a stored history longer than that is
+  cut to its last 8192 pairs on restore with their rotary positions
+  rewound, as a head that started at the window would hold them - the
+  rotated rows of the head's own layout (MLA keeps them in the values),
+  moved by the module's rotation alone (a YaRN amplitude is not applied
+  twice); a head whose rotation cannot be rewound keeps its history whole. `/health.speculative.proposer` counts
+  `primed_pairs` and `histories_restored`. Measured before on the 27B
+  head: 2.39 against 2.23 tokens per cycle with and without the prompt
+  primed.
+- A depth regulator. Each cycle's draft depth is chosen below
+  `--max-draft-tokens` from what was measured on the machine: the
+  acceptance at each chain position and the wall time of a cycle at each
+  depth against the wall time of a plain step (measured, not assumed);
+  the depth with the best expected tokens per time runs, a neighbour is
+  probed now and then. A cycle that commits fewer tokens than its cost in
+  plain steps is a loss; sixteen in a row park the proposer for a
+  cooldown of plain steps that doubles each time (128 to 4096) until a
+  cycle wins again. `/health.speculative` reports the current `depth`
+  (the cap as `max_depth`) and under `regulator` the acceptance by
+  position, the costs, the rates, the tokens saved, `parked` with the
+  reason and the cooldown left.
+- A second draft-head form: the NextN layer of GLM-4.7 / DeepSeek-V3
+  (`enorm`, `hnorm`, `eh_proj`, one full decoder layer with its MoE,
+  `shared_head`), read from `mtp/weights.safetensors` or the shards under
+  the checkpoint's own names through the trunk's sanitize (experts
+  stacked, latent projection split), with its own embedding and output
+  head when the checkpoint ships them. The tensors say the form; the
+  manifest's `parts.mtp.form` may confirm it, not contradict it.
+  `/health.speculative.proposer.form` names it. Exercised against a tiny
+  GLM with a random head; acceptance on the real package is still to be
+  measured.
 
 ### Changed
+- A seeded request draws by Gumbel-max under a key derived from the seed
+  and the position of the token, no longer from a key chain advanced per
+  step. Same seed, prompt and settings still give the same tokens; the
+  tokens themselves differ from earlier versions for the same seed.
+- Dead weight out: an unused recurrent snapshot helper, a duplicate of the
+  cache-array walk, store statistics fields nothing set, a speculator flag
+  nothing read, a test-only wrapper around the boundary finder; the think
+  markers of a request are read once instead of up to three times. A fixed
+  request series against the tiny model gives the same bytes before and
+  after (golden transcript), the suite is unchanged.
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing
@@ -39,6 +138,38 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and date; a tag is refused without its changelog section.
 - `--max-context` help text: only a prompt whose reserve does not fit is a
   400, a larger `max_tokens` is served capped.
+- The test suite asserts bit-equality with plain decoding only where the
+  machine's own width probe finds the block forward bit-equal to single
+  steps (the CPU); on Metal the block verify's tokens are the kernels' and
+  the tests check the run, not the transcript. The per-position mode stays
+  exact everywhere.
+
+### Fixed
+- The depth regulator measures a plain step every 64 cycles, so the cost
+  the cycles are held against is the plain step at the current context
+  rather than the warm-up's; it starts over after the warm-up (whose
+  cycles ran cold over a few tokens) and takes one plain step first. A
+  cycle the row was not eligible for no longer counts, the acceptance is
+  learned from the drafts actually made, and a position the row's limit
+  cut before it was compared is not booked as a refusal.
+- The draft head's history stays whole when a row decodes plainly for
+  long beside others: the queued pairs go into the head as the queue
+  fills instead of restarting the history from the queue alone. A history
+  restored from the store is cut to the same window as a primed one. The
+  hidden-state tail kept for a store snapshot is a contiguous copy, not a
+  slice that held a whole prefill chunk alive. The warm-up row leaves the
+  head's tables.
+- `--exact-verify kernels` checks every width a cycle can run (2 to the
+  cap plus one), not only the widest, before it trusts the kernels;
+  `exact_forward` restores the attention flag it found.
+- A proposer or sampler that fails at admission fails that request, not
+  the worker.
+- The per-position verify (`--exact-verify positions`) checks the row's
+  stop and length limits on each token before it feeds the next: nothing
+  past the cut enters the caches, the stored entry is exactly what was
+  emitted. Its later positions also hand the presence, frequency and
+  repetition penalties the tokens fed earlier in the cycle, as a plain
+  step would - the logprobs now match plain decoding, not only the tokens.
 
 ### Fixed
 - The reasoning budget sees every token before the next decode step. While

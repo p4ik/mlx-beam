@@ -20,14 +20,23 @@ from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
+from mlx_beam.engine import exact
 from mlx_beam.engine.kv import (
     KVPolicy,
     describe_caches,
     for_prefill,
     for_store,
+    kv_exceptions,
     make_request_cache,
 )
-from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
+from mlx_beam.engine.prefix import (
+    HEAD,
+    PrefixStore,
+    recurrent_layers,
+    snapshot_window,
+    window_layers,
+)
+from mlx_beam.engine.priming import PrimingPromptBatch
 from mlx_beam.engine.proposer import check_head
 from mlx_beam.engine.request import (
     GenerationRequest,
@@ -36,8 +45,12 @@ from mlx_beam.engine.request import (
     SamplingParams,
     TokenEvent,
 )
-from mlx_beam.engine.sampling import SamplerPool, is_greedy, top_logprobs
-from mlx_beam.engine.speculative import SpeculativeGenerationBatch, Speculator
+from mlx_beam.engine.sampling import SamplerPool, SeededSampler, is_greedy, top_logprobs
+from mlx_beam.engine.speculative import (
+    SpeculativeGenerationBatch,
+    Speculator,
+    width_check,
+)
 from mlx_beam.engine.thinking import (
     ContextTooLong,
     ThinkingBudget,
@@ -68,12 +81,6 @@ def own_recurrent_state(caches: list) -> None:
 
 class QueueFull(RuntimeError):
     """More requests are waiting than --max-queued allows; try again later."""
-
-
-# Draft depth of a cycle at this stage: three held the best gain for one row
-# on a 27B (2.1x, p1..p3 0.87/0.79/0.74; 2026-09-19, M4 Pro). A regulator
-# picks below the cap later; until then the cap only lowers this.
-FIXED_DRAFT_DEPTH = 3
 
 
 def _model_args(model: Any) -> list:
@@ -165,26 +172,41 @@ class Engine:
         max_queued: int | None = None,
         proposer: Any = None,
         max_draft_tokens: int = 3,
+        exact_verify: str = "off",
     ):
         self.model = model
         self.model_key = model_key
         self.kv_policy = kv_policy or KVPolicy()
         # Speculative decoding: a proposer drafts, the verify cycle in
-        # SpeculativeGenerationBatch checks. Depth is fixed at this stage;
-        # the flag is a cap (measured 2.1x at depth 3 for one row, 19.09.).
-        # uid -> the row is greedy and carries no logits processor beyond a
-        # logit bias and its thinking budget (checked per cycle for inertness).
-        self._spec_rows: dict[int, bool] = {}
-        # uid -> (indices, values) of the row's logit bias, for the verify.
-        self._spec_bias: dict[int, tuple[mx.array, mx.array]] = {}
+        # SpeculativeGenerationBatch checks.
+        # uid -> None for a greedy row, its SeededSampler for a sampled one:
+        # the verify draws through it and the proposer drafts through it. A
+        # row present here may speculate; its thinking budget, if any, is
+        # checked per cycle.
+        self._spec_coupling: dict[int, SeededSampler | None] = {}
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
                 raise ValueError("max_draft_tokens must be at least 1")
-            proposer.depth = min(FIXED_DRAFT_DEPTH, max_draft_tokens)
+            # The cap; the regulator picks each cycle's depth below it from
+            # measured acceptance and cost (three held the best gain for one
+            # row on a 27B: 2.1x, p1..p3 0.87/0.79/0.74; 2026-09-19, M4 Pro).
+            proposer.depth = max_draft_tokens
             self.speculator = Speculator(
-                proposer, proposer.depth, self._may_speculate, self._spec_bias.get
+                proposer, proposer.depth, self._may_speculate, self._spec_coupling.get
             )
+            if exact_verify not in ("off", "positions", "kernels"):
+                raise ValueError(
+                    f"exact_verify must be off, positions or kernels, got {exact_verify!r}"
+                )
+            # "positions": the reference mode, one forward per token (plain
+            # decoding's cost, exact by construction); "kernels": the block
+            # through the exact projections, kept only if the warm-up check
+            # finds it bit-equal; "off": the block verify, whose width check
+            # /health reports either way.
+            self.speculator.mode = "block" if exact_verify == "off" else exact_verify
+            if exact_verify == "kernels":
+                self._exact_installed = exact.install(model)
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -253,6 +275,10 @@ class Engine:
         self._applied_caches: list[dict] | None = None
         # Finished rows whose store entry could not be written (health).
         self.store_failures = 0
+        self._kv_exceptions = kv_exceptions(model)
+        self._kv_quantizable = len(make_request_cache(model, KVPolicy())) - len(
+            self._kv_exceptions
+        )
         self._started_at = 0.0
         self._ready = threading.Event()
         # Four tokens: three through the prefill (the prompt batch, the KV
@@ -444,15 +470,15 @@ class Engine:
             self._cancelled.add(request_id)
 
     def _may_speculate(self, uid: int, tokens: int) -> bool:
-        """Whether a cycle of `tokens` may run for the row now: it was admitted
-        greedy without processors, and its thinking budget, if any, cannot
-        act within the cycle - the verify applies no processor, so one that
-        would have forced or masked a token inside the block must not be
+        """Whether a cycle of `tokens` may run for the row now: the row was
+        admitted with a proposer, and its thinking budget, if any, cannot
+        change state within the cycle - the verify runs the processors per
+        position, but a force that would arm inside the block must not be
         skipped over."""
-        if not self._spec_rows.get(uid, False):
+        if uid not in self._spec_coupling:
             return False
         thinking = self._budgets.get(uid)
-        return thinking is None or thinking.inert_for(tokens)
+        return thinking is None or thinking.stable_for(tokens)
 
     def _death_message(self) -> str:
         if self._error is not None:
@@ -500,6 +526,10 @@ class Engine:
                 "policy": self.kv_policy.describe(),
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
+                # Layers the policy may quantize, and the ones it must not,
+                # each with the reason (sinks, MLA, sliding window, recurrent).
+                "quantizable_layers": self._kv_quantizable,
+                "exceptions": self._kv_exceptions,
             },
             "prompt_cache": {
                 **self.prefix_store.describe(),
@@ -538,8 +568,7 @@ class Engine:
         self._stride.clear()
         self._budgets.clear()
         self._observed.clear()
-        self._spec_rows.clear()
-        self._spec_bias.clear()
+        self._spec_coupling.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -575,6 +604,7 @@ class Engine:
             segments.append(rest[start:])
             stop = StopSequences(req.stop_sequences or None)
             processors = _logits_processors(req.sampling)
+            sampler = self._samplers.get(req.sampling)
             thinking = None
             if req.reasoning is not None:
                 # The tracker always runs, for the flags; it touches the
@@ -589,7 +619,7 @@ class Engine:
                 max_tokens=[stream.completion_cap],
                 caches=[cache],
                 all_tokens=[list(req.tokens[:covered])],
-                samplers=[self._samplers.get(req.sampling)],
+                samplers=[sampler],
                 logits_processors=[processors],
                 stop_sequences=[stop],
             )
@@ -606,24 +636,45 @@ class Engine:
         if thinking is not None:
             self._budgets[uid] = thinking
         if self.speculator is not None:
-            # Greedy, and nothing but a logit bias and the budget touches the
-            # logits: the verify applies the bias itself and skips an inert
-            # budget; a penalty reads the context per step and would need
-            # the per-position replay a later stage brings.
+            # A greedy row is verified by argmax; a sampled one draws under
+            # keys per position, through the seeded sampler it has anyway
+            # or one seeded here - the plain steps of an unseeded row keep
+            # the shared sampler, its draws inside a cycle come from the
+            # engine's own stream, both exact draws from the same
+            # distribution.
             p = req.sampling
-            penalised = any(
-                x
-                for x in (p.repetition_penalty, p.presence_penalty, p.frequency_penalty)
-            )
-            self._spec_rows[uid] = is_greedy(p) and not penalised
-            if p.logit_bias:
-                self._spec_bias[uid] = (
-                    mx.array(list(p.logit_bias.keys())),
-                    mx.array(list(p.logit_bias.values())),
+            try:
+                if is_greedy(p):
+                    coupling = None
+                elif isinstance(sampler, SeededSampler):
+                    coupling = sampler
+                else:
+                    coupling = SeededSampler(
+                        p, seed=int(mx.random.randint(0, 2**62).item())
+                    )
+                self._spec_coupling[uid] = coupling
+                # The head's history over the prompt: resumed from the store
+                # when it has one at the position the prefill starts, primed
+                # over the rest by the prefill.
+                self.speculator.proposer.begin(
+                    uid, len(req.tokens), carried.get(covered, {}).get(HEAD)
                 )
+            except Exception as e:  # noqa: BLE001 - this row's, not the worker's
+                # Admitted a moment ago: take it back before anything runs.
+                gen.remove([uid])
+                self._live.pop(uid, None)
+                self._bookkeeping.pop(uid, None)
+                self._stride.pop(uid, None)
+                self._budgets.pop(uid, None)
+                self._forget_row(uid)
+                stream.put(e)
 
-    def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
-        """Snapshot the recurrent layers of one sequence at a boundary."""
+    def _checkpoint(
+        self, gen: BatchGenerator, uid: int, position: int, windows: bool = True
+    ) -> None:
+        """Snapshot the recurrent layers of one sequence at a boundary, and
+        its sliding-window layers too - those cost the whole window per
+        layer, so a stride checkpoint inside a long turn leaves them out."""
         found = gen._find_uids([uid]).get(uid)
         if found is None:
             return
@@ -633,10 +684,10 @@ class Engine:
             return
         caches = batch.prompt_cache
         rec = recurrent_layers(caches)
-        if not rec:
-            return
+        win = window_layers(caches) if windows else []
         # extract() slices the batch buffers; own the bytes, or every
-        # snapshot pins a whole batch array per layer.
+        # snapshot pins a whole batch array per layer. A window's extract()
+        # already copies its row in temporal order.
         snap = {
             i: [
                 None if a is None else mx.contiguous(a)
@@ -644,9 +695,28 @@ class Engine:
             ]
             for i in rec
         }
+        for i in win:
+            snap[i] = snapshot_window(caches[i].extract(idx))
         for arrays in snap.values():
-            mx.eval(*[a for a in arrays if a is not None])
+            mx.eval(*[a for a in arrays if isinstance(a, mx.array)])
+        if windows and self.speculator is not None:
+            # The draft head's history up to here, a sidecar of the entry:
+            # a request that resumes at this boundary drafts with it.
+            head = self.speculator.proposer.snapshot(uid)
+            if head is not None:
+                snap[HEAD] = head
+        if not snap:
+            return
         self._bookkeeping[uid][1][position] = snap
+
+    def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
+        """The draft head's history at the end of a row, next to the entry's
+        end state: the next turn of the conversation resumes it whole."""
+        if self.speculator is None:
+            return
+        head = self.speculator.proposer.snapshot(uid)
+        if head is not None:
+            checkpoints.setdefault(position, {})[HEAD] = head
 
     def _stride_checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
         """A checkpoint every ``checkpoint_stride`` tokens of prefill; beyond
@@ -662,7 +732,7 @@ class Engine:
         last = max([covered, *taken])
         if position // stride <= last // stride or position in checkpoints:
             return
-        self._checkpoint(gen, uid, position)
+        self._checkpoint(gen, uid, position, windows=False)
         if position not in checkpoints:
             return  # a plain model: nothing was stored
         taken.append(position)
@@ -698,8 +768,10 @@ class Engine:
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
             self._observed.pop(u, None)
-            self._forget_row(u)
             got = partial.get(u)
+            if got is not None:
+                self._head_checkpoint(u, checkpoints, len(got[1]))
+            self._forget_row(u)
             if got is None:
                 continue
             cache, tokens = got
@@ -743,6 +815,7 @@ class Engine:
         own_recurrent_state(r.prompt_cache)
         stored = for_store(r.prompt_cache)
         tokens = list(r.all_tokens)
+        self._head_checkpoint(r.uid, checkpoints, len(tokens))
         self.prefix_store.insert(
             self.model_key,
             tokens,
@@ -763,8 +836,7 @@ class Engine:
             )
 
     def _forget_row(self, uid: int) -> None:
-        self._spec_rows.pop(uid, None)
-        self._spec_bias.pop(uid, None)
+        self._spec_coupling.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
@@ -775,6 +847,7 @@ class Engine:
             _, generated = gen.next()
             if any(r.uid == uid and r.finish_reason for r in generated):
                 break
+        self._forget_row(uid)
         self._applied_caches = describe_caches(cache)
         if self.speculator is not None:
             # The trunk's head must give the model's own logits: a family
@@ -789,7 +862,7 @@ class Engine:
                 max_tokens=[self.speculator.depth + 2],
                 caches=[spec_cache],
             )
-            self._spec_rows[uid] = True
+            self._spec_coupling[uid] = None
             cycles = self.speculator.cycles
             while True:
                 _, generated = gen.next()
@@ -801,7 +874,37 @@ class Engine:
                     "the speculative warm-up ran no verify cycle; the proposer "
                     "drafted nothing"
                 )
-            self.speculator.checked = True
+            spec = self.speculator
+            probe = (list(self.warmup_tokens), spec.depth + 1)
+            spec.exact = width_check(self.model, self.kv_policy, *probe)
+            if spec.mode == "kernels":
+                # Every width a cycle can run (2 .. cap + 1): the kernels are
+                # chosen by width, one that is exact at the cap may not be
+                # at a shallower depth the regulator picks.
+                kernels = width_check(self.model, self.kv_policy, *probe, exact=True)
+                kernels["installed"] = self._exact_installed
+                widths = {}
+                for width in range(2, spec.depth + 2):
+                    r = width_check(
+                        self.model, self.kv_policy, probe[0], width, exact=True
+                    )
+                    widths[width] = r["block_equals_positions"]
+                kernels["widths"] = widths
+                if all(widths.values()):
+                    spec.exact = kernels
+                else:
+                    # Not bit-equal here: the block verify it is, and health
+                    # says why the kernels are not in use.
+                    kernels["fallback"] = "block"
+                    kernels["reason"] = (
+                        "the exact kernels are not bit-equal on this machine"
+                    )
+                    spec.exact = kernels
+                    spec.mode = "block"
+                    exact.uninstall(self.model)
+            # The warm-up's measurements are cold (first shapes, a prompt of
+            # a few tokens): the regulator starts over from its priors.
+            spec.regulator.reset()
         self._last_step = time.monotonic()
 
     def _loop(self) -> None:
@@ -815,6 +918,7 @@ class Engine:
             stop_tokens=[],
             generation_batch=batch_class,
             on_step=self._on_step,
+            prompt_batch=PrimingPromptBatch if self.speculator is not None else None,
             **self._gen_args,
         )
         self._gen = gen

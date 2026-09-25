@@ -1572,6 +1572,7 @@ class BatchGenerator:
         stream=None,
         generation_batch=None,
         on_step=None,
+        prompt_batch=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1585,6 +1586,9 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.generation_batch = generation_batch or GenerationBatch
+        # The class that prefills: the caller may hand in a subclass (mlx-beam's
+        # priming batch feeds the draft head along); VENDORED.md, generation batch.
+        self.prompt_batch = prompt_batch or PromptProcessingBatch
         # A model call cannot be interrupted, so its width is the wait a
         # newcomer sees. 512 ran at 125 tok/s against 114 for 2048 on a
         # 27B GDN hybrid (2026-09-13, M4 Pro 64 GB); VENDORED.md, scheduler.
@@ -1602,7 +1606,7 @@ class BatchGenerator:
             stop_tokens if stop_tokens else None,
         )
         self._uid_count = 0
-        self._prompt_batch = PromptProcessingBatch.empty(
+        self._prompt_batch = self.prompt_batch.empty(
             self.model,
             self.sampler,
             prefill_step_size=prefill_step_size,
@@ -1827,7 +1831,7 @@ class BatchGenerator:
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
 
-        return PromptProcessingBatch(
+        return self.prompt_batch(
             model=self.model,
             uids=uids,
             caches=caches,
