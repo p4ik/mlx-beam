@@ -703,8 +703,12 @@ class Engine:
     @staticmethod
     def _store_key(request: GenerationRequest, tokens: list[int]) -> list[int]:
         """What the store files a finished (or cut) row under: the request's
-        cache key (image spans as digests) plus what was generated."""
-        return request.cache_key + list(tokens[len(request.tokens) :])
+        cache key (image spans as digests) over the prompt positions the
+        row computed - a prefill cut short by a cancel holds fewer than the
+        prompt, and the entry's length is the key's - plus what was
+        generated."""
+        n = len(request.tokens)
+        return request.cache_key[: min(len(tokens), n)] + list(tokens[n:])
 
     def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
         """The draft head's history at the end of a row, next to the entry's

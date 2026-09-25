@@ -307,3 +307,35 @@ def test_a_model_that_norms_its_embeddings_takes_the_features_as_they_are():
         want.append(int(y.item()))
         y = mx.argmax(lm_head(inner(y.reshape(1, 1), cache=cache))[0, -1])
     assert out == want
+
+
+def test_the_key_carries_the_whole_digest_not_a_slice_of_it():
+    # Two digests that agree in their low 31 bits and differ higher up: a
+    # key built from one slice of the digest would be the same for both.
+    digests = [f"{n:016x}" + "b" * 48 for n in (1, 1 + 2**31)]
+    keys = [
+        GenerationRequest(
+            [1, 62, 62, 2], spans=[ImageSpan(1, 3, mx.ones((2, 32)) * i, d)]
+        ).cache_key
+        for i, d in enumerate(digests)
+    ]
+    assert keys[0] != keys[1]
+    assert all(k < 0 for key in keys for k in key[1:3])
+    # The same image twice: the same key, and each position its own id.
+    same = [
+        GenerationRequest(
+            [1] + [62] * 12 + [2],
+            spans=[ImageSpan(1, 13, mx.ones((12, 32)), "ab" * 32)],
+        ).cache_key
+        for _ in range(2)
+    ]
+    assert same[0] == same[1] and len(set(same[0][1:13])) == 12
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("max_tokens", 0), ("top_logprobs", -1), ("min_response_tokens", -1)],
+)
+def test_the_request_still_rejects_bad_limits(field, value):
+    with pytest.raises(ValueError):
+        GenerationRequest([1, 2, 3], **{field: value})

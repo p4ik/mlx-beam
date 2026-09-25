@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import threading
 import time
@@ -98,6 +99,12 @@ class GenerationRequest:
     def __post_init__(self):
         if not self.tokens:
             raise ValueError("prompt is empty")
+        if self.max_tokens < 1:
+            raise ValueError("max_tokens must be at least 1")
+        if self.top_logprobs < 0:
+            raise ValueError("top_logprobs must not be negative")
+        if self.min_response_tokens < 0:
+            raise ValueError("min_response_tokens must not be negative")
         for span in self.spans:
             if span.end > len(self.tokens):
                 raise ValueError("an image span reaches past the prompt")
@@ -107,19 +114,19 @@ class GenerationRequest:
         """What the prefix store keys on: the tokens, with every image
         span's positions replaced by ids derived from the image's digest -
         the same length, so boundaries keep their positions, and never a
-        vocabulary id, so text never matches an image."""
+        vocabulary id, so text never matches an image. Every position is
+        its own 31-bit hash of the whole digest and the position, so the
+        span carries 31 bits of the image's identity per position - two
+        images share a key only if every one of those hashes collides, not
+        when one slice of the digest does."""
         key = list(self.tokens)
         for span in self.spans:
-            seed = int(span.digest[:16], 16) if span.digest else 0
+            digest = bytes.fromhex(span.digest) if span.digest else b""
             for i in range(span.start, span.end):
-                key[i] = -1 - ((seed + (i - span.start) * 0x9E3779B1) % (2**31))
+                salt = (i - span.start).to_bytes(4, "little")
+                h = hashlib.blake2b(digest, digest_size=4, salt=salt).digest()
+                key[i] = -1 - (int.from_bytes(h, "little") % (2**31))
         return key
-        if self.max_tokens < 1:
-            raise ValueError("max_tokens must be at least 1")
-        if self.top_logprobs < 0:
-            raise ValueError("top_logprobs must not be negative")
-        if self.min_response_tokens < 0:
-            raise ValueError("min_response_tokens must not be negative")
 
 
 @dataclass(frozen=True)
