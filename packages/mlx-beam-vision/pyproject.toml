@@ -25,6 +25,12 @@ dependencies = [
   # Muse Glimmer's processor arrived in 5.15; Gemma 4 and Granite Vision
   # 4.1 are older.
   "transformers>=5.15",
+  # The processors transformers ships for these families are written on
+  # torch (Gemma 4 imports it at module level) and torchvision (the Qwen
+  # and Muse processors build a video processor on it); the towers run on
+  # MLX. Measured 2026-09-25: +260 MB RSS and +0.5 s per process.
+  "torch>=2.5",
+  "torchvision",
   "pillow>=10",
   "numpy",
 ]

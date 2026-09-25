@@ -25,6 +25,11 @@ Not yet: audio and video input, quantized towers (the towers load at model
 precision; a package that ships a quantized tower is refused with a
 message). An image above 32 megapixels is refused before it is decoded.
 
+The package installs torch and torchvision: the processors transformers
+ships for these families (the template rendering and the image-to-patches
+step) are written on them. The towers themselves run on MLX; torch does no
+inference here.
+
 Every family is exercised in the tests on a tiny random tower against a
 direct forward; the real towers and processors are validated on Apple
 silicon with the checkpoints themselves.
