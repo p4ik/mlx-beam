@@ -13,6 +13,7 @@ the draft then agrees with the target exactly when both argmaxes agree.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -135,14 +136,60 @@ class MTPHead(nn.Module):
         return self.norm(x)
 
 
+class NextNHead(nn.Module):
+    """GLM-4.7 / DeepSeek-V3's NextN head: the trunk's hidden state and the
+    embedding of the token just placed, each RMS-normed, fused by `eh_proj`
+    (2H -> H), one full decoder layer of the trunk's kind - MoE included -
+    with its own KV cache, `shared_head.norm`; `shared_head.head` reads the
+    result when the checkpoint ships it, else the trunk's lm_head. The
+    fuse puts the embedding first (vLLM `glm4_moe_mtp.py`,
+    `deepseek_mtp.py`; the paper writes the pair the other way round) -
+    to be held against acceptance on the real package."""
+
+    form = "glm_nextn"
+
+    def __init__(self, args, layer_class, own_embed: bool, own_head: bool):
+        super().__init__()
+        self.enorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.eh_proj = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        # Past the trunk's layers, so the layer picks the MoE form.
+        self.layers = [layer_class(args, layer_idx=args.num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        if own_embed:
+            self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        if own_head:
+            self.head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(self, hidden, token_ids, embed, cache):
+        own = getattr(self, "embed_tokens", None)
+        e = self.enorm((embed if own is None else own)(token_ids))
+        h = self.hnorm(hidden)
+        x = self.eh_proj(mx.concatenate([e, h], axis=-1))
+        # An array, as the trunk builds it: an MLA layer masks its scores
+        # with mx.where and cannot take the "causal" keyword.
+        mask = create_attention_mask(x, cache[0], return_array=True)
+        x = self.layers[0](x, mask=mask, cache=cache[0])
+        return self.norm(x)
+
+
 def _quant_predicate(bits: int, group_size: int):
-    # `fc` and the norms stay at model precision, the layer's linears quantize:
-    # the pack's own layout (mtplx "cyankiwi"), and int4 measured equal to
-    # bf16 in acceptance (2026-09-19, Qwen3.8-27B).
+    # The fuse (`fc` / `eh_proj`) and the norms stay at model precision, the
+    # layer's linears quantize - the pack's own layout (mtplx "cyankiwi"),
+    # and int4 measured equal to bf16 in acceptance (2026-09-19,
+    # Qwen3.8-27B); a NextN head's own embedding and output head quantize
+    # like the layer.
     def predicate(path: str, module):
-        if path == "fc" or path.startswith("pre_fc_norm") or path == "norm":
+        if path in ("fc", "eh_proj", "norm") or path.startswith("pre_fc_norm"):
             return False
-        if path.startswith("layers.") and hasattr(module, "to_quantized"):
+        if path in ("enorm", "hnorm"):
+            return False
+        if (path.startswith("layers.") or path in ("embed_tokens", "head")) and hasattr(
+            module, "to_quantized"
+        ):
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.shape[-1] % group_size:
+                return False  # a width the group does not divide stays as is
             return {"group_size": group_size, "bits": bits}
         return False
 
@@ -160,8 +207,44 @@ def shift_norms(weights: dict) -> dict:
     return out
 
 
+_LAYER_PREFIX = re.compile(r"^(?:model\.)?layers\.\d+\.")
+
+
 def _strip(k: str) -> str:
-    return k.split("mtp.", 1)[1] if "mtp." in k else k
+    """The head's own key: Qwen's `mtp.` prefix or a NextN layer's
+    `model.layers.N.` prefix, whichever the checkpoint uses."""
+    if "mtp." in k:
+        return k.split("mtp.", 1)[1]
+    return _LAYER_PREFIX.sub("", k)
+
+
+def _to_head_form(weights: dict) -> dict:
+    """NextN keys into the head module's names: the decoder layer's keys
+    under `layers.0.`, `shared_head.norm` as `norm`, `shared_head.head` as
+    `head`; the fuse and the embedding keep their names."""
+    out = {}
+    for k, v in weights.items():
+        if k.startswith("shared_head.norm."):
+            out["norm." + k[len("shared_head.norm.") :]] = v
+        elif k.startswith("shared_head.head."):
+            out["head." + k[len("shared_head.head.") :]] = v
+        elif k.split(".")[0] in ("enorm", "hnorm", "eh_proj", "embed_tokens"):
+            out[k] = v
+        else:
+            out["layers.0." + k] = v
+    return out
+
+
+def head_form(weights: dict) -> str:
+    """What the tensors say the head is: Qwen's `fc`, or NextN's `eh_proj`."""
+    if "fc.weight" in weights:
+        return "qwen_mtp"
+    if "eh_proj.weight" in weights:
+        return "glm_nextn"
+    raise ValueError(
+        "the draft head's tensors match neither form: no fc.weight (Qwen MTP) "
+        "and no eh_proj.weight (GLM/DeepSeek NextN)"
+    )
 
 
 def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
@@ -190,17 +273,32 @@ def bundled_head_files(model_path: Path) -> tuple[list[Path], dict]:
         shards = sorted({v for k, v in weight_map.items() if k.startswith("mtp.")})
         if shards:
             return [model_path / s for s in shards], config
+        # A NextN head is the layer past the trunk's last (GLM-4.7,
+        # DeepSeek-V3: `num_nextn_predict_layers` of them).
+        n = config.get("num_hidden_layers")
+        if n is not None and config.get("num_nextn_predict_layers"):
+            prefix = f"model.layers.{n}."
+            shards = sorted({v for k, v in weight_map.items() if k.startswith(prefix)})
+            if shards:
+                return [model_path / s for s in shards], config
     raise FileNotFoundError(
         f"{model_path} bundles no draft head: config.json names no mtp_file and "
-        "no shard holds mtp.* tensors"
+        "no shard holds mtp.* tensors or a NextN layer"
     )
 
 
-def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
-    """The head from the checkpoint's own tensors, quantized as the pack says
-    (the manifest's `parts.mtp`, or `mtplx_mtp_quantization`), else int4/64;
-    norms shifted unless the manifest says they already are (`norm_convention`
-    `mlx`)."""
+def _nextn_keys(config: dict, k: str) -> bool:
+    n = config.get("num_hidden_layers")
+    return n is not None and k.startswith(f"model.layers.{n}.")
+
+
+def load_bundled_head(model: Any, model_path: Path) -> tuple[nn.Module, dict]:
+    """The head from the checkpoint's own tensors, in the form the tensors
+    (or the manifest's `parts.mtp.form`) say: Qwen's `mtp.*` head or a
+    NextN layer. Quantized as the pack says (the manifest's `parts.mtp`,
+    or `mtplx_mtp_quantization`), else int4/64; a Qwen head's norms
+    shifted unless the manifest says they already are (`norm_convention`
+    `mlx`), a NextN head's never (its RMSNorm is the plain kind)."""
     text = getattr(model, "language_model", model)
     args = text.args
     files, config = bundled_head_files(model_path)
@@ -208,23 +306,54 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
     weights: dict = {}
     for file in files:
         raw = mx.load(str(file))
-        weights.update({_strip(k): v for k, v in raw.items() if "mtp." in k})
+        mine = {k: v for k, v in raw.items() if "mtp." in k or _nextn_keys(config, k)}
+        if mine and not any("mtp." in k for k in mine):
+            # NextN tensors in the checkpoint's own names: the trunk's
+            # sanitize stacks the experts and splits the latent projection
+            # as it does for its own layers, once they sit at a layer index
+            # it keeps.
+            renamed = {"model.layers.0." + _strip(k): v for k, v in mine.items()}
+            mine = text.sanitize(renamed) if hasattr(text, "sanitize") else renamed
+        weights.update({_strip(k): v for k, v in mine.items()})
     if not weights:
-        raise ValueError(f"{files[0]} holds no mtp.* tensors")
-    layer_class = type(text.model.layers[args.full_attention_interval - 1])
-    head = MTPHead(args, layer_class)
+        raise ValueError(f"{files[0]} holds no draft-head tensors")
+    form = head_form(weights)
+    if manifest.get("form") not in (None, form):
+        raise ValueError(
+            f"manifest parts.mtp.form says {manifest['form']!r}, the tensors are "
+            f"a {form} head"
+        )
+    if form == "qwen_mtp":
+        layer_class = type(text.model.layers[args.full_attention_interval - 1])
+        head = MTPHead(args, layer_class)
+        probe = "layers.0.self_attn.k_proj"
+    else:
+        weights = _to_head_form(weights)
+        layer_class = type(text.model.layers[-1])
+        head = NextNHead(
+            args,
+            layer_class,
+            own_embed="embed_tokens.weight" in weights,
+            own_head="head.weight" in weights,
+        )
+        probe = next(
+            f"layers.0.self_attn.{n}"
+            for n in ("q_a_proj", "kv_a_proj_with_mqa", "q_proj")
+            if f"layers.0.self_attn.{n}.weight" in weights
+        )
     quant = (
         {k: manifest[k] for k in ("bits", "group_size") if k in manifest}
         or config.get("mtplx_mtp_quantization")
         or {}
     )
-    packed = "layers.0.self_attn.k_proj.scales" in weights
+    packed = f"{probe}.scales" in weights
     if packed:
-        # The packed width says the bits: K / (32 / bits) uint32 per row.
-        w = weights["layers.0.self_attn.k_proj.weight"]
-        s = weights["layers.0.self_attn.k_proj.scales"]
+        # The packed width says the bits: K / (32 / bits) uint32 per row of
+        # a projection that reads the hidden state.
+        w = weights[f"{probe}.weight"]
+        sc = weights[f"{probe}.scales"]
         bits = 32 * w.shape[1] // args.hidden_size
-        group_size = args.hidden_size // s.shape[1]
+        group_size = args.hidden_size // sc.shape[1]
         nn.quantize(head, class_predicate=_quant_predicate(bits, group_size))
     else:
         # int4 / 64 measured equal to bf16 in acceptance (2026-09-19, 27B);
@@ -232,7 +361,8 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
         default_group = next(g for g in (64, 32, 16, 8) if args.hidden_size % g == 0)
         bits = int(quant.get("bits", 4))
         group_size = int(quant.get("group_size", default_group))
-    if manifest.get("norm_convention", "hf") != "mlx":
+    shifted = form == "qwen_mtp" and manifest.get("norm_convention", "hf") != "mlx"
+    if shifted:
         weights = shift_norms(weights)
     head.load_weights(list(weights.items()), strict=True)
     if not packed:
@@ -240,12 +370,15 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
     mx.eval(head.parameters())
     return head, {
         "kind": "mtp",
+        "form": form,
         "source": "bundled",
         "files": [str(f.relative_to(model_path)) for f in files],
         "bits": bits,
         "group_size": group_size,
         "prequantized": packed,
-        "norms_shifted": manifest.get("norm_convention", "hf") != "mlx",
+        "norms_shifted": shifted,
+        "own_embedding": form == "glm_nextn" and hasattr(head, "embed_tokens"),
+        "own_head": form == "glm_nextn" and hasattr(head, "head"),
         # Where the bits and norm convention came from: the package's
         # manifest, or the loader's own defaults. "verified" says the head
         # file was hashed against the manifest (bundled_head_files refuses a
@@ -277,9 +410,12 @@ class BundledHeadProposer:
 
     kind = "mtp"
 
-    def __init__(self, model: Any, head: MTPHead, depth: int, info: dict):
+    def __init__(self, model: Any, head: nn.Module, depth: int, info: dict):
         self._inner, self._lm_head, self._embed = trunk(model)
         self.head = head
+        own = getattr(head, "head", None)
+        if own is not None:
+            self._lm_head = own
         self.depth = depth
         self.info = info
         self._cache: dict[int, list] = {}

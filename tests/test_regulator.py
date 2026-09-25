@@ -3,7 +3,7 @@ on losses with a doubling cooldown, and the engine following it."""
 
 import pytest
 
-from mlx_beam.engine import Engine, GenerationRequest
+from mlx_beam.engine import GenerationRequest
 from mlx_beam.engine.regulator import (
     COOLDOWN_MAX,
     COOLDOWN_MIN,

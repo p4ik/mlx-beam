@@ -164,10 +164,18 @@ class Regulator:
             "acceptance_by_position": [round(p, 3) for p in self.acceptance],
             "positions_seen": list(self._seen),
             "cost_ms": {
-                "plain": None if self.plain_cost is None else round(self.plain_cost * 1e3, 3),
-                "cycle": {k: round(c * 1e3, 3) for k, c in sorted(self.cycle_cost.items())},
+                "plain": (
+                    None if self.plain_cost is None else round(self.plain_cost * 1e3, 3)
+                ),
+                "cycle": {
+                    k: round(c * 1e3, 3) for k, c in sorted(self.cycle_cost.items())
+                },
             },
-            "rate": {k: (None if r is None else round(r, 3)) for k in range(self.cap + 1) for r in (self.rate(k),)},
+            "rate": {
+                k: (None if r is None else round(r, 3))
+                for k in range(self.cap + 1)
+                for r in (self.rate(k),)
+            },
             "tokens_saved": self.tokens_saved,
             "parked": self.parked,
             "cooldown_left": self.cooldown if self.parked else 0,

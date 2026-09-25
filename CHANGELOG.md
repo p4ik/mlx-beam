@@ -94,6 +94,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   (the cap as `max_depth`) and under `regulator` the acceptance by
   position, the costs, the rates, the tokens saved, `parked` with the
   reason and the cooldown left.
+- A second draft-head form: the NextN layer of GLM-4.7 / DeepSeek-V3
+  (`enorm`, `hnorm`, `eh_proj`, one full decoder layer with its MoE,
+  `shared_head`), read from `mtp/weights.safetensors` or the shards under
+  the checkpoint's own names through the trunk's sanitize (experts
+  stacked, latent projection split), with its own embedding and output
+  head when the checkpoint ships them. The tensors say the form; the
+  manifest's `parts.mtp.form` may confirm it, not contradict it.
+  `/health.speculative.proposer.form` names it. Exercised against a tiny
+  GLM with a random head; acceptance on the real package is still to be
+  measured.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

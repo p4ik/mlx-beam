@@ -17,6 +17,7 @@ from mlx_beam.engine.prefix import HEAD
 from mlx_beam.engine.proposer import (
     BundledHeadProposer,
     MTPHead,
+    NextNHead,
     load_bundled_head,
     shift_norms,
     trunk,
@@ -915,6 +916,98 @@ def test_history_window_and_queue_cap(tmp_path, monkeypatch):
         entry = engine.prefix_store._trie.get(engine.model_key, [3, 7, 11] + oa)
         keys, _, _ = entry.checkpoints[3 + len(oa)][HEAD]
         assert keys.shape[2] <= 3 + 1
+
+
+def nextn_checkpoint(tmp_path, model, form_in_manifest="glm_nextn"):
+    """A tiny GLM checkpoint whose NextN layer sits in `mtp/weights.safetensors`
+    under the checkpoint's own names (`model.layers.<N>.*`, experts one by
+    one, `kv_b_proj` whole), the way a package built from the base ships
+    it; the manifest names the form."""
+    from mlx_beam.package import sha256_of
+    from tests.test_model_classes import CLASSES
+
+    args = model.args
+    head = NextNHead(args, type(model.model.layers[-1]), own_embed=True, own_head=True)
+    mx.eval(head.parameters())
+    flat = dict(nn.utils.tree_flatten(head.parameters()))
+    n = args.num_hidden_layers
+    hf = {}
+    for k, v in flat.items():
+        if k.startswith("layers.0."):
+            k = k[len("layers.0.") :]
+        if k == "norm.weight":
+            k = "shared_head.norm.weight"
+        elif k == "head.weight":
+            k = "shared_head.head.weight"
+        hf[f"model.layers.{n}.{k}"] = v
+    prefix = f"model.layers.{n}"
+    for m in ("gate_proj", "down_proj", "up_proj"):
+        stacked = hf.pop(f"{prefix}.mlp.switch_mlp.{m}.weight")
+        for e in range(args.n_routed_experts):
+            hf[f"{prefix}.mlp.experts.{e}.{m}.weight"] = stacked[e]
+    wk = hf.pop(f"{prefix}.self_attn.embed_q.weight")
+    wv = hf.pop(f"{prefix}.self_attn.unembed_out.weight")
+    kv_b = mx.concatenate([wk.swapaxes(-1, -2), wv], axis=1)
+    hf[f"{prefix}.self_attn.kv_b_proj.weight"] = kv_b.reshape(-1, args.kv_lora_rank)
+    (tmp_path / "mtp").mkdir()
+    (tmp_path / "extras").mkdir()
+    head_file = tmp_path / "mtp" / "weights.safetensors"
+    mx.save_safetensors(str(head_file), hf)
+    cfg = dict(CLASSES["glm4_moe_lite"]["cfg"])
+    cfg["extras"] = {"manifest": "extras/manifest.json"}
+    entry = {"file": "mtp/weights.safetensors", "sha256": sha256_of(head_file)}
+    if form_in_manifest:
+        entry["form"] = form_in_manifest
+    (tmp_path / "extras" / "manifest.json").write_text(
+        json.dumps({"format": "beam", "version": 1, "parts": {"mtp": entry}})
+    )
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    return head, tmp_path
+
+
+def test_nextn_head_loads_from_the_checkpoint_names_and_drafts(tmp_path):
+    """The second head form: a NextN layer read through the trunk's own
+    sanitize (experts stacked, latent projection split), quantized like a
+    Qwen head, norms untouched; the engine drafts with it and the
+    transcript stays the plain one."""
+    from tests.test_model_classes import tiny
+
+    model = tiny("glm4_moe_lite")
+    original, path = nextn_checkpoint(tmp_path, model)
+    head, info = load_bundled_head(model, path)
+    assert isinstance(head, NextNHead)
+    assert info["form"] == "glm_nextn" and not info["norms_shifted"]
+    assert info["own_embedding"] and info["own_head"] and info["bits"] == 4
+    assert isinstance(head.eh_proj, nn.Linear) and not isinstance(
+        head.eh_proj, nn.QuantizedLinear
+    )
+    assert isinstance(head.head, nn.QuantizedLinear)
+    assert isinstance(head.embed_tokens, nn.QuantizedEmbedding)
+    # The round trip through the checkpoint's names is exact.
+    assert mx.array_equal(
+        head.layers[0].self_attn.embed_q.weight,
+        original.layers[0].self_attn.embed_q.weight,
+    )
+    assert mx.array_equal(head.enorm.weight, original.enorm.weight)
+    prompt = [3, 7, 11, 13, 5, 9]
+    truth = plain_transcript(model, prompt, 24)
+    proposer = BundledHeadProposer(model, head, 3, info)
+    assert proposer._lm_head is head.head
+    engine = Engine(model, proposer=proposer)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=24)))
+        h = engine.health()["speculative"]
+    assert out == truth
+    assert h["cycles"] >= 4 and h["proposer"]["form"] == "glm_nextn"
+
+
+def test_manifest_form_must_match_the_tensors(tmp_path):
+    from tests.test_model_classes import tiny
+
+    model = tiny("glm4_moe_lite")
+    _, path = nextn_checkpoint(tmp_path, model, form_in_manifest="qwen_mtp")
+    with pytest.raises(ValueError, match="form says 'qwen_mtp'"):
+        load_bundled_head(model, path)
 
 
 def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):
