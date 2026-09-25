@@ -43,6 +43,7 @@ from mlx_beam.engine.thinking import (
     close_counted,
     close_tail,
 )
+from mlx_beam.engine.valve import PrefillValve
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,9 @@ class Engine:
             self.speculator = Speculator(
                 proposer, proposer.depth, self._may_speculate, self._spec_bias.get
             )
+        # The prefill valve: the next call's peak estimated from the calls
+        # before, held under min(recommended working set, held + free).
+        self.prefill_valve = PrefillValve()
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
@@ -464,6 +468,10 @@ class Engine:
             # Prefill calls that admitted nobody so a starved long prompt got
             # its full slice (VENDORED.md, scheduler); 0 means never needed.
             "prefill_starved_calls": gen.starved_calls if gen is not None else 0,
+            "prefill_valve": {
+                **self.prefill_valve.describe(),
+                "stalled_rounds": gen.stalled_calls if gen is not None else 0,
+            },
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
             # recommended working set) and what it found before.
@@ -735,7 +743,11 @@ class Engine:
             else None
         )
         gen = BatchGenerator(
-            self.model, stop_tokens=[], generation_batch=batch_class, **self._gen_args
+            self.model,
+            stop_tokens=[],
+            generation_batch=batch_class,
+            prefill_valve=self.prefill_valve,
+            **self._gen_args,
         )
         self._gen = gen
         try:

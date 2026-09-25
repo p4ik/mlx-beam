@@ -108,6 +108,17 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 8 and 4 bit, for one and for several prefill chunks; a cancelled prefill
 is stored quantized).
 
+`prefill valve` - `generate.py`, `BatchGenerator`: one constructor
+argument, `prefill_valve`, an object asked before every prefill call for
+the width the call may have (`width(tokens)`: the width, or None for no
+call this round) and told the width afterwards (`observe(tokens)`). The
+engine hands in `mlx_beam.engine.valve.PrefillValve`, which estimates the
+call's peak from bytes per token learned on this machine and holds it
+under min(recommended working set, held + free), cutting the width or
+stalling the round instead of letting Metal fail. `stalled_calls` counts
+the rounds held back. With the argument left out nothing changes. Tests:
+`tests/test_valve.py`.
+
 `marker families` - `tokenizer_utils.py`, `_infer_thinking`,
 `_infer_structural_markers`, `_infer_tool_parser`, `TokenizerWrapper`: two
 families next to upstream's think pairs, Gemma's channels and xtml.

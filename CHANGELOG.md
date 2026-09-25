@@ -60,6 +60,17 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `capabilities` object with the effort measurement; chat and text
   completions carry a `system_fingerprint` (model, version and KV layout
   hashed).
+- A prefill valve. The next prefill call's peak is estimated from the
+  bytes per token the calls before cost on this machine (learned from the
+  allocator's peak) and held under the smaller of the device's
+  recommended working set and what the process holds plus what the
+  system has free - dynamic, for a memory other engines share. A call
+  that would not fit is cut to the width that does (on a grid of 64
+  tokens); below the narrowest width the round prefills nobody and
+  decoding goes on, instead of Metal failing with an error nothing can
+  catch. `/health.prefill_valve` reports the estimate, the ceiling, the
+  calls cut and the rounds stalled. Thresholds and the estimate's
+  accuracy are to be measured on the Mac.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is
