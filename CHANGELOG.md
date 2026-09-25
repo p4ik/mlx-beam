@@ -37,7 +37,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   the block verify and says so. In every mode `/health.speculative.exact`
   reports the warm-up width check: does the block forward give the same
   logits as single forwards here (`block_equals_positions`,
-  `max_abs_logit_diff`, `argmax_equal`).
+  `max_abs_logit_diff`, `argmax_equal`). On Metal (mlx 0.32.2) the kernel
+  path does not pass its own check yet and the fallback is what runs;
+  `positions` is the mode that is exact there.
 - The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
   what a partial rollback needs, the rollback replays the selective scan
   over the accepted prefix, bit for bit against a forward of those tokens.
@@ -131,6 +133,19 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   and date; a tag is refused without its changelog section.
 - `--max-context` help text: only a prompt whose reserve does not fit is a
   400, a larger `max_tokens` is served capped.
+- The test suite asserts bit-equality with plain decoding only where the
+  machine's own width probe finds the block forward bit-equal to single
+  steps (the CPU); on Metal the block verify's tokens are the kernels' and
+  the tests check the run, not the transcript. The per-position mode stays
+  exact everywhere.
+
+### Fixed
+- The per-position verify (`--exact-verify positions`) checks the row's
+  stop and length limits on each token before it feeds the next: nothing
+  past the cut enters the caches, the stored entry is exactly what was
+  emitted. Its later positions also hand the presence, frequency and
+  repetition penalties the tokens fed earlier in the cycle, as a plain
+  step would - the logprobs now match plain decoding, not only the tokens.
 
 ## [0.1.0a4] - 2026-09-25
 

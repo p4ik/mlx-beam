@@ -399,8 +399,12 @@ class SpeculativeGenerationBatch(GenerationBatch):
         if processors:
             base = self._token_context[0].tokens
             rows = []
-            for j in range(logits.shape[1]):
-                context = mx.concatenate([base, mx.array(fed[: j + 1], dtype=mx.int32)])
+            n = logits.shape[1]
+            for j in range(n):
+                # The positions are the last n of `fed`: the block verify
+                # hands all of them, the per-position one the latest only.
+                upto = len(fed) - n + j + 1
+                context = mx.concatenate([base, mx.array(fed[:upto], dtype=mx.int32)])
                 row = logits[:, j, :]
                 for processor in processors:
                     row = processor(context, row)
@@ -434,12 +438,15 @@ class SpeculativeGenerationBatch(GenerationBatch):
         """The verify one token at a time: feed y, read the model's token;
         feed the draft only while it is that token. Nothing rejected ever
         enters a cache, so nothing rolls back - the same forwards plain
-        decoding runs, and the same bytes (the check mode)."""
+        decoding runs, and the same bytes (the check mode). The row's
+        limits are checked on each token before the next is fed: a token
+        past the stop or the length limit never enters the caches either,
+        so the entry the store gets is exactly what was emitted."""
         spec = self.speculator
         drafts_l = drafts.tolist()
         tokens = [int(y.item()), *drafts_l]
-        hiddens, logprob_rows, chosen = [], [], []
-        m = 0
+        hiddens, logprob_rows, chosen, responses = [], [], [], []
+        m, finish = 0, None
         for j, token in enumerate(tokens):
             hidden, logits = self._forward(mx.array([[token]], dtype=y.dtype))
             logprobs = self._processed(logits[:, -1:, :], tokens[: j + 1])
@@ -447,6 +454,10 @@ class SpeculativeGenerationBatch(GenerationBatch):
             hiddens.append(hidden)
             logprob_rows.append(logprobs[0, -1])
             chosen.append(nxt)
+            finish = self._limit(token)
+            responses.append((token, lp_y if j == 0 else logprob_rows[j - 1], finish))
+            if finish is not None:
+                break
             if j < k and int(nxt.item()) == drafts_l[j]:
                 m += 1
             else:
@@ -455,24 +466,27 @@ class SpeculativeGenerationBatch(GenerationBatch):
         spec.drafted += k
         spec.accepted += m
         hidden = mx.concatenate(hiddens, axis=1)  # (1, m + 1, H)
-        emitted = [(tokens[0], lp_y)] + [
-            (drafts_l[i], logprob_rows[i]) for i in range(m)
-        ]
-        responses, finish = self._emit(emitted)
         sampled = mx.concatenate(chosen)[None]
         return self._finish_cycle(
             uid, responses, finish, sampled, logprob_rows, hidden, m, drafts_l
         )
 
+    def _limit(self, token: int) -> str | None:
+        """One emitted token against the row's limits: the count and the
+        stop matcher advance, the finish reason comes back if it ends here."""
+        finish = None
+        self._num_tokens[0] += 1
+        if self._num_tokens[0] >= self.max_tokens[0]:
+            finish = "length"
+        if self._matchers[0].advance(token):
+            finish = "stop"
+        return finish
+
     def _emit(self, emitted):
         """Cut the cycle's tokens short at the row's own limits."""
         responses, finish = [], None
         for token, lp in emitted:
-            self._num_tokens[0] += 1
-            if self._num_tokens[0] >= self.max_tokens[0]:
-                finish = "length"
-            if self._matchers[0].advance(token):
-                finish = "stop"
+            finish = self._limit(token)
             responses.append((token, lp, finish))
             if finish is not None:
                 break
