@@ -30,8 +30,9 @@ from collections.abc import Callable
 import mlx.core as mx
 
 from mlx_beam._vendor.mlx_lm.generate import GenerationBatch, _cache_arrays
-from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache
+from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, BatchRotatingKVCache
 from mlx_beam._vendor.mlx_lm.models.gated_delta import gated_delta_update
+from mlx_beam._vendor.mlx_lm.models.ssm import ssm_update
 from mlx_beam._vendor.mlx_lm.sample_utils import greedy_sampler
 from mlx_beam.engine.proposer import Proposer, trunk
 
@@ -87,6 +88,21 @@ class Speculator:
         }
 
 
+def rollback_window(cache, before: tuple, keep: int, total: int) -> None:
+    """Put a sliding-window layer back to `keep` of the `total` tokens the
+    verify wrote. The verify goes through the concat path, which leaves the
+    buffer in temporal order with the cycle's tokens last: the kept ones are
+    sliced out, the state before the cycle is restored, and they are written
+    again - the same buffers a plain decode of just those tokens would have
+    built. A rotated ring cannot simply trim: its stale tail would stay."""
+    n = cache.keys.shape[2]
+    kept_keys = cache.keys[..., n - total : n - total + keep, :]
+    kept_values = cache.values[..., n - total : n - total + keep, :]
+    cache.state = before
+    if keep:
+        cache.update_and_fetch(mx.contiguous(kept_keys), mx.contiguous(kept_values))
+
+
 def rollback_recurrent(cache: ArraysCache, keep: int, total: int) -> None:
     """Put a recurrent layer back to the state after `keep` of the `total`
     tokens the last forward ran, from what the layer stashed: the conv window
@@ -105,18 +121,37 @@ def rollback_recurrent(cache: ArraysCache, keep: int, total: int) -> None:
     n_keep = stash["n_keep"]
     cache[0] = mx.contiguous(stash["conv_input"][:, keep : keep + n_keep, :])
     mask = stash["mask"]
-    _, state = gated_delta_update(
-        stash["q"][:, :keep],
-        stash["k"][:, :keep],
-        stash["v"][:, :keep],
-        stash["a"][:, :keep],
-        stash["b"][:, :keep],
-        stash["A_log"],
-        stash["dt_bias"],
-        stash["state"],
-        None if mask is None else mask[:, :keep],
-        use_kernel=stash["use_kernel"],
-    )
+    kind = stash.get("kind", "gated_delta")
+    if kind == "gated_delta":
+        _, state = gated_delta_update(
+            stash["q"][:, :keep],
+            stash["k"][:, :keep],
+            stash["v"][:, :keep],
+            stash["a"][:, :keep],
+            stash["b"][:, :keep],
+            stash["A_log"],
+            stash["dt_bias"],
+            stash["state"],
+            None if mask is None else mask[:, :keep],
+            use_kernel=stash["use_kernel"],
+        )
+    elif kind == "mamba2":
+        # Mamba-2 (Granite 4, Nemotron-H): the same replay over the
+        # selective-scan update the layer ran, on the kept prefix.
+        _, state = ssm_update(
+            stash["hidden"][:, :keep],
+            stash["A_log"],
+            stash["B"][:, :keep],
+            stash["C"][:, :keep],
+            stash["D"],
+            stash["dt"][:, :keep],
+            stash["dt_bias"],
+            stash["state"],
+            stash["time_step_limit"],
+            None if mask is None else mask[:, :keep],
+        )
+    else:
+        raise RollbackUnsupported(f"recurrent stash of kind {kind!r} has no replay")
     cache[1] = state
     cache.advance(-(total - keep))
 
@@ -237,11 +272,21 @@ class SpeculativeGenerationBatch(GenerationBatch):
         return responses
 
     def _arm(self) -> list[ArraysCache]:
+        """Prepare every cache for a possible rollback: recurrent layers
+        stash what the forward computes, sliding windows keep the state
+        they had before the cycle (a rotated ring cannot trim - its stale
+        tail would stay in the buffer), the rest must trim."""
         recurrent = []
-        for c in self.prompt_cache:
+        self._window_states = {}
+        for i, c in enumerate(self.prompt_cache):
             if isinstance(c, ArraysCache):
                 c.stash = {}
                 recurrent.append(c)
+            elif isinstance(c, BatchRotatingKVCache):
+                # Views, not references: an in-place write copies first.
+                self._window_states[i] = tuple(
+                    v[:] if isinstance(v, mx.array) else v for v in c.state
+                )
             elif not (hasattr(c, "is_trimmable") and c.is_trimmable()):
                 raise RollbackUnsupported(
                     f"{type(c).__name__} cannot trim; the speculative verify "
@@ -295,14 +340,17 @@ class SpeculativeGenerationBatch(GenerationBatch):
                     break
             total = 1 + k
             if e < total:
-                for c in self.prompt_cache:
+                for i, c in enumerate(self.prompt_cache):
                     if isinstance(c, ArraysCache):
                         rollback_recurrent(c, e, total)
+                    elif i in self._window_states:
+                        rollback_window(c, self._window_states[i], e, total)
                     else:
                         c.trim(total - e)
         finally:
             for c in recurrent:
                 c.stash = None
+            self._window_states = {}
         committed = [t for t, _, _ in responses]
         self.tokens[0].extend(committed)
         if self.logits_processors and self.logits_processors[0]:

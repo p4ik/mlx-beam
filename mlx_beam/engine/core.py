@@ -24,9 +24,15 @@ from mlx_beam.engine.kv import (
     describe_caches,
     for_prefill,
     for_store,
+    kv_exceptions,
     make_request_cache,
 )
-from mlx_beam.engine.prefix import PrefixStore, recurrent_layers
+from mlx_beam.engine.prefix import (
+    PrefixStore,
+    recurrent_layers,
+    snapshot_window,
+    window_layers,
+)
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -244,6 +250,10 @@ class Engine:
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
         self._applied_caches: list[dict] | None = None
+        self._kv_exceptions = kv_exceptions(model)
+        self._kv_quantizable = len(make_request_cache(model, KVPolicy())) - len(
+            self._kv_exceptions
+        )
         self._started_at = 0.0
         self._ready = threading.Event()
         self.warmup_tokens: list[int] = [0]
@@ -476,6 +486,10 @@ class Engine:
                 "policy": self.kv_policy.describe(),
                 # What the last batch was built from, layer by layer.
                 "applied": self._applied_caches,
+                # Layers the policy may quantize, and the ones it must not,
+                # each with the reason (sinks, MLA, sliding window, recurrent).
+                "quantizable_layers": self._kv_quantizable,
+                "exceptions": self._kv_exceptions,
             },
             "prompt_cache": self.prefix_store.describe(),
             "sampling": self._samplers.describe(),
@@ -592,8 +606,12 @@ class Engine:
                     mx.array(list(p.logit_bias.values())),
                 )
 
-    def _checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
-        """Snapshot the recurrent layers of one sequence at a boundary."""
+    def _checkpoint(
+        self, gen: BatchGenerator, uid: int, position: int, windows: bool = True
+    ) -> None:
+        """Snapshot the recurrent layers of one sequence at a boundary, and
+        its sliding-window layers too - those cost the whole window per
+        layer, so a stride checkpoint inside a long turn leaves them out."""
         found = gen._find_uids([uid]).get(uid)
         if found is None:
             return
@@ -603,10 +621,12 @@ class Engine:
             return
         caches = batch.prompt_cache
         rec = recurrent_layers(caches)
-        if not rec:
+        win = window_layers(caches) if windows else []
+        if not rec and not win:
             return
         # extract() slices the batch buffers; own the bytes, or every
-        # snapshot pins a whole batch array per layer.
+        # snapshot pins a whole batch array per layer. A window's extract()
+        # already copies its row in temporal order.
         snap = {
             i: [
                 None if a is None else mx.contiguous(a)
@@ -614,8 +634,10 @@ class Engine:
             ]
             for i in rec
         }
+        for i in win:
+            snap[i] = snapshot_window(caches[i].extract(idx))
         for arrays in snap.values():
-            mx.eval(*[a for a in arrays if a is not None])
+            mx.eval(*[a for a in arrays if isinstance(a, mx.array)])
         self._bookkeeping[uid][1][position] = snap
 
     def _stride_checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
@@ -632,7 +654,7 @@ class Engine:
         last = max([covered, *taken])
         if position // stride <= last // stride or position in checkpoints:
             return
-        self._checkpoint(gen, uid, position)
+        self._checkpoint(gen, uid, position, windows=False)
         if position not in checkpoints:
             return  # a plain model: nothing was stored
         taken.append(position)

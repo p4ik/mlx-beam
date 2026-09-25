@@ -133,6 +133,14 @@ in `speculative.py`. Without the attribute the layer runs as upstream.
 Tests: `tests/test_speculative.py` (`test_committed_tokens_equal_plain_greedy`
 with nothing, everything and a ragged mix accepted;
 `test_rollback_on_metal_matches_a_shorter_forward` on the Metal kernels).
+The stash names its `kind` (`gated_delta`); `models/granitemoehybrid.py`,
+`GraniteMoeHybridMamba2Mixer`, keeps the same kind of stash for Mamba-2
+(`kind` `mamba2`: the padded conv input, the SSM inputs and the state
+before the call), and `_conv` keeps the padded input on the module for it.
+`speculative.rollback_recurrent` replays either kind. Tests:
+`test_mamba2_rollback_matches_a_shorter_forward` (bit for bit, the scan
+runs the same ops on both sides) and the Granite class in
+`tests/test_model_classes.py`.
 
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`

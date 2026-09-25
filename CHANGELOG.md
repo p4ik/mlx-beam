@@ -7,6 +7,30 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 ## [Unreleased]
 
 ### Added
+- One tiny model per architecture class in the test suite - attention
+  sinks (gpt-oss), sliding window with NoPE full layers (Muse), MLA
+  (GLM-4.7), Mamba-2 + attention (Granite 4), plain attention behind a
+  vision wrapper (Mistral 3) - each pushed through batched decode, the KV
+  policy, the prefix store across a boundary and the speculative verify
+  (`tests/test_model_classes.py`).
+- The KV policy checks what a layer can carry before the engine starts:
+  attention sinks have no quantized SDPA, an MLA attention reads its
+  latent projection back from the cache as an array. Bits on such a layer
+  are refused at start with the reason, instead of a worker that dies at
+  the first decode step; `/health.kv` lists `quantizable_layers` and the
+  `exceptions` with their reason (sliding-window and recurrent layers among
+  them).
+- Sliding-window layers under the prefix store and the speculative verify.
+  A rotated ring cannot trim (its stale tail would stay), so a boundary
+  checkpoint now holds the window's state next to the recurrent state and
+  a request that shares a system prompt longer than the window restores
+  it from there; the verify restores the state before a cycle and writes
+  the accepted tokens again. Before, a store entry longer than the window
+  was usable only as an exact match, and a full window ended the
+  speculative path with an error that took the engine down.
+- The speculative verify on Mamba-2 hybrids (Granite 4): the layer stashes
+  what a partial rollback needs, the rollback replays the selective scan
+  over the accepted prefix, bit for bit against a forward of those tokens.
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is

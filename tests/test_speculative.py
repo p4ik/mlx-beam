@@ -567,3 +567,82 @@ def test_rollback_on_metal_matches_a_shorter_forward(family, head_dim, dtype, ke
         assert mx.allclose(g, w, atol=1e-5, rtol=1e-4)
         if keep > 1 or dtype == mx.bfloat16:
             assert mx.array_equal(got, want)
+
+
+# -- the Mamba-2 rollback (Granite 4) ----------------------------------------
+
+
+def mamba2_layer(dtype=mx.float32):
+    from mlx_beam._vendor.mlx_lm.models import granitemoehybrid
+    from tests.test_model_classes import CLASSES
+
+    mx.random.seed(93)
+    args = granitemoehybrid.ModelArgs.from_dict(CLASSES["granitemoehybrid"]["cfg"])
+    layer = granitemoehybrid.GraniteMoeHybridMamba2Mixer(args)
+    layer.set_dtype(dtype)
+    layer.eval()
+    mx.eval(layer.parameters())
+    return layer
+
+
+@pytest.mark.parametrize("keep", [1, 2, 3])
+def test_mamba2_rollback_matches_a_shorter_forward(keep):
+    """The Mamba-2 replay from the stash: a four-token verify rolled back to
+    `keep` tokens equals a forward of just those tokens from the same state
+    - conv window and SSM state alike. The selective-scan update runs the
+    same ops on both sides, so the states match to the last bit here."""
+    layer = mamba2_layer()
+    x = mx.random.normal((1, 9, 64))
+    spec, plain = ArraysCache(2), ArraysCache(2)
+    mx.eval(
+        layer(x[:, :5], mask=None, cache=spec), layer(x[:, :5], mask=None, cache=plain)
+    )
+    spec.stash = {}
+    mx.eval(layer(x[:, 5:], mask=None, cache=spec))
+    assert spec.stash["kind"] == "mamba2"
+    rollback_recurrent(spec, keep, 4)
+    spec.stash = None
+    mx.eval(layer(x[:, 5 : 5 + keep], mask=None, cache=plain))
+    mx.eval(*spec.cache, *plain.cache)
+    for got, want in zip(spec.cache, plain.cache, strict=True):
+        assert mx.allclose(got, want, atol=1e-5, rtol=1e-4)
+        assert mx.array_equal(got, want)
+
+
+# -- the sliding-window rollback -----------------------------------------------
+
+
+@pytest.mark.parametrize("keep", [1, 2, 3, 4])
+@pytest.mark.parametrize("fill", [3, 8, 13])
+def test_window_rollback_matches_a_shorter_feed(keep, fill):
+    """A rotated ring cannot trim (its stale tail stays), so the verify
+    restores the state before the cycle and writes the kept tokens again.
+    The window then holds exactly what feeding those tokens alone would
+    have left - before the ring is full, at the fill line, and rotated."""
+    from mlx_beam._vendor.mlx_lm.models.cache import BatchRotatingKVCache
+    from mlx_beam.engine.speculative import rollback_window
+
+    mx.random.seed(7)
+    keys = mx.random.normal((1, 1, fill + 4, 4))
+    values = mx.random.normal((1, 1, fill + 4, 4))
+    spec, plain = (BatchRotatingKVCache(8, [0]) for _ in range(2))
+    for i in range(fill):  # one token at a time, the decode path
+        for c in (spec, plain):
+            c.update_and_fetch(keys[..., i : i + 1, :], values[..., i : i + 1, :])
+    before = tuple(v[:] if isinstance(v, mx.array) else v for v in spec.state)
+    spec.update_and_fetch(keys[..., fill:, :], values[..., fill:, :])  # the verify
+    rollback_window(spec, before, keep, 4)
+    plain.update_and_fetch(
+        keys[..., fill : fill + keep, :], values[..., fill : fill + keep, :]
+    )
+    for c in (spec, plain):
+        c._temporal_order()
+    got_k, got_v = spec.keys_and_values()
+    want_k, want_v = plain.keys_and_values()
+    assert spec.offset.tolist() == plain.offset.tolist()
+    assert mx.array_equal(
+        got_k[..., -min(8, fill + keep) :, :], want_k[..., -min(8, fill + keep) :, :]
+    )
+    assert mx.array_equal(
+        got_v[..., -min(8, fill + keep) :, :], want_v[..., -min(8, fill + keep) :, :]
+    )

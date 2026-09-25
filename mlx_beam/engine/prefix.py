@@ -1,13 +1,15 @@
 """The prefix store: one entry per conversation, checkpoints at its boundaries.
 
 A stored entry holds the caches of a finished request (KV for every token
-plus the recurrent state at the end) and, for the recurrent layers of a
-hybrid, snapshots taken at the segment boundaries of its prompt (system
-end, each user end). A new request that shares a prefix restores the entry,
-cuts it back to the last boundary at or before the shared length - KV
-layers trim to any position, recurrent layers only to a checkpoint - and
-prefills the rest. Plain-attention models need no checkpoints; every
-position is a boundary for them.
+plus the recurrent state at the end) and, for the recurrent and the
+sliding-window layers of a model, snapshots taken at the segment boundaries
+of its prompt (system end, each user end). A new request that shares a
+prefix restores the entry, cuts it back to the last boundary at or before
+the shared length - full-attention layers trim to any position, recurrent
+layers only to a checkpoint, and a sliding-window layer that has rotated
+past the boundary (its ring buffer overwrote the tokens a trim would need)
+only to a checkpoint as well - and prefills the rest. Plain-attention
+models need no checkpoints; every position is a boundary for them.
 """
 
 from __future__ import annotations
@@ -20,7 +22,12 @@ from typing import Any
 import mlx.core as mx
 from mlx.utils import tree_flatten
 
-from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, PromptTrie
+from mlx_beam._vendor.mlx_lm.models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    PromptTrie,
+    RotatingKVCache,
+)
 
 # Bytes of a recurrent snapshot are counted like cache bytes.
 _ORDER = ("assistant", "user", "system")
@@ -30,12 +37,47 @@ def recurrent_layers(cache: list[Any]) -> list[int]:
     return [i for i, c in enumerate(cache) if isinstance(c, ArraysCache)]
 
 
+def window_layers(cache: list[Any]) -> list[int]:
+    return [
+        i
+        for i, c in enumerate(cache)
+        if isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
+    ]
+
+
+def snapshot_window(c: RotatingKVCache) -> list:
+    """A sliding-window layer's state as a checkpoint holds it: the ring
+    buffers (views; a later in-place write copies first) and the scalars
+    that place them - the same tuple ``state`` reads and writes."""
+    keys = None if c.keys is None else c.keys[:]
+    values = None if c.values is None else c.values[:]
+    return [keys, values, c.offset, c.keep, c.max_size, c._idx]
+
+
+def restore_window(c: RotatingKVCache, snap: list) -> None:
+    keys, values, offset, keep, max_size, idx = snap
+    c.state = (
+        None if keys is None else keys[:],
+        None if values is None else values[:],
+        offset,
+        keep,
+        max_size,
+        idx,
+    )
+
+
 def snapshot_recurrent(cache: list[Any]) -> dict[int, list]:
     """The recurrent layers' state, copied, keyed by layer index."""
     return {
         i: [None if a is None else copy.deepcopy(a) for a in cache[i].cache]
         for i in recurrent_layers(cache)
     }
+
+
+def checkpoint_layers(cache: list[Any]) -> list[int]:
+    """Layers a boundary checkpoint must capture: recurrent state and
+    sliding windows. Full-attention layers trim to any position."""
+    return sorted(set(recurrent_layers(cache)) | set(window_layers(cache)))
 
 
 def _common_prefix(a: list[int], b: list[int]) -> int:
@@ -79,7 +121,8 @@ def compact_kv(cache: list[Any]) -> None:
 
 
 def _snapshot_bytes(snap: dict[int, list]) -> int:
-    return sum(a.nbytes for arrays in snap.values() for a in arrays if a is not None)
+    # A window snapshot carries scalars next to its arrays; only arrays weigh.
+    return sum(getattr(a, "nbytes", 0) for arrays in snap.values() for a in arrays)
 
 
 @dataclass
@@ -134,8 +177,15 @@ def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
     if target >= entry_len:
         return entry_len
     rec = recurrent_layers(cache)
-    if rec:
-        usable = [p for p in checkpoints if p <= target]
+    # A rotated window cannot trim (the ring overwrote what a trim would
+    # need); until it rotates, it trims like a full-attention layer.
+    stuck = [i for i in window_layers(cache) if not cache[i].is_trimmable()]
+    if rec or stuck:
+        usable = [
+            p
+            for p, snap in checkpoints.items()
+            if p <= target and all(i in snap for i in (*rec, *stuck))
+        ]
         if not usable:
             return -1
         pos = max(usable)
@@ -146,6 +196,8 @@ def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
             c.cache = [
                 None if a is None else copy.deepcopy(a) for a in checkpoints[pos][i]
             ]
+        elif i in stuck:
+            restore_window(c, checkpoints[pos][i])
         else:
             if not c.is_trimmable():
                 return -1
@@ -199,13 +251,20 @@ class PrefixStore:
             self.stats.tokens_found += shared
             self.stats.tokens_restored += pos
             carried = {p: s for p, s in entry.checkpoints.items() if p <= pos}
-            rec = recurrent_layers(cache)
-            if rec and pos == entry.length and pos not in carried:
+            stateful = checkpoint_layers(cache)
+            if stateful and pos == entry.length and pos not in carried:
                 # Restored whole: the entry's end state is the restore point
                 # this request stands on. Carried along (shared, not copied),
                 # it survives the entry being replaced or evicted before the
                 # request finishes.
-                carried[pos] = {i: entry.cache[i].cache for i in rec}
+                carried[pos] = {
+                    i: (
+                        entry.cache[i].cache
+                        if isinstance(entry.cache[i], ArraysCache)
+                        else snapshot_window(entry.cache[i])
+                    )
+                    for i in stateful
+                }
             if len(key) == len(tokens):
                 kind = "exact"
             elif len(key) < len(tokens):
@@ -236,19 +295,28 @@ class PrefixStore:
         self._lru[cache_type].append((model, tokens))
         # Prefixes this entry can be cut back to are redundant copies - except
         # a system entry, which exists to outlive the conversations above it.
-        rec = recurrent_layers(cache)
-        cuttable = all(c.is_trimmable() for i, c in enumerate(cache) if i not in rec)
+        stateful = checkpoint_layers(cache)
+        cuttable = all(
+            c.is_trimmable() for i, c in enumerate(cache) if i not in stateful
+        )
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
             if old.cache_type == "system" or not cuttable:
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue
-            if rec:
+            if stateful:
                 # Whatever the old entry could restore, the new one can too:
                 # its checkpoints and its end state (the recurrent state at
                 # prefix_len). Moved, not copied - the old KV cache is what
                 # goes away. One entry per conversation, not one per turn.
                 inherited = dict(old.checkpoints)
-                inherited[prefix_len] = {i: old.cache[i].cache for i in rec}
+                inherited[prefix_len] = {
+                    i: (
+                        old.cache[i].cache
+                        if isinstance(old.cache[i], ArraysCache)
+                        else snapshot_window(old.cache[i])
+                    )
+                    for i in stateful
+                }
                 for position, snap in inherited.items():
                     if position <= prefix_len and position not in entry.checkpoints:
                         entry.add_checkpoint(position, snap)

@@ -27,6 +27,7 @@ modified = [
   "models/cache.py",
   "models/qwen3_5.py",
   "models/qwen3_next.py",
+  "models/granitemoehybrid.py",
   "utils.py",
   "tokenizer_utils.py",
   "models/plamo2.py",

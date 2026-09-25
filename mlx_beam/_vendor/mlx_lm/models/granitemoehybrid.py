@@ -161,6 +161,9 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             )
 
         conv_output = self.conv1d(padded_input)
+        # The padded input is what a partial rollback re-slices its conv
+        # state from (recurrent stash, VENDORED.md).
+        self._padded_input = padded_input
         return nn.silu(conv_output)
 
     def _ssm(
@@ -184,7 +187,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         else:
             state = None
 
-        y, state = ssm_update(
+        y, new_state = ssm_update(
             hidden_states,
             self.A_log,
             B,
@@ -197,7 +200,25 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             mask,
         )
         if cache:
-            cache[1] = state
+            if getattr(cache, "stash", None) is not None:
+                # A speculative verify: keep what redoing the recurrence over
+                # an accepted prefix needs (VENDORED.md, recurrent stash).
+                cache.stash = dict(
+                    kind="mamba2",
+                    conv_input=self._padded_input,
+                    n_keep=self.conv_kernel_size - 1,
+                    state=state,
+                    hidden=hidden_states,
+                    B=B,
+                    C=C,
+                    dt=dt,
+                    A_log=self.A_log,
+                    D=self.D.astype(hidden_states.dtype),
+                    dt_bias=self.dt_bias,
+                    time_step_limit=self.time_step_limit,
+                    mask=mask,
+                )
+            cache[1] = new_state
 
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
