@@ -13,11 +13,13 @@ import pytest
 from mlx_beam._vendor.mlx_lm.models import qwen3_5, qwen3_next
 from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_beam.engine import Engine, EngineDead, GenerationRequest
+from mlx_beam.engine.prefix import HEAD
 from mlx_beam.engine.proposer import (
     BundledHeadProposer,
     MTPHead,
     load_bundled_head,
     shift_norms,
+    trunk,
 )
 from mlx_beam.engine.request import SamplingParams
 from mlx_beam.engine.speculative import rollback_recurrent
@@ -46,9 +48,9 @@ class OracleProposer:
     """Drafts from a script: `start(transcript)` hands it the plain
     continuation, `plan(call)` says how many of a call's drafts are right
     before a wrong one follows. It follows each row's position through the
-    script: the generation batch's first step feeds the prompt's last token
-    (a `drop` before position 0), a plain step feeds one token of the
-    script (`drop`), a cycle `1 + accepted` (`commit`)."""
+    script: a plain step feeds one token of the script (`follow`), a cycle
+    `1 + accepted` (`commit`); the prompt's last token, fed by the generation
+    batch's first step, is followed with no hidden state before it."""
 
     kind = "oracle"
 
@@ -58,6 +60,7 @@ class OracleProposer:
         self.calls = 0
         self.commits = []
         self.dropped = []
+        self.followed = []
         self._current = []
         self._pos = {}
 
@@ -79,9 +82,22 @@ class OracleProposer:
         self.commits.append(list(tokens))
         self._pos[uid] = self._pos.get(uid, 0) + 1 + len(tokens)
 
+    def follow(self, uid, hidden, token):
+        self.followed.append(uid)
+        if hidden is not None:  # None: the prompt's last token, not the script's
+            self._pos[uid] = self._pos.get(uid, 0) + 1
+
+    def begin(self, uid, prompt_len, snapshot):
+        pass
+
+    def prime(self, uid, hidden, tokens, start):
+        pass
+
+    def snapshot(self, uid):
+        return None
+
     def drop(self, uid):
         self.dropped.append(uid)
-        self._pos[uid] = self._pos.get(uid, -1) + 1
 
     def describe(self):
         return {"kind": self.kind}
@@ -212,6 +228,18 @@ class FixedDraftProposer:
 
     def commit(self, uid, hidden, tokens):
         pass
+
+    def follow(self, uid, hidden, token):
+        pass
+
+    def begin(self, uid, prompt_len, snapshot):
+        pass
+
+    def prime(self, uid, hidden, tokens, start):
+        pass
+
+    def snapshot(self, uid):
+        return None
 
     def drop(self, uid):
         pass
@@ -522,6 +550,11 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
         def commit(self, *a):
             pass
 
+        follow = begin = prime = commit
+
+        def snapshot(self, uid):
+            return None
+
         def drop(self, uid):
             pass
 
@@ -725,6 +758,157 @@ def test_head_history_holds_exactly_the_confirmed_pairs(tmp_path):
         assert mx.array_equal(got[..., :4, :], want[..., :4, :])
     proposer.drop(7)
     assert 7 not in proposer._cache and proposer.describe()["rows_with_history"] == 0
+
+
+def head_engine(tmp_path, model, **kw):
+    path = synthetic_head_checkpoint(tmp_path, model, "beam")
+    head, info = load_bundled_head(model, path)
+    proposer = BundledHeadProposer(model, head, 3, info)
+    engine = Engine(model, proposer=proposer, **kw)
+    engine.warmup_tokens = [1]
+    return engine, proposer
+
+
+def head_pairs(model, tokens):
+    """(hidden at every position but the last, the tokens after them): the
+    pairs a head primed over `tokens` holds, from one forward."""
+    inner, _, _ = trunk(model)
+    hidden = inner(mx.array([tokens]))
+    return hidden[:, :-1, :], tokens[1:]
+
+
+def test_prefill_primes_the_head_and_the_store_keeps_its_history(tmp_path):
+    """The prompt's pairs go through the head in the prefill; at the end of
+    the row the head's history - every position of the transcript but the
+    last, whose hidden state waits as the tail - sits in the store entry."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9, 2, 8]
+    truth = plain_transcript(model, prompt, 6)
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=6)))
+        assert out == truth
+        d = proposer.describe()
+        # The chunk holds all but the last prompt token: one pair less.
+        assert d["primed_pairs"] == len(prompt) - 2
+        assert d["rows_with_history"] == 0
+        entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+        keys, values, tail = entry.checkpoints[len(prompt) + len(out)][HEAD]
+        assert keys.shape[2] == len(prompt) + len(out) - 1
+        assert tail is not None and tail.shape == (1, 1, 32)
+        assert entry.nbytes >= keys.nbytes + values.nbytes + tail.nbytes
+        # The same pairs, fed to a fresh head in one call, give the same cache.
+        hidden, nexts = head_pairs(model, prompt + out)
+        reference = [KVCache()]
+        mx.eval(proposer.head(hidden, mx.array([nexts]), proposer._embed, reference))
+        ref_keys, ref_values = reference[0].keys_and_values()
+        assert mx.allclose(keys, ref_keys, atol=1e-5, rtol=1e-4)
+        assert mx.allclose(values, ref_values, atol=1e-5, rtol=1e-4)
+
+
+def test_next_turn_resumes_the_head_history_from_the_store(tmp_path):
+    """A conversation continued: the store restores the entry whole and the
+    head's history with it; the prefill primes only the new tokens. The
+    transcript stays the plain one."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        first = collect(engine.submit(GenerationRequest(prompt, max_tokens=5)))
+        primed = proposer.describe()["primed_pairs"]
+        turn2 = prompt + first + [21, 22, 23, 24]
+        truth = plain_transcript(model, turn2, 5)
+        stream = engine.submit(GenerationRequest(turn2, max_tokens=5))
+        out = collect(stream)
+        assert out == truth
+        assert stream.prompt_cached == len(prompt) + len(first)
+        d = proposer.describe()
+        assert d["histories_restored"] == 1
+        # Three new tokens in the chunk (the fourth is fed by the first
+        # step): the tail's pair plus two pairs inside the chunk.
+        assert d["primed_pairs"] - primed == 3
+        entry = engine.prefix_store._trie.get(engine.model_key, turn2 + out)
+        keys, _, tail = entry.checkpoints[len(turn2) + len(out)][HEAD]
+        assert keys.shape[2] == len(turn2) + len(out) - 1 and tail is not None
+
+
+def test_boundary_checkpoint_carries_the_head_and_a_prefix_hit_resumes_it(tmp_path):
+    """A request that shares only the system block resumes the head from
+    the boundary's sidecar; one that shares nothing starts the head empty."""
+    model = tiny_qwen35()
+    system = [3, 7, 11, 13, 5, 9, 2, 8]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        first = collect(
+            engine.submit(
+                GenerationRequest(
+                    system + [30, 31, 32], max_tokens=4, boundaries=[len(system)]
+                )
+            )
+        )
+        entry = engine.prefix_store._trie.get(
+            engine.model_key, system + [30, 31, 32] + first
+        )
+        keys, _, tail = entry.checkpoints[len(system)][HEAD]
+        assert keys.shape[2] == len(system) - 1 and tail is not None
+        other = system + [40, 41, 42, 43]
+        truth = plain_transcript(model, other, 4)
+        stream = engine.submit(
+            GenerationRequest(other, max_tokens=4, boundaries=[len(system)])
+        )
+        assert collect(stream) == truth
+        assert stream.prompt_cached == len(system)
+        assert proposer.describe()["histories_restored"] == 1
+        stream = engine.submit(GenerationRequest([50, 51, 52, 53], max_tokens=2))
+        collect(stream)
+        assert stream.prompt_cached == 0
+        assert proposer.describe()["histories_restored"] == 1
+
+
+def test_head_history_survives_plain_steps_beside_another_row(tmp_path):
+    """Two rows decode plainly (no verify beside another row); the pairs
+    they go through are queued and the histories are whole at the end."""
+    model = tiny_qwen35()
+    a, b = [3, 7, 11, 13], [5, 9, 13, 17, 21]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        sa = engine.submit(GenerationRequest(a, max_tokens=8))
+        sb = engine.submit(GenerationRequest(b, max_tokens=8))
+        oa, ob = collect(sa), collect(sb)
+        for prompt, out in ((a, oa), (b, ob)):
+            entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+            keys, _, tail = entry.checkpoints[len(prompt) + len(out)][HEAD]
+            assert keys.shape[2] == len(prompt) + len(out) - 1 and tail is not None
+
+
+def test_history_window_and_queue_cap(tmp_path, monkeypatch):
+    """A prompt longer than the window is primed from its last positions
+    on, as a fresh head that saw only those; a queue past its cap restarts
+    the history from the queue alone."""
+    from mlx_beam.engine import proposer as proposer_mod
+
+    monkeypatch.setattr(proposer_mod, "HEAD_HISTORY", 4)
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5, 9, 2, 8, 6, 4]
+    engine, proposer = head_engine(tmp_path, model)
+    with engine:
+        out = collect(engine.submit(GenerationRequest(prompt, max_tokens=3)))
+        # Window 4 of 10: pairs at positions 6 and 7 from the chunk (8 sits
+        # on the prompt's last token, fed by the first step).
+        assert proposer.describe()["primed_pairs"] == 2
+        entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+        keys, _, _ = entry.checkpoints[len(prompt) + len(out)][HEAD]
+        assert keys.shape[2] == 4 + len(out) - 1
+    monkeypatch.setattr(proposer_mod, "PENDING_CAP", 3)
+    (tmp_path / "second").mkdir()
+    engine, proposer = head_engine(tmp_path / "second", model)
+    with engine:
+        sa = engine.submit(GenerationRequest([3, 7, 11], max_tokens=8))
+        sb = engine.submit(GenerationRequest([5, 9, 13], max_tokens=8))
+        oa, _ = collect(sa), collect(sb)
+        entry = engine.prefix_store._trie.get(engine.model_key, [3, 7, 11] + oa)
+        keys, _, _ = entry.checkpoints[3 + len(oa)][HEAD]
+        assert keys.shape[2] <= 3 + 1
 
 
 def test_cli_resolves_the_proposer_from_the_flag(tmp_path, caplog):

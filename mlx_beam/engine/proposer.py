@@ -46,8 +46,30 @@ class Proposer(Protocol):
         """The verify's outcome: `tokens` are the drafts that held (in order),
         `hidden` ((1, m, H)) the target's hidden state at each of them."""
 
+    def follow(self, uid: int, hidden: mx.array | None, token: mx.array) -> None:
+        """The row moved one token without this proposer: `token` ((1,))
+        follows the position whose hidden state is `hidden` ((1, 1, H)) -
+        the pair a `propose` at that position would have carried. `hidden`
+        None names the last primed position, whose pair the prefill left
+        open (the prompt's last token, fed by the first decode step)."""
+
+    def begin(self, uid: int, prompt_len: int, snapshot: list | None) -> None:
+        """A row starts: its prompt length (for a proposer that bounds its
+        history) and the history to resume from, if the prefix store had one
+        at the position the prefill starts."""
+
+    def prime(self, uid: int, hidden: mx.array, tokens: list[int], start: int) -> None:
+        """A prefill chunk: `hidden` ((1, L, H)) the target's hidden state at
+        prompt positions `start` .. `start + L - 1`, `tokens` the L tokens at
+        those positions - the pair of position t is (hidden[t], tokens[t+1]),
+        the last one waits for the token that follows the chunk."""
+
+    def snapshot(self, uid: int) -> list | None:
+        """The row's history as arrays and scalars for the prefix store, or
+        None when there is none; `begin` takes it back."""
+
     def drop(self, uid: int) -> None:
-        """The row left the batch, or decoded a step without this proposer."""
+        """The row left the batch."""
 
     def describe(self) -> dict: ...
 
@@ -232,12 +254,25 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[MTPHead, dict]:
     }
 
 
+# Pairs of prompt history the head keeps at most: a prompt longer than this
+# is primed from its last HEAD_HISTORY positions on, as a fresh head that
+# saw only those (MTPLX keeps the last 8192 from 16k on; the head's
+# attention is one layer, its KV 4 KB per pair on the 27B head).
+HEAD_HISTORY = 8192
+# Pairs queued from plain steps before the head is fed again in one call;
+# past this the history restarts from the queue alone.
+PENDING_CAP = 512
+
+
 class BundledHeadProposer:
     """The checkpoint's MTP head as proposer. Per row it keeps the head's KV
-    cache over the pairs (hidden, next token) the target confirmed - the
-    head's history, worth a third of its acceptance - and the pairs the last
-    verify confirmed but did not feed yet; those go in with the next draft's
-    first call, so a cycle costs `depth` head calls, no more."""
+    cache over the pairs (hidden, next token) the target went through -
+    primed over the prompt in the prefill, continued by every plain step
+    and every verify - the head's history, worth a third of its acceptance
+    (measured 2026-09-19: 2.39 against 2.23 tokens per cycle with and
+    without the prompt primed). Pairs the head has not seen yet wait in a
+    queue and go in with the next draft's first call, so a cycle costs
+    `depth` head calls, no more."""
 
     kind = "mtp"
 
@@ -249,21 +284,107 @@ class BundledHeadProposer:
         self._cache: dict[int, list] = {}
         self._pending: dict[int, tuple[list[mx.array], list[int]]] = {}
         self._chain: dict[int, int] = {}
+        # uid -> the hidden state of the last prefilled position, whose
+        # partner token comes with the next chunk or the first decode step.
+        self._tail: dict[int, mx.array] = {}
+        self._prompt_len: dict[int, int] = {}
+        self.primed_pairs = 0
+        self.restored = 0
 
-    def propose(self, uid, hidden, token, choose=None):
+    # -- history --------------------------------------------------------------
+
+    def _queue(self, uid: int, hs: list[mx.array], ts: list[int]) -> None:
+        old_h, old_t = self._pending.get(uid, ([], []))
+        hs, ts = old_h + hs, old_t + ts
+        if len(ts) > PENDING_CAP:
+            self._cache.pop(uid, None)
+            hs = [mx.concatenate(hs, axis=1)[:, -PENDING_CAP:, :]]
+            ts = ts[-PENDING_CAP:]
+        self._pending[uid] = (hs, ts)
+
+    def _feed(self, uid: int, hidden: mx.array, tokens: mx.array):
+        """Queued pairs first, then these: one head call, its output the
+        head's state at the last of them."""
         cache = self._cache.get(uid)
         if cache is None:
             cache = self._cache[uid] = [KVCache()]
         hs, ts = self._pending.pop(uid, ([], []))
-        # Confirmed pairs first, the new one last: one call, its last row drafts.
         h_in = mx.concatenate([*hs, hidden], axis=1) if hs else hidden
         t_in = (
-            mx.concatenate([mx.array(ts, dtype=token.dtype), token])[None]
+            mx.concatenate([mx.array([ts], dtype=tokens.dtype), tokens], axis=1)
             if ts
-            else token[None]
+            else tokens
         )
+        return self.head(h_in, t_in, self._embed, cache), cache
+
+    def begin(self, uid, prompt_len, snapshot):
+        self.drop(uid)
+        self._prompt_len[uid] = prompt_len
+        if snapshot is not None:
+            keys, values, tail = snapshot
+            cache = KVCache()
+            # Distinct array objects: the store's copy must not see the
+            # in-place writes the cache makes from here on.
+            cache.state = (keys[:], values[:], keys.shape[2])
+            self._cache[uid] = [cache]
+            if tail is not None:
+                self._tail[uid] = tail[:]
+            self.restored += 1
+
+    def prime(self, uid, hidden, tokens, start):
+        total = self._prompt_len.get(uid)
+        window = 0 if total is None else max(0, total - HEAD_HISTORY)
+        n = len(tokens)
+        # Pair (tail, tokens[0]) sits at position start - 1; the chunk's own
+        # pairs at start .. start + n - 2; the last hidden waits.
+        tail = self._tail.pop(uid, None)
+        hs, ts = [], []
+        if tail is not None and start - 1 >= window:
+            hs.append(tail)
+            ts.append(int(tokens[0]))
+        lo = max(0, window - start)
+        if lo < n - 1:
+            hs.append(hidden[:, lo : n - 1, :])
+            ts.extend(int(t) for t in tokens[lo + 1 :])
+        if hs:
+            out, cache = self._feed(
+                uid, mx.concatenate(hs, axis=1), mx.array([ts], dtype=mx.int32)
+            )
+            mx.eval(out, *cache[0].state)
+            self.primed_pairs += len(ts)
+        self._tail[uid] = hidden[:, n - 1 : n, :]
+
+    def follow(self, uid, hidden, token):
+        tail = self._tail.pop(uid, None)
+        if hidden is None:
+            hidden = tail
+            if hidden is None:
+                return  # nothing primed (or the window left it out)
+        self._queue(uid, [hidden], [int(token.item())])
+
+    def snapshot(self, uid):
+        if uid not in self._cache and uid not in self._pending:
+            return None
+        cache = self._cache.get(uid)
+        hs, ts = self._pending.pop(uid, ([], []))
+        if ts:
+            # Feed the queue so the snapshot is one cache, not a queue too.
+            _, cache = self._feed(
+                uid, mx.concatenate(hs, axis=1), mx.array([ts], dtype=mx.int32)
+            )
+        keys, values = cache[0].keys_and_values()
+        tail = self._tail.get(uid)
+        arrays = [mx.contiguous(keys), mx.contiguous(values), tail]
+        mx.eval(*[a for a in arrays if a is not None])
+        return arrays
+
+    # -- the cycle ------------------------------------------------------------
+
+    def propose(self, uid, hidden, token, choose=None):
+        self._tail.pop(uid, None)
         drafts = []
-        out = self.head(h_in, t_in, self._embed, cache)[:, -1:]
+        out, cache = self._feed(uid, hidden, token[None])
+        out = out[:, -1:]
         for i in range(self.depth):
             logits = self._lm_head(out)[:, -1, :]
             draft = mx.argmax(logits, axis=-1) if choose is None else choose(logits, i)
@@ -283,12 +404,21 @@ class BundledHeadProposer:
         if chained:
             cache[0].trim(chained)
         if tokens:
-            self._pending[uid] = ([hidden], list(tokens))
+            self._queue(uid, [hidden], list(tokens))
 
     def drop(self, uid: int) -> None:
         self._cache.pop(uid, None)
         self._pending.pop(uid, None)
         self._chain.pop(uid, None)
+        self._tail.pop(uid, None)
+        self._prompt_len.pop(uid, None)
 
     def describe(self) -> dict:
-        return {**self.info, "depth": self.depth, "rows_with_history": len(self._cache)}
+        return {
+            **self.info,
+            "depth": self.depth,
+            "rows_with_history": len(self._cache),
+            "primed_pairs": self.primed_pairs,
+            "histories_restored": self.restored,
+            "history_window": HEAD_HISTORY,
+        }

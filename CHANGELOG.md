@@ -69,6 +69,19 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   would have seen; a thinking budget speculates whenever its state cannot
   change within the cycle, the opener mask included - only the forced
   close itself runs in plain steps.
+- The draft head keeps its history over the whole conversation. The
+  prefill runs the trunk without the `lm_head` over each prompt chunk
+  (its logits were discarded before) and feeds the hidden states to the
+  head as pairs with the next token; every plain step queues its pair, so
+  a row that decoded beside another for a while still drafts with a whole
+  history when it is alone again; the history at each message boundary
+  and at the end of a row is stored beside the prefix-cache entry, and a
+  conversation that continues, or a request that shares the system block,
+  resumes it from there. Prompts longer than 8192 tokens are primed from
+  their last 8192 positions on. `/health.speculative.proposer` counts
+  `primed_pairs` and `histories_restored`. Measured before on the 27B
+  head: 2.39 against 2.23 tokens per cycle with and without the prompt
+  primed.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

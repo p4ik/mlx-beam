@@ -29,11 +29,13 @@ from mlx_beam.engine.kv import (
     make_request_cache,
 )
 from mlx_beam.engine.prefix import (
+    HEAD,
     PrefixStore,
     recurrent_layers,
     snapshot_window,
     window_layers,
 )
+from mlx_beam.engine.priming import PrimingPromptBatch
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -624,6 +626,12 @@ class Engine:
                     p, seed=int(mx.random.randint(0, 2**62).item())
                 )
             self._spec_coupling[uid] = coupling
+            # The head's history over the prompt: resumed from the store
+            # when it has one at the position the prefill starts, primed
+            # over the rest by the prefill.
+            self.speculator.proposer.begin(
+                uid, len(req.tokens), carried.get(covered, {}).get(HEAD)
+            )
 
     def _checkpoint(
         self, gen: BatchGenerator, uid: int, position: int, windows: bool = True
@@ -641,8 +649,6 @@ class Engine:
         caches = batch.prompt_cache
         rec = recurrent_layers(caches)
         win = window_layers(caches) if windows else []
-        if not rec and not win:
-            return
         # extract() slices the batch buffers; own the bytes, or every
         # snapshot pins a whole batch array per layer. A window's extract()
         # already copies its row in temporal order.
@@ -657,7 +663,24 @@ class Engine:
             snap[i] = snapshot_window(caches[i].extract(idx))
         for arrays in snap.values():
             mx.eval(*[a for a in arrays if isinstance(a, mx.array)])
+        if windows and self.speculator is not None:
+            # The draft head's history up to here, a sidecar of the entry:
+            # a request that resumes at this boundary drafts with it.
+            head = self.speculator.proposer.snapshot(uid)
+            if head is not None:
+                snap[HEAD] = head
+        if not snap:
+            return
         self._bookkeeping[uid][1][position] = snap
+
+    def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
+        """The draft head's history at the end of a row, next to the entry's
+        end state: the next turn of the conversation resumes it whole."""
+        if self.speculator is None:
+            return
+        head = self.speculator.proposer.snapshot(uid)
+        if head is not None:
+            checkpoints.setdefault(position, {})[HEAD] = head
 
     def _stride_checkpoint(self, gen: BatchGenerator, uid: int, position: int) -> None:
         """A checkpoint every ``checkpoint_stride`` tokens of prefill; beyond
@@ -708,8 +731,10 @@ class Engine:
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
-            self._forget_row(u)
             got = partial.get(u)
+            if got is not None:
+                self._head_checkpoint(u, checkpoints, len(got[1]))
+            self._forget_row(u)
             if got is None:
                 continue
             cache, tokens = got
@@ -792,7 +817,11 @@ class Engine:
             else None
         )
         gen = BatchGenerator(
-            self.model, stop_tokens=[], generation_batch=batch_class, **self._gen_args
+            self.model,
+            stop_tokens=[],
+            generation_batch=batch_class,
+            prompt_batch=PrimingPromptBatch if self.speculator is not None else None,
+            **self._gen_args,
         )
         self._gen = gen
         try:
@@ -855,6 +884,7 @@ class Engine:
                         own_recurrent_state(r.prompt_cache)
                         stored = for_store(r.prompt_cache)
                         tokens = list(r.all_tokens)
+                        self._head_checkpoint(r.uid, checkpoints, len(tokens))
                         self.prefix_store.insert(
                             self.model_key,
                             tokens,

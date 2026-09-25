@@ -275,8 +275,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
             )
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
+        before = self._hidden_slot
         self._hidden_slot = hidden[:, -1:, :]
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        mx.async_eval(
+            self._next_tokens, self._next_logprobs, self._hidden_slot, token_context
+        )
         mx.eval(inputs, self._current_logprobs)
         mx.eval(*_cache_arrays(self.prompt_cache))
         inputs = inputs.tolist()
@@ -284,8 +287,13 @@ class SpeculativeGenerationBatch(GenerationBatch):
             sti.append(ti)
         if self.speculator is not None:
             self.speculator.plain_steps += 1
-            for uid in self.uids:
-                self.speculator.proposer.drop(uid)
+            if before is not None:
+                # The pair this step went through, so the proposer's
+                # history stays in step: the state before it, the token fed.
+                for e, uid in enumerate(self.uids):
+                    self.speculator.proposer.follow(
+                        uid, before[e : e + 1], self._current_tokens[e : e + 1]
+                    )
         return inputs, self._current_logprobs
 
     # -- batch bookkeeping -----------------------------------------------------
@@ -302,6 +310,17 @@ class SpeculativeGenerationBatch(GenerationBatch):
             self._hidden_slot = None  # the next plain step fills it again
 
     def filter(self, keep):
+        if self.speculator is not None and self._hidden_slot is not None:
+            # A row that leaves has fed its last token; the hidden state
+            # after it is the open end of its history, for the store.
+            for e, uid in enumerate(self.uids):
+                if e not in keep and self.tokens[e]:
+                    self.speculator.proposer.prime(
+                        uid,
+                        self._hidden_slot[e : e + 1],
+                        [self.tokens[e][-1]],
+                        len(self.tokens[e]) - 1,
+                    )
         super().filter(keep)
         if self._hidden_slot is not None:
             self._hidden_slot = self._hidden_slot[keep] if keep else None
@@ -529,7 +548,12 @@ class SpeculativeGenerationBatch(GenerationBatch):
             mx.async_eval(self._next_tokens, self._next_logprobs, self._hidden_slot)
             spec.proposer.commit(uid, hidden[:, :m, :], drafts_l[:m])
         else:
-            spec.proposer.drop(uid)
+            # The row ends here: its history closes on the drafts that were
+            # committed (the cut may have dropped some), the engine takes
+            # the snapshot for the store before it drops the row.
+            kept = len(committed) - 1
+            spec.proposer.commit(uid, hidden[:, :kept, :], drafts_l[:kept])
+            self._hidden_slot = hidden[:, kept : kept + 1, :]
         mx.eval(*_cache_arrays(self.prompt_cache))
         out = []
         for token, lp, fin in responses:

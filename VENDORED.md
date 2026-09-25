@@ -109,13 +109,19 @@ round trip. Tests: `tests/test_kv_prefill.py` (exact mode matches
 is stored quantized).
 
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
-one constructor argument, `generation_batch`, the class built at the move to
-decoding (`PromptProcessingBatch.generate`) and for the empty batch. Upstream
-names `GenerationBatch` there; the engine hands in
+two constructor arguments. `generation_batch` is the class built at the move
+to decoding (`PromptProcessingBatch.generate`) and for the empty batch;
+upstream names `GenerationBatch` there, the engine hands in
 `mlx_beam.engine.speculative.SpeculativeGenerationBatch`, which decodes
 several tokens per call when a proposer drafts them and plainly otherwise.
-Nothing about the plain path changed: with the argument left out the
-default is upstream's class. Tests: `tests/test_speculative.py`.
+`prompt_batch` (on `BatchGenerator` only) is the class that prefills, built
+for the empty batch and in `_make_batch`; upstream names
+`PromptProcessingBatch`, the engine hands in
+`mlx_beam.engine.priming.PrimingPromptBatch` when a proposer is configured,
+which runs the trunk without the `lm_head` over the prompt chunks and feeds
+the hidden states to the draft head. Nothing about the plain path changed:
+with the arguments left out the defaults are upstream's classes. Tests:
+`tests/test_speculative.py`.
 
 `exact verify` - `models/base.py`, `scaled_dot_product_attention`: with
 `EXACT_PER_QUERY` set (by `mlx_beam.engine.exact.exact_forward`) a block of

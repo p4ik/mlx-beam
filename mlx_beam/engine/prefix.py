@@ -96,7 +96,13 @@ def compact_kv(cache: list[Any]) -> None:
         c.values = tree_map(lambda a, n=n: mx.contiguous(a[..., :n, :]), c.values)
 
 
-def _snapshot_bytes(snap: dict[int, list]) -> int:
+# The key of the draft head's history in a checkpoint, beside the layer
+# indices: (keys, values, tail hidden) of the head's cache at that position,
+# taken back by the proposer when a request resumes exactly there.
+HEAD = "head"
+
+
+def _snapshot_bytes(snap: dict) -> int:
     # A window snapshot carries scalars next to its arrays; only arrays weigh.
     return sum(getattr(a, "nbytes", 0) for arrays in snap.values() for a in arrays)
 
@@ -105,8 +111,9 @@ def _snapshot_bytes(snap: dict[int, list]) -> int:
 class Entry:
     cache: list[Any]
     length: int
-    # position -> recurrent state at that position (empty for plain models)
-    checkpoints: dict[int, dict[int, list]]
+    # position -> layer index -> state at that position, and the draft
+    # head's history under HEAD (empty for plain models without a head)
+    checkpoints: dict[int, dict]
     cache_type: str
     nbytes: int = 0
 
@@ -130,7 +137,7 @@ class Hit:
     kind: str  # "exact", "longer", "shorter"
     # the entry's checkpoints at or before ``covered``, still valid - and
     # for a recurrent model always one at ``covered`` itself
-    checkpoints: dict[int, dict[int, list]] = field(default_factory=dict)
+    checkpoints: dict[int, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -225,19 +232,20 @@ class PrefixStore:
             self.stats.tokens_restored += pos
             carried = {p: s for p, s in entry.checkpoints.items() if p <= pos}
             stateful = checkpoint_layers(cache)
-            if stateful and pos == entry.length and pos not in carried:
+            if stateful and pos == entry.length:
                 # Restored whole: the entry's end state is the restore point
                 # this request stands on. Carried along (shared, not copied),
                 # it survives the entry being replaced or evicted before the
-                # request finishes.
-                carried[pos] = {
-                    i: (
-                        entry.cache[i].cache
-                        if isinstance(entry.cache[i], ArraysCache)
-                        else snapshot_window(entry.cache[i])
-                    )
-                    for i in stateful
-                }
+                # request finishes. A head sidecar already there stays.
+                end = dict(carried.get(pos, {}))
+                for i in stateful:
+                    if i not in end:
+                        end[i] = (
+                            entry.cache[i].cache
+                            if isinstance(entry.cache[i], ArraysCache)
+                            else snapshot_window(entry.cache[i])
+                        )
+                carried[pos] = end
             if len(key) == len(tokens):
                 kind = "exact"
             elif len(key) < len(tokens):
@@ -254,7 +262,7 @@ class PrefixStore:
         model: Any,
         tokens: list[int],
         cache: list[Any],
-        checkpoints: dict[int, dict[int, list]] | None = None,
+        checkpoints: dict[int, dict] | None = None,
         cache_type: str = "assistant",
     ) -> None:
         # extract() hands out lazy slices of the batch buffers; evaluated
@@ -282,14 +290,15 @@ class PrefixStore:
                 # prefix_len). Moved, not copied - the old KV cache is what
                 # goes away. One entry per conversation, not one per turn.
                 inherited = dict(old.checkpoints)
-                inherited[prefix_len] = {
-                    i: (
-                        old.cache[i].cache
-                        if isinstance(old.cache[i], ArraysCache)
-                        else snapshot_window(old.cache[i])
-                    )
-                    for i in stateful
-                }
+                end = dict(inherited.get(prefix_len, {}))
+                for i in stateful:
+                    if i not in end:
+                        end[i] = (
+                            old.cache[i].cache
+                            if isinstance(old.cache[i], ArraysCache)
+                            else snapshot_window(old.cache[i])
+                        )
+                inherited[prefix_len] = end
                 for position, snap in inherited.items():
                     if position <= prefix_len and position not in entry.checkpoints:
                         entry.add_checkpoint(position, snap)
@@ -309,7 +318,7 @@ class PrefixStore:
         model: Any,
         tokens: list[int],
         cache: list[Any],
-        checkpoints: dict[int, dict[int, list]],
+        checkpoints: dict[int, dict],
         upto: int,
         cache_type: str = "system",
     ) -> bool:
