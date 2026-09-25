@@ -9,7 +9,6 @@ import pytest
 from mlx_beam.api import messages
 from mlx_beam.api.errors import ApiError
 from tests.stub_tokenizer import (
-    EOS,
     THINK_END,
     THINK_START,
     TOOL_END,

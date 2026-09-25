@@ -105,7 +105,9 @@ def _coerce_one(value: Any, kinds: list[str]) -> Any:
             text = value.strip()
             if kind == "integer" and re.fullmatch(r"[+-]?\d+", text):
                 return int(text)
-            if kind == "number" and re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", text):
+            if kind == "number" and re.fullmatch(
+                r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", text
+            ):
                 return float(text)
             if kind == "boolean" and text.lower() in ("true", "false"):
                 return text.lower() == "true"
@@ -120,7 +122,9 @@ def _coerce_one(value: Any, kinds: list[str]) -> Any:
                     return parsed
         elif kind == "string" and isinstance(value, (int, float, bool)):
             return json.dumps(value)
-        elif kind == "number" and isinstance(value, int) and not isinstance(value, bool):
+        elif (
+            kind == "number" and isinstance(value, int) and not isinstance(value, bool)
+        ):
             return float(value)
         elif kind == "integer" and isinstance(value, float) and value.is_integer():
             return int(value)
@@ -140,7 +144,9 @@ def repair_json_text(text: str) -> str:
     literals, single-quoted strings and keys, a trailing comma, braces or
     brackets left open at the end."""
     out = _FENCE.sub("", text)
-    out = _PY_LITERAL.sub(lambda m: {"True": "true", "False": "false", "None": "null"}[m.group(1)], out)
+    out = _PY_LITERAL.sub(
+        lambda m: {"True": "true", "False": "false", "None": "null"}[m.group(1)], out
+    )
     if "'" in out and '"' not in out:
         out = out.replace("'", '"')
     out = _TRAILING_COMMA.sub(r"\1", out)

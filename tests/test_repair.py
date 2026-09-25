@@ -24,27 +24,42 @@ TOOLS = [{"type": "function", "function": {"name": "weather", "parameters": SCHE
 
 
 def parse(text, tools=TOOLS):
-    p = ToolCallParser(json_tools.parse_tool_call, tools, streaming=False, start="<tool_call>", end="</tool_call>")
+    p = ToolCallParser(
+        json_tools.parse_tool_call,
+        tools,
+        streaming=False,
+        start="<tool_call>",
+        end="</tool_call>",
+    )
     calls, unparsed = p([(text, True)])
     return calls, unparsed
 
 
 def test_strict_call_passes_untouched():
-    calls, unparsed = parse('{"name": "weather", "arguments": {"city": "Oslo", "days": 2}}')
+    calls, unparsed = parse(
+        '{"name": "weather", "arguments": {"city": "Oslo", "days": 2}}'
+    )
     assert not unparsed and "repair_actions" not in calls[0]
     assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Oslo", "days": 2}
 
 
 def test_mended_json_is_read_and_reported():
     before = dict(repair.STATS)
-    text = "```json\n{'name': 'weather', 'arguments': {'city': 'Oslo', 'flag': True,}\n```"
+    text = (
+        "```json\n{'name': 'weather', 'arguments': {'city': 'Oslo', 'flag': True,}\n```"
+    )
     calls, unparsed = parse(text)
     assert not unparsed and calls[0]["repair_actions"] == ["json repaired"]
-    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Oslo", "flag": True}
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "city": "Oslo",
+        "flag": True,
+    }
     assert repair.STATS["repaired"] == before["repaired"] + 1
     # Braces left open at the end are closed.
     calls, unparsed = parse('{"name": "weather", "arguments": {"city": "Oslo"')
-    assert not unparsed and json.loads(calls[0]["function"]["arguments"]) == {"city": "Oslo"}
+    assert not unparsed and json.loads(calls[0]["function"]["arguments"]) == {
+        "city": "Oslo"
+    }
 
 
 def test_values_are_coerced_to_the_declared_type_and_reported():
@@ -67,10 +82,14 @@ def test_what_the_schema_still_rejects_comes_back_as_text():
     calls, unparsed = parse('{"name": "weather", "arguments": {"days": 2}}')
     assert not calls and unparsed[0].startswith("<tool_call>")
     # A value that is not plainly the type.
-    calls, unparsed = parse('{"name": "weather", "arguments": {"city": "Oslo", "days": "soon"}}')
+    calls, unparsed = parse(
+        '{"name": "weather", "arguments": {"city": "Oslo", "days": "soon"}}'
+    )
     assert not calls and unparsed
     # A key the schema forbids.
-    calls, unparsed = parse('{"name": "weather", "arguments": {"city": "Oslo", "x": 1}}')
+    calls, unparsed = parse(
+        '{"name": "weather", "arguments": {"city": "Oslo", "x": 1}}'
+    )
     assert not calls and unparsed
     assert repair.STATS["failed"] == before + 3
     # A tool the request did not declare: the parser's reading, unvalidated.

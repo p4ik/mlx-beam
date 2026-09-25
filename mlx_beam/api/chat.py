@@ -562,12 +562,16 @@ class ChatResponder:
         req: ChatRequest,
         prompt_tokens: list[int],
         reasoning_field: str = "reasoning",
+        fingerprint: str | None = None,
     ):
         if reasoning_field not in REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
         self._tokenizer = tokenizer
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        # The served configuration's id (model, version, KV layout): the
+        # same value for every answer the same set-up gives.
+        self.fingerprint = fingerprint
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self._sent_role = False
@@ -589,6 +593,7 @@ class ChatResponder:
             "object": kind,
             "created": self.created,
             "model": self.req.model,
+            "system_fingerprint": self.fingerprint,
         }
 
     def _message(self, d: TextDelta) -> dict:

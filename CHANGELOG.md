@@ -50,6 +50,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   nothing is invented, what a rung did is the call's `repair_actions`,
   and a call no rung makes valid still comes back as text.
   `/health.tools.repairs` counts the rungs.
+- `/metrics` in Prometheus' text format from the same counters `/health`
+  reports (`mlx_beam_*`: requests, tokens, seconds, memory, the prefix
+  store, tool-call rungs, the speculator), plus the four `vllm:` names
+  dashboards read most.
+- `/v1/models` entries carry `context_length` and `max_model_len` (the
+  context the engine serves), `max_completion_tokens` (the default a
+  request may override), `input_modalities`, `owned_by: mlx-beam` and the
+  `capabilities` object with the effort measurement; chat and text
+  completions carry a `system_fingerprint` (model, version and KV layout
+  hashed).
 - A checkpoint in the package layout is read through its manifest:
   `config.json` names it (`extras.manifest`), `parts.mtp` names the draft
   head's file, bits, group size and norm convention, and the file is

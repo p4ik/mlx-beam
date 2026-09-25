@@ -104,9 +104,16 @@ def to_generation_request(
 
 
 class CompletionResponder:
-    def __init__(self, tokenizer, req: CompletionRequest, prompt_tokens: list[int]):
+    def __init__(
+        self,
+        tokenizer,
+        req: CompletionRequest,
+        prompt_tokens: list[int],
+        fingerprint: str | None = None,
+    ):
         self.req = req
         self.id = f"cmpl-{uuid.uuid4().hex[:24]}"
+        self.fingerprint = fingerprint
         self.created = int(time.time())
         self.prompt_tokens = prompt_tokens
         self._tokenizer = tokenizer
@@ -128,6 +135,7 @@ class CompletionResponder:
             "object": "text_completion",
             "created": self.created,
             "model": self.req.model,
+            "system_fingerprint": self.fingerprint,
         }
 
     def _usage(self, cached: int) -> dict:

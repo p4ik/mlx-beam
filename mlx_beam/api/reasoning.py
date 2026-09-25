@@ -23,6 +23,9 @@ ORDINAL = ("minimal", "low", "medium", "high", "xhigh", "max")
 EFFORT_ALIASES = {"ultra": "max"}
 # Words that mean thinking off.
 EFFORT_OFF = ("none", "false", "off")
+# The keys earlier assistant turns carry their thinking in, most specific
+# first: that order decides which value fills a key the client left empty.
+REASONING_KEYS = ("reasoning_content", "thinking", "reasoning")
 # Kwarg names a template may take the effort under, searched in its source.
 EFFORT_KWARGS = ("reasoning_effort", "reasoning_strength", "thinking_budget")
 # Words the probe renders with, the client's vocabulary plus what some
@@ -84,8 +87,12 @@ def probe_effort(tokenizer) -> EffortCapability:
     source = _template_source(tokenizer)
     kwarg = next((k for k in EFFORT_KWARGS if k in source), None)
     if kwarg is None:
-        m = re.search(r"\b(reasoning_[a-z_]+)\b", source)
-        kwarg = m.group(1) if m else None
+        # Another reasoning_* name read as a variable, not a message key
+        # (`message.reasoning_content` is the turn's own field).
+        for m in re.finditer(r"""(?<![\.\w'"\[])(reasoning_[a-z_]+)\b""", source):
+            if m.group(1) not in REASONING_KEYS:
+                kwarg = m.group(1)
+                break
     if kwarg is None:
         return EffortCapability("none")
     if not kwarg.startswith("reasoning_"):
@@ -167,10 +174,6 @@ def map_effort(effort) -> str | None:
     callers that only need the switch."""
     return normalise_effort(effort)
 
-
-# The keys earlier assistant turns carry their thinking in, most specific
-# first: that order decides which value fills a key the client left empty.
-REASONING_KEYS = ("reasoning_content", "thinking", "reasoning")
 
 # message.thinking, message["thinking"], msg.get("thinking"): an access, not
 # the word in prose (an ellipsis before it is prose).
