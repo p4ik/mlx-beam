@@ -6,6 +6,14 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a6] - 2026-09-25
+
+### Fixed
+- `mlx-beam-vision` installs torch and torchvision. The processors
+  transformers ships for its families need them, so a clean install
+  refused every vision checkpoint with "requires the Torchvision library"
+  and served no image.
+
 ## [0.1.0a5] - 2026-09-25
 
 ### Added
