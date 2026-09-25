@@ -7,6 +7,7 @@ build/
 .ruff_cache/
 .pytest_cache/
 mlx_beam/_version.py
+packages/*/*/_version.py
 docs/site/node_modules/
 docs/site/dist/
 docs/site/.astro/
