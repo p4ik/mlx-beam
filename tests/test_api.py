@@ -1438,3 +1438,82 @@ def test_logprobs_keep_the_byte_tokens_of_a_character(stream):
         entries = choice["logprobs"]["content"]
     assert content == "€"
     assert [e["logprob"] for e in entries] == [-0.1, -0.2, -0.3]
+
+
+def test_responses_take_a_null_tool_choice_as_auto():
+    # Clients send the default explicitly as null; that is not a choice.
+    req = responses.parse_responses_request({"input": "w1", "tool_choice": None}, "m")
+    assert req.tool_choice == "auto"
+
+
+def test_logprobs_book_a_held_prefix_with_the_token_that_releases_it():
+    """A token the automaton holds back as the possible start of a stop
+    word is content once the word does not come; the eos token itself is
+    never content, even when its arrival flushes held text."""
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "stop": "w10 w11",
+        },
+        "m",
+    )
+    responder = chat.ChatResponder(tok, req, [1])
+    # w10 is held (prefix of the stop word), w12 releases both.
+    ev = [TokenEvent(10, -0.1), TokenEvent(12, -0.2), TokenEvent(EOS, -0.3, "stop")]
+    choice = responder.complete(iter(ev), 0)["choices"][0]
+    assert choice["message"]["content"] == "w10 w12 "
+    assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1, -0.2]
+    # Held at the end: the eos flushes w10 as content, but is none itself.
+    responder = chat.ChatResponder(tok, req, [1])
+    ev = [TokenEvent(10, -0.1), TokenEvent(EOS, -0.3, "stop")]
+    choice = responder.complete(iter(ev), 0)["choices"][0]
+    assert choice["message"]["content"] == "w10 "
+    assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1]
+
+
+def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():
+    # The raw prompt already carries `<think>`; the completion is what the
+    # model wrote after it, not the opener again.
+    tok = StubTokenizer()
+    req = completions.parse_completion_request(
+        {"prompt": [6, 1, 7, THINK_START], "max_tokens": 4}, "m"
+    )
+    responder = completions.CompletionResponder(tok, req, req.prompt)
+    out = responder.complete(events([10, THINK_END, 11]), 0)
+    assert out["choices"][0]["text"] == "w10 </think>w11 "
+
+
+def test_a_marker_inside_a_user_message_does_not_open_the_assistant_state():
+    """A `<think>` the user wrote (code, a question about the token) is
+    text; only the assistant's own frame seeds the reasoning state."""
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w2 <think> w3"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert THINK_START in gen.tokens and req.assistant_start == len(gen.tokens) - 1
+    assert gen.reasoning is not None and not gen.reasoning.seeded
+    responder = chat.ChatResponder(tok, req, gen.tokens)
+    out = responder.complete(events([10, 11]), 0)["choices"][0]["message"]
+    assert out["content"] == "w10 w11 " and not out.get("reasoning")
+
+
+def test_logprob_bytes_of_a_byte_level_token_are_its_own():
+    tok = _ByteTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    ev = [
+        TokenEvent(40, -0.1),
+        TokenEvent(41, -0.2),
+        TokenEvent(42, -0.3),
+        TokenEvent(EOS, -0.4, "stop"),
+    ]
+    choice = chat.ChatResponder(tok, req, [1]).complete(iter(ev), 0)["choices"][0]
+    assert [e["bytes"] for e in choice["logprobs"]["content"]] == [
+        [0xE2],
+        [0x82],
+        [0xAC],
+    ]

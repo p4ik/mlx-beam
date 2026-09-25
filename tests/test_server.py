@@ -604,3 +604,31 @@ def test_no_keepalive_before_the_first_token_without_worker_progress(monkeypatch
     handler.wfile = io.BytesIO()
     handler._await_first(stepping, keepalive=True)
     assert handler.wfile.getvalue().count(b": waiting") == 3
+
+
+def test_a_non_streaming_client_that_leaves_is_cancelled(server, monkeypatch):
+    """Nothing is written until the answer is complete, so the handler has
+    to look at the socket itself: a client that closed the connection ends
+    the row instead of being decoded to max_tokens for nobody."""
+    import mlx_beam.server as srv
+
+    monkeypatch.setattr(srv, "DISCONNECT_CHECK_S", 0.01)
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=30)
+    body = json.dumps({"prompt": [1, 2, 3], "max_tokens": 4000}).encode()
+    conn.request(
+        "POST",
+        "/v1/completions",
+        body=body,
+        headers={"Content-Type": "application/json"},
+    )
+    import time
+
+    time.sleep(0.3)  # a few tokens in
+    conn.close()  # walk away before the answer
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        status, _, raw = call(server, "GET", "/health")
+        if json.loads(raw)["in_flight"] == 0:
+            break
+        time.sleep(0.2)
+    assert json.loads(raw)["in_flight"] == 0

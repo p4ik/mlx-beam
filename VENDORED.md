@@ -28,7 +28,18 @@ have.
 
 `import paths` - `utils.py`, `tokenizer_utils.py`, `models/plamo2.py`: three
 dynamic imports and one absolute import used the top-level name `mlx_lm`;
-they now use the vendored package path. Nothing else about them changed.
+they now use the vendored package path. Nothing else about them changed
+except the next entry.
+
+`sidecar download` - `utils.py`, `_download` and `package_files`: after the
+default snapshot (`*.json`, `model*.safetensors`, ...) a second
+`snapshot_download` fetches the files the checkpoint itself names beyond
+those patterns - `mtp_file` in config.json, every `parts.<name>.file` of
+a package manifest, and the weight index's shards outside
+`model*.safetensors`. Without it a Hugging Face repo id loads the trunk
+but never its draft head (`mtp/weights.safetensors`) or a tower sidecar
+(`optiq/…`), and `--draft-model bundled` fails on a fresh machine. Tests:
+`tests/test_cli.py`.
 
 `mask` - `models/cache.py`, `ArraysCache.make_mask`: `lengths` decides before
 `left_padding`. A right-padded prefill sets `lengths`, but `merge()` of fresh

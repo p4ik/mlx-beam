@@ -12,9 +12,11 @@ permissions:
   pages: write
   id-token: write
 
+# A deploy in progress finishes; the newer one waits its turn (a cancelled
+# deploy could leave the site half-updated).
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:

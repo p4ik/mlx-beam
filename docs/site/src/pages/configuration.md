@@ -20,9 +20,9 @@ Flags take mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`
 | `--model-alias` | text | — | model id shown to clients (default: --model) |
 | `--reasoning-field` | `reasoning` / `reasoning_content` / `both` / `none` | `reasoning` | where a chat completion carries the model's thinking: the field name(s), or none to leave the think markers in the content |
 | `--host` | text | `127.0.0.1` | address to listen on |
-| `--port` | integer | `8000` | TCP port to listen on |
+| `--port` | integer ≥ 1 | `8000` | TCP port to listen on |
 | `--allowed-origins` | `ORIGIN` (one or more) | `*` | origins CORS admits (default: any) |
-| `--max-queued` | integer | — | requests allowed to wait for a batch slot; one more is a 503 with Retry-After (default: unlimited) |
+| `--max-queued` | integer ≥ 1 | — | requests allowed to wait for a batch slot; one more is a 503 with Retry-After (default: unlimited) |
 | `--trust-remote-code` | switch | — | run a model_file shipped inside the checkpoint |
 | `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | how much the server log says |
 
@@ -40,11 +40,11 @@ Every value counts tokens; each one counts a different set.
 
 | Flag | Value | Default | What it does |
 |---|---|---|---|
-| `--max-context` | integer | — | prompt plus generated tokens, a hard cap: a prompt whose reserve does not fit is a 400, a larger max_tokens is served capped at what the context holds (default: the model's own context length) |
-| `--max-prompt-tokens` | integer | — | prompt tokens, a hard cap below the context: a longer prompt is a 400; a request's max_prompt_tokens may only lower it |
-| `--max-completion-tokens` | integer | — | generated tokens when the client sends no max_tokens / max_completion_tokens / max_output_tokens; the request overrides (mlx-lm: --max-tokens, default 512) |
-| `--max-reasoning-tokens` | integer | — | reasoning tokens (what usage.reasoning_tokens counts) when the client sends no max_reasoning_tokens; the think block is closed by force at the budget (default: unbounded) |
-| `--min-response-tokens` | integer | `0` | tokens kept for the answer after the think block when the client sends no min_response_tokens; the reasoning budget is cut to leave them, and a request whose context cannot hold them is a 400 |
+| `--max-context` | integer ≥ 1 | — | prompt plus generated tokens, a hard cap: a prompt whose reserve does not fit is a 400, a larger max_tokens is served capped at what the context holds (default: the model's own context length) |
+| `--max-prompt-tokens` | integer ≥ 1 | — | prompt tokens, a hard cap below the context: a longer prompt is a 400; a request's max_prompt_tokens may only lower it |
+| `--max-completion-tokens` | integer ≥ 1 | — | generated tokens when the client sends no max_tokens / max_completion_tokens / max_output_tokens; the request overrides (mlx-lm: --max-tokens, default 512) |
+| `--max-reasoning-tokens` | integer ≥ 0 | — | reasoning tokens (what usage.reasoning_tokens counts) when the client sends no max_reasoning_tokens; the think block is closed by force at the budget (default: unbounded) |
+| `--min-response-tokens` | integer ≥ 0 | `0` | tokens kept for the answer after the think block when the client sends no min_response_tokens; the reasoning budget is cut to leave them, and a request whose context cannot hold them is a 400 |
 
 ### Sampling defaults
 
@@ -54,7 +54,7 @@ Used when the client sends nothing; a flag beats the model's generation_config.j
 |---|---|---|---|
 | `--temp` | number | — | temperature |
 | `--top-p` | number | — | nucleus sampling |
-| `--top-k` | integer | — | top-k sampling (0 = off) |
+| `--top-k` | integer ≥ 0 | — | top-k sampling (0 = off) |
 | `--min-p` | number | — | min-p sampling (0 = off) |
 
 ### KV cache
@@ -62,7 +62,7 @@ Used when the client sends nothing; a flag beats the model's generation_config.j
 | Flag | Value | Default | What it does |
 |---|---|---|---|
 | `--kv-bits` | `4` / `8` | — | quantize the full-attention KV cache to this many bits |
-| `--kv-group-size` | `32` / `64` / `128` | `64` | group size of the KV quantization |
+| `--kv-group-size` | `32` / `64` / `128` | — | group size of the KV quantization (default: 64, or what the checkpoint's kv_config carries; the flag beats the file) |
 | `--kv-config` | text | — | JSON file, bits per layer: {"bits": 4, "group_size": 64, "layers": {"3": 8}}, or the list a quantized package ships ([{"layer_idx": 3, "bits": 4, "group_size": 64}, ...]): listed layers take their bits, unlisted ones follow --kv-bits (optiq leaves them at full precision and ignores --kv-bits) |
 | `--kv-prefill` | `exact` / `quantized` | — | when a quantized layer becomes quantized: 'exact' (default) keeps the prompt at model precision while it is prefilled and quantizes at the handover to decoding (mlx-lm's generate_step with quantized_kv_start at the prompt's end); 'quantized' writes it quantized from the first token, which saves the prompt's full-precision transient (~2 GB for a 64k prompt on a 27B) and on some models costs accuracy - use it for a profile that was measured with it (a kv_config object may carry "prefill": "quantized") |
 
@@ -70,10 +70,10 @@ Used when the client sends nothing; a flag beats the model's generation_config.j
 
 | Flag | Value | Default | What it does |
 |---|---|---|---|
-| `--decode-concurrency` | integer | `8` | sequences decoded in one batch |
-| `--prompt-concurrency` | integer | `2` | prompts prefilled in one batch |
-| `--prefill-step-size` | integer | `2048` | prompt tokens per model call while prefilling |
-| `--prefill-slice` | integer | `512` | prompt tokens a prefill runs before decode gets a turn |
+| `--decode-concurrency` | integer ≥ 1 | `8` | sequences decoded in one batch |
+| `--prompt-concurrency` | integer ≥ 1 | `2` | prompts prefilled in one batch |
+| `--prefill-step-size` | integer ≥ 1 | `2048` | prompt tokens per model call while prefilling |
+| `--prefill-slice` | integer ≥ 1 | `512` | prompt tokens a prefill runs before decode gets a turn |
 | `--decode-share` | `SHARE` | `0.5` | share of the worker's time decode keeps while a prefill runs (0-1) |
 
 ### Speculative decoding
@@ -83,14 +83,14 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 | Flag | Value | Default | What it does |
 |---|---|---|---|
 | `--draft-model` | text | — | the proposer that drafts tokens for the verify pass: 'bundled' takes the draft head the checkpoint ships (the package manifest's parts.mtp, config.json mtp_file, or mtp.* tensors in the shards); a repo or path for an external drafter is not supported yet |
-| `--max-draft-tokens` | integer | `3` | cap on the drafts verified per cycle (default: 3, the fixed depth at this stage; a lower value lowers it) |
+| `--max-draft-tokens` | integer ≥ 1 | `3` | cap on the drafts verified per cycle (default: 3, the fixed depth at this stage; a lower value lowers it) |
 
 ### Prompt cache
 
 | Flag | Value | Default | What it does |
 |---|---|---|---|
-| `--prompt-cache-size` | integer | `16` | stored prefixes: a number of entries, not a size in bytes |
-| `--prompt-cache-bytes` | integer | — | RAM budget in bytes for the stored prefixes (default: unlimited); the store's own limit, separate from the caches of running requests |
+| `--prompt-cache-size` | integer ≥ 1 | `16` | stored prefixes: a number of entries, not a size in bytes |
+| `--prompt-cache-bytes` | integer ≥ 1 | — | RAM budget in bytes for the stored prefixes (default: unlimited); the store's own limit, separate from the caches of running requests |
 
 <!-- /generated -->
 

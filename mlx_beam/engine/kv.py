@@ -72,10 +72,6 @@ class KVPolicy:
     def bits_for(self, layer: int) -> int | None:
         return self.layers.get(layer, self.bits)
 
-    @property
-    def quantizes(self) -> bool:
-        return self.bits is not None or any(b for b in self.layers.values())
-
     def describe(self) -> dict:
         return {
             "bits": self.bits,

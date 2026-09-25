@@ -204,7 +204,7 @@ def parse_responses_request(
     text_format = object_field(object_field(body, "text"), "format", "text").get("type")
     if text_format not in (None, "text"):
         raise missing_extra("text.format", "structured")
-    tool_choice = body.get("tool_choice", "auto")
+    tool_choice = body.get("tool_choice") or "auto"  # null is the default too
     if tool_choice not in ("auto", "none"):
         raise unsupported("tool_choice other than auto or none", "tool_choice")
     tools = _tools_to_chat(body.get("tools")) if tool_choice != "none" else None
@@ -270,11 +270,12 @@ class ResponsesResponder:
         self.prompt_len = len(prompt_tokens)
         self.assembler = TextAssembler(
             tokenizer,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=prompt_tokens[req.chat.assistant_start :],
+            stop_words=req.chat.stop,
             tools=req.chat.tools,
             streaming=False,
             route_thinking=route_thinking,
-            tools_enabled=req.chat.tools is not None,
+            tools_enabled=bool(req.chat.tools),
         )
 
     def _response(
