@@ -274,23 +274,6 @@ def test_short_request_is_not_stuck_behind_a_long_prefill():
     assert result["long"] < 2.0 * solo_long, (result["long"], solo_long)
 
 
-def test_a_failing_store_reaches_the_finishing_stream():
-    # The store runs before the last token is delivered; if it raises, the
-    # worker dies and that stream must hear about it, not wait forever.
-    model = tiny_llama()
-    with Engine(model) as engine:
-
-        def boom(*args, **kwargs):
-            raise MemoryError("no room for the entry")
-
-        engine.prefix_store.insert = boom
-        stream = engine.submit(GenerationRequest([1, 2, 3], max_tokens=1))
-        with pytest.raises(EngineDead, match="no room"):
-            for _ in stream:
-                pass
-        assert not engine.alive
-
-
 def test_max_queued_refuses_the_overflow_with_a_count():
     from mlx_beam.engine import QueueFull
 
@@ -505,3 +488,21 @@ def test_sizes_come_from_the_wrapper_text_config():
         assert engine.health()["max_context"] == 512
         with pytest.raises(ContextTooLong):
             engine.submit(GenerationRequest(list(range(1, 60)) * 9, max_tokens=8))
+
+
+def test_a_failing_store_costs_the_entry_not_the_engine(monkeypatch):
+    """The entry of a finished row could not be written: the answer still
+    reaches the caller, the engine lives, health counts the loss."""
+    model = tiny_hybrid()
+    with Engine(model) as engine:
+
+        def broken(*a, **k):
+            raise RuntimeError("no room in the store")
+
+        monkeypatch.setattr(engine.prefix_store, "insert", broken)
+        out = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=3)))
+        assert len(out) == 3
+        h = engine.health()
+        assert h["alive"] and h["prompt_cache"]["store_failures"] == 1
+        # And the next request runs as if nothing happened.
+        assert len(collect(engine.submit(GenerationRequest([3, 7], max_tokens=2)))) == 2

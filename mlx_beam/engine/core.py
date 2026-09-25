@@ -6,6 +6,7 @@ per-request stream. Nothing here knows about text, HTTP or chat formats.
 
 from __future__ import annotations
 
+import collections
 import logging
 import queue
 import threading
@@ -36,7 +37,7 @@ from mlx_beam.engine.prefix import (
     window_layers,
 )
 from mlx_beam.engine.priming import PrimingPromptBatch, image_capabilities
-from mlx_beam.engine.proposer import trunk
+from mlx_beam.engine.proposer import check_head, trunk
 from mlx_beam.engine.request import (
     GenerationRequest,
     PromptProgress,
@@ -57,8 +58,15 @@ from mlx_beam.engine.thinking import (
     close_counted,
     close_tail,
 )
+from mlx_beam.engine.valve import PrefillValve
 
 logger = logging.getLogger(__name__)
+
+# A prefill the valve stalls: rounds with the store empty and nothing
+# decoding before the widest prompt is refused, and the pause per stalled
+# round while something else may free memory.
+STALL_ROUNDS = 3
+STALL_SLEEP_S = 0.05
 
 
 class EngineDead(RuntimeError):
@@ -211,11 +219,18 @@ class Engine:
             self.speculator.mode = "block" if exact_verify == "off" else exact_verify
             if exact_verify == "kernels":
                 self._exact_installed = exact.install(model)
+        # The prefill valve: the next call's peak estimated from the calls
+        # before, held under min(recommended working set, held + free).
+        self.prefill_valve = PrefillValve()
+        # Prompts refused because the stall could not end (health).
+        self.stalls_refused = 0
         # Recurrent-state checkpoints inside a long prefill, every ``stride``
         # tokens and at most ``max`` per request, so an edit or a cancel
         # deep in a turn does not throw the whole turn away.
         self.checkpoint_stride = checkpoint_stride
-        self.checkpoint_stride_max = checkpoint_stride_max
+        # The pruning keeps the newest and the oldest stride checkpoint and
+        # drops from between them, so fewer than two cannot be honoured.
+        self.checkpoint_stride_max = max(2, checkpoint_stride_max)
         # Prompt plus generation must fit; None reads the model's own limit.
         native = model_context_length(model)
         if max_context and native and max_context > native:
@@ -268,38 +283,56 @@ class Engine:
         self._stride: dict[int, list[int]] = {}
         self._samplers = SamplerPool()
         self._budgets: dict[int, ThinkingBudget] = {}
+        # What each budget said about a token, in order, from the step that
+        # produced it (_on_step); the delivery loop takes them off the front.
+        self._observed: dict[int, collections.deque] = {}
         self._admitting: ResultStream | None = None
         self._gen: BatchGenerator | None = None
         self._last_step = 0.0
         self._applied_caches: list[dict] | None = None
+        # Finished rows whose store entry could not be written (health).
+        self.store_failures = 0
         self._kv_exceptions = kv_exceptions(model)
         self._kv_quantizable = len(make_request_cache(model, KVPolicy())) - len(
             self._kv_exceptions
         )
         self._started_at = 0.0
         self._ready = threading.Event()
-        self.warmup_tokens: list[int] = [0]
+        # Four tokens: three through the prefill (the prompt batch, the KV
+        # policy's write path) and the last through a decode step - a
+        # single token skips the prefill entirely and a defect there would
+        # surface on the first client request instead of here.
+        self.warmup_tokens: list[int] = [0, 0, 0, 0]
 
     # -- lifecycle --------------------------------------------------------
 
     def start(self, timeout: float | None = 600.0) -> Engine:
-        """Start the worker and wait for its warm-up: one token through the
-        model with the configured KV layout. A policy the model cannot carry
-        fails here, not on the first client request."""
-        if self._thread is not None:
-            return self
-        # Lazy arrays carry the loading thread's stream; the worker cannot
-        # evaluate them ("There is no Stream(cpu, 0) in current thread").
-        # The state holds more than the parameters: rope frequency tables
-        # (Gemma 4, Llama 3) are lazy arrays outside parameters().
-        mx.eval(
-            [a for _, a in tree_flatten(self.model.state) if isinstance(a, mx.array)]
-        )
-        self._started_at = time.monotonic()
-        self._thread = threading.Thread(
-            target=self._run, name="beam-engine", daemon=True
-        )
-        self._thread.start()
+        """Start the worker and wait for its warm-up: a short prompt through
+        the prefill and one decode step with the configured KV layout. A
+        policy the model cannot carry fails here, not on the first client
+        request. A second call while the first warm-up runs waits for it."""
+        with self._lock:
+            if self._thread is None:
+                # Lazy arrays carry the loading thread's stream; the worker
+                # cannot evaluate them ("There is no Stream(cpu, 0) in
+                # current thread"). The state holds more than the
+                # parameters: rope frequency tables (Gemma 4, Llama 3) are
+                # lazy arrays outside parameters().
+                mx.eval(
+                    [
+                        a
+                        for _, a in tree_flatten(self.model.state)
+                        if isinstance(a, mx.array)
+                    ]
+                )
+                self._started_at = time.monotonic()
+                self._thread = threading.Thread(
+                    target=self._run, name="beam-engine", daemon=True
+                )
+                self._thread.start()
+        return self._await_ready(timeout)
+
+    def _await_ready(self, timeout: float | None) -> Engine:
         while not self._ready.wait(0.05):
             if not self._thread.is_alive():
                 raise EngineDead(self._death_message())
@@ -432,6 +465,8 @@ class Engine:
             raise InvalidRequest(
                 "xtc_probability must be in [0, 1], xtc_threshold in [0, 0.5]"
             )
+        if not 0.0 <= p.min_p <= 1.0:
+            raise InvalidRequest("min_p must be in [0, 1]")
         if p.min_tokens_to_keep < 1:
             raise InvalidRequest("min_tokens_to_keep must be at least 1")
         if p.temperature < 0:
@@ -522,6 +557,11 @@ class Engine:
             # Prefill calls that admitted nobody so a starved long prompt got
             # its full slice (VENDORED.md, scheduler); 0 means never needed.
             "prefill_starved_calls": gen.starved_calls if gen is not None else 0,
+            "prefill_valve": {
+                **self.prefill_valve.describe(),
+                "stalled_rounds": gen.stalled_calls if gen is not None else 0,
+                "refused": self.stalls_refused,
+            },
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
             # recommended working set) and what it found before.
@@ -539,7 +579,10 @@ class Engine:
                 "quantizable_layers": self._kv_quantizable,
                 "exceptions": self._kv_exceptions,
             },
-            "prompt_cache": self.prefix_store.describe(),
+            "prompt_cache": {
+                **self.prefix_store.describe(),
+                "store_failures": self.store_failures,
+            },
             "sampling": self._samplers.describe(),
             # None: no proposer configured, every row decodes plainly.
             "speculative": (
@@ -562,16 +605,17 @@ class Engine:
     def _fail_everything(self, error: BaseException) -> None:
         with self._lock:
             self._dead = True
-        dead = EngineDead(f"engine worker died: {error!r}")
+        message = f"engine worker died: {error!r}"
         if self._admitting is not None:
-            self._admitting.put(dead)
+            self._admitting.put(EngineDead(message))
             self._admitting = None
         for stream in self._live.values():
-            stream.put(dead)
+            stream.put(EngineDead(message))
         self._live.clear()
         self._bookkeeping.clear()
         self._stride.clear()
         self._budgets.clear()
+        self._observed.clear()
         self._spec_coupling.clear()
         self._spans.clear()
         while True:
@@ -636,7 +680,9 @@ class Engine:
         self._live[uid] = stream
         if req.spans:
             self._spans[uid] = tuple(req.spans)
-        self._bookkeeping[uid] = (covered, dict(carried))
+        # Copies of the store's own checkpoint dicts: a sidecar written into
+        # a row's checkpoints must never land in the entry it came from.
+        self._bookkeeping[uid] = (covered, {p: dict(c) for p, c in carried.items()})
         self._stride[uid] = []
         if thinking is not None:
             self._budgets[uid] = thinking
@@ -785,6 +831,7 @@ class Engine:
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
             self._budgets.pop(u, None)
+            self._observed.pop(u, None)
             got = partial.get(u)
             if got is not None:
                 self._head_checkpoint(u, checkpoints, len(got[1]))
@@ -801,13 +848,97 @@ class Engine:
                     self.model_key,
                     self._store_key(stream.request, list(tokens)),
                     cache,
-                    checkpoints={
-                        p: c for p, c in checkpoints.items() if p <= len(tokens)
-                    },
+                    checkpoints=checkpoints,
                     cache_type="assistant",
                 )
             except Exception:  # noqa: BLE001 - a lost partial is no failure
                 traceback.print_exc()
+
+    def _on_step(self, step) -> None:
+        """One decode step's responses, from inside the generator before the
+        next step: every budget observes its token now, so a forced close
+        arms in time and a speculative cycle judges `stable_for` on the
+        current count - not after a run of steps that shared the worker
+        with a prefill."""
+        for r in step:
+            thinking = self._budgets.get(r.uid)
+            if thinking is None:
+                continue
+            thinking.observe(r.token, r.finish_reason)
+            self._observed.setdefault(r.uid, collections.deque()).append(
+                (
+                    thinking.last_forced,
+                    thinking.thinking_truncated,
+                    thinking.in_reasoning,
+                )
+            )
+
+    def _store_finished(self, s: ResultStream, r, checkpoints: dict) -> None:
+        """A finished row into the prefix store, plus its system block as an
+        entry of its own when the request marked one."""
+        own_recurrent_state(r.prompt_cache)
+        stored = for_store(r.prompt_cache)
+        tokens = self._store_key(s.request, list(r.all_tokens))
+        self._head_checkpoint(r.uid, checkpoints, len(tokens))
+        self.prefix_store.insert(
+            self.model_key,
+            tokens,
+            stored,
+            checkpoints=checkpoints,
+            cache_type="assistant",
+        )
+        if s.request.system_end:
+            # The system block as its own entry: evicted after every
+            # conversation, so the expensive prefix survives a full
+            # turnover of the store.
+            self.prefix_store.insert_prefix(
+                self.model_key,
+                tokens,
+                stored,
+                checkpoints,
+                s.request.system_end,
+            )
+
+    def _relieve_stall(self, gen: BatchGenerator) -> None:
+        """The valve let nobody prefill this round. Memory the store holds
+        is memory the prefill may have: one entry goes per stalled round.
+        With the store empty and nothing decoding (whose finish would free
+        its cache) the stall cannot end by itself: after STALL_ROUNDS the
+        widest prefilling row is refused with a 400 - the prompt does not
+        fit beside what runs - instead of holding every prompt behind it
+        for ever. While something decodes, the worker waits a little
+        rather than spinning."""
+        if self.prefix_store.evict_one():
+            mx.clear_cache()
+            return
+        if len(gen._generation_batch) > 0:
+            time.sleep(STALL_SLEEP_S)
+            return
+        if gen.stall_streak < STALL_ROUNDS:
+            time.sleep(STALL_SLEEP_S)
+            return
+        batch = gen._prompt_batch
+        if not batch.uids:
+            return
+        i = max(range(len(batch.uids)), key=lambda j: len(batch.tokens[j]))
+        uid, prefilled = batch.uids[i], len(batch.tokens[i])
+        error = ContextTooLong(
+            f"the prompt does not fit in memory beside what is running "
+            f"({prefilled} of it prefilled; the prefill valve found no room "
+            "for the narrowest call)"
+        )
+        gen.remove([uid])
+        stream = self._live.pop(uid, None)
+        self._bookkeeping.pop(uid, None)
+        self._stride.pop(uid, None)
+        self._budgets.pop(uid, None)
+        self._observed.pop(uid, None)
+        self._spans.pop(uid, None)
+        self._forget_row(uid)
+        gen.stall_streak = 0
+        self.stalls_refused += 1
+        if stream is not None:
+            stream.put(error)
 
     def _forget_row(self, uid: int) -> None:
         self._spec_coupling.pop(uid, None)
@@ -825,6 +956,9 @@ class Engine:
         self._forget_row(uid)
         self._applied_caches = describe_caches(cache)
         if self.speculator is not None:
+            # The trunk's head must give the model's own logits: a family
+            # whose post-processing it does not compose is refused here.
+            check_head(self.model, list(self.warmup_tokens))
             # One verify cycle through the model with the configured KV
             # layout: a head or a cache layer the path cannot carry fails
             # here, not on the first client request.
@@ -889,7 +1023,9 @@ class Engine:
             self.model,
             stop_tokens=[],
             generation_batch=batch_class,
+            on_step=self._on_step,
             prompt_batch=self._prompt_batch_class(),
+            prefill_valve=self.prefill_valve,
             **self._gen_args,
         )
         self._gen = gen
@@ -922,6 +1058,8 @@ class Engine:
 
                 prompt_responses, gen_responses = gen.next()
                 self._last_step = time.monotonic()
+                if gen.stall_streak:
+                    self._relieve_stall(gen)
 
                 for r in prompt_responses:
                     s = self._live.get(r.uid)
@@ -945,36 +1083,26 @@ class Engine:
                         continue
                     if r.finish_reason is not None:
                         # Store first: when the caller sees the last token,
-                        # the next request can already find the entry. The
-                        # stream stays in _live until it has the token, so a
-                        # failing store still reaches it as EngineDead.
+                        # the next request can already find the entry. A
+                        # store that fails costs that entry, not the engine:
+                        # the token still goes out, health counts the loss.
                         _, checkpoints = self._bookkeeping.pop(r.uid, (0, {}))
                         self._stride.pop(r.uid, None)
-                        own_recurrent_state(r.prompt_cache)
-                        stored = for_store(r.prompt_cache)
-                        tokens = self._store_key(s.request, list(r.all_tokens))
-                        self._head_checkpoint(r.uid, checkpoints, len(tokens))
-                        self.prefix_store.insert(
-                            self.model_key,
-                            tokens,
-                            stored,
-                            checkpoints=checkpoints,
-                            cache_type="assistant",
-                        )
-                        if s.request.system_end:
-                            # The system block as its own entry: evicted after
-                            # every conversation, so the expensive prefix
-                            # survives a full turnover of the store.
-                            self.prefix_store.insert_prefix(
-                                self.model_key,
-                                tokens,
-                                stored,
-                                checkpoints,
-                                s.request.system_end,
+                        try:
+                            self._store_finished(s, r, checkpoints)
+                        except Exception:  # noqa: BLE001 - logged and counted
+                            self.store_failures += 1
+                            logger.exception(
+                                "storing request %s failed; the answer is delivered, "
+                                "the entry is not kept",
+                                s.request.request_id,
                             )
-                    thinking = self._budgets.get(r.uid)
-                    if thinking is not None:
-                        thinking.observe(r.token, r.finish_reason)
+                    # The budget saw this token in _on_step, before the step
+                    # after it ran; what it said then is this token's.
+                    seen = self._observed.get(r.uid)
+                    forced, truncated, in_reasoning = (
+                        seen.popleft() if seen else (False, False, False)
+                    )
                     cut = r.finish_reason == "length"
                     s.put(
                         TokenEvent(
@@ -986,17 +1114,15 @@ class Engine:
                                 if s.request.top_logprobs
                                 else None
                             ),
-                            thinking_truncated=(
-                                thinking is not None and thinking.thinking_truncated
-                            ),
-                            response_truncated=cut
-                            and (thinking is None or not thinking.in_reasoning),
-                            forced=thinking is not None and thinking.last_forced,
+                            thinking_truncated=truncated,
+                            response_truncated=cut and not in_reasoning,
+                            forced=forced,
                         )
                     )
                     if r.finish_reason is not None:
                         del self._live[r.uid]
                         self._budgets.pop(r.uid, None)
+                        self._observed.pop(r.uid, None)
                         self._forget_row(r.uid)
         finally:
             gen.close()

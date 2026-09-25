@@ -31,6 +31,12 @@ class ReasoningLimits:
     seeded: bool = False
     # Reasoning tokens allowed, markers and close included; None: no budget.
     max_tokens: int | None = None
+    # Families whose opener is followed by a label (Harmony's channel,
+    # Muse's recipient): the label sequences that mean reasoning, and the
+    # tokens that end a label. An opener whose label is another (the
+    # answer's channel, a tool's name) does not open a block.
+    labels: tuple[tuple[int, ...], ...] = ()
+    label_end: tuple[int, ...] = ()
 
 
 def budget(
@@ -133,6 +139,8 @@ class ThinkingBudget:
         self._state = "reasoning" if limits.seeded else "normal"
         self._start = _Matcher(limits.start)
         self._end = _Matcher(limits.end)
+        self._label_end = _Matcher(limits.label_end)
+        self._label: list[int] = []
         self.reasoning_tokens = 0
         self.thinking_truncated = False
         # Set by observe(): the token just seen came from the force queue.
@@ -159,6 +167,8 @@ class ThinkingBudget:
         self._start_prefix = mx.array(limits.start[:-1], dtype=mx.int32)
         # While set, the opener cannot complete: no block fits any more.
         self._block = False
+        # Tokens of the close's tail still to come after the end marker.
+        self._closing = 0
         limit = limits.max_tokens
         if limit is None:
             return
@@ -216,7 +226,14 @@ class ThinkingBudget:
     def observe(self, token: int, finish_reason: str | None) -> None:
         """One generated token, in order; called after the generator returned it."""
         self.last_forced = self._is_forced(token)
-        if self._state == "reasoning":
+        if self._closing:
+            # The close's tail after the end marker (a line break, or the
+            # answer's opener for a family that closes by opening it): the
+            # queue keeps forcing it, the arming ends with its last token.
+            self._closing -= 1
+            if self._closing == 0:
+                self._disarm()
+        elif self._state == "reasoning":
             if self._end.feed(token):
                 self._state = "normal"
                 if self._armed_at is not None:
@@ -226,16 +243,41 @@ class ThinkingBudget:
                         self._armed_at + self._free + self._close_counted
                     )
                     self.thinking_truncated |= forced
-                    self._disarm()
+                    # The marker's last token was this one; the rest of the
+                    # close follows from the queue.
+                    tail = close_tail(self.limits) - 1
+                    if tail > 0 and not self._natural:
+                        self._closing = tail
+                    else:
+                        self._disarm()
             else:
                 self.reasoning_tokens += 1
                 self._gate_opener()
                 self._maybe_arm()
+        elif self._state == "label":
+            # The opener's label: reasoning only when it says so (Harmony's
+            # `analysis`, Muse's `self`); the answer's channel or a tool's
+            # name opens no block, and its tokens count for nothing.
+            self._label.append(token)
+            if self._label_end.feed(token):
+                label = tuple(self._label[: -len(self.limits.label_end)])
+                if label in self.limits.labels:
+                    self._state = "reasoning"
+                    self.reasoning_tokens += 1 + len(self._label)
+                    self._gate_opener()
+                    self._maybe_arm()
+                else:
+                    self._state = "normal"
+                self._label = []
         elif self._start.feed(token):
-            self._state = "reasoning"
-            self.reasoning_tokens += 1
-            self._gate_opener()
-            self._maybe_arm()
+            if self.limits.labels:
+                self._state = "label"
+                self._label = []
+            else:
+                self._state = "reasoning"
+                self.reasoning_tokens += 1
+                self._gate_opener()
+                self._maybe_arm()
         if finish_reason == "length" and self._state == "reasoning":
             self.thinking_truncated = True
 
@@ -245,14 +287,16 @@ class ThinkingBudget:
 
     def stable_for(self, tokens: int) -> bool:
         """The processor's state cannot change over the next `tokens`
-        logits: no force in progress, and `tokens` more counted tokens
-        cannot arm one. A speculative cycle may then verify that many
-        positions, calling the processor per position like a plain step
-        would - the opener mask it may hold is a function of the context
-        alone. Whether the tokens turn out counted or not does not matter:
-        the bound assumes every one of them counts."""
-        if self._pos < len(self._queue):
+        logits: no force in progress or closing, and `tokens` more counted
+        tokens cannot arm one. A speculative cycle may then verify that
+        many positions, calling the processor per position like a plain
+        step would - the opener mask it may hold is a function of the
+        context alone. Whether the tokens turn out counted or not does not
+        matter: the bound assumes every one of them counts."""
+        if self._pos < len(self._queue) or self._closing:
             return False
+        if self._state == "label":
+            return False  # the label decides whether counting starts
         limit = self.limits.max_tokens
         if limit is None:
             return True
@@ -269,8 +313,10 @@ class ThinkingBudget:
         """Once armed, the tokens after the free one are the queue's - unless
         the free token itself began the end marker, then the model's own
         close is merely completed and nothing counts as forced."""
-        if self._armed_at is None or self._state != "reasoning":
+        if self._armed_at is None:
             return False
+        if self._state != "reasoning":
+            return bool(self._closing) and not self._natural
         since = self.reasoning_tokens - self._armed_at
         if since < self._free:
             self._natural = token == self._guard
@@ -305,6 +351,7 @@ class ThinkingBudget:
         self._pos = 0
         self._armed_at = None
         self._closed = None
+        self._closing = 0
 
     def _gate_opener(self) -> None:
         """Another block costs the opener, a free token and the counted part

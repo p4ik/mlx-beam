@@ -139,7 +139,7 @@ def test_system_entry_outlives_the_conversations():
         d = engine.prefix_store.describe()
         # Two conversation entries fit; the third pushed the oldest out, the
         # system entry stayed untouched.
-        assert d["by_type"] == {"assistant": 2, "user": 0, "system": 0}
+        assert d["by_type"] == {"assistant": 2, "system": 0}
     with Engine(model, prompt_cache_size=2) as engine:
         for turn in ([7, 3], [5, 4], [3, 3, 6]):
             run(engine, system + turn, 2, system_end=len(system))

@@ -125,7 +125,10 @@ def test_engine_forces_the_close_and_reports_the_flags():
         # and the blank line, then the 3 answer tokens.
         assert tokens[2:5] == [nl, end, nl2] and len(tokens) == 8
         assert tokens[:2] == free[:2]
-        assert [e.forced for e in events] == [False, False, True, True] + [False] * 4
+        # The close's tail after the marker is the queue's as well.
+        assert [e.forced for e in events] == [False, False, True, True, True] + [
+            False
+        ] * 3
         assert events[-1].thinking_truncated and events[-1].finish_reason == "length"
         assert events[-1].response_truncated
         # A client stop on the marker ends the request there, flagged.
@@ -241,9 +244,9 @@ def test_two_token_end_marker_is_exact_and_a_started_close_is_finished():
     out = steps.run(10)
     assert out[:6] == [START, 10, 11, NL, E1, E2]
     assert tracker.reasoning_tokens == 5 and tracker.thinking_truncated
-    # The forced tokens are marked as such, up to the end marker.
-    assert steps.forced[:6] == [False, False, False, True, True, True]
-    assert not any(steps.forced[6:])
+    # The forced tokens are marked as such, the close's tail included.
+    assert steps.forced[:7] == [False, False, False, True, True, True, True]
+    assert not any(steps.forced[7:])
     # The model starts the marker on the free token and would wander off:
     # the marker is completed instead, so no second run-up eats the answer.
     tracker = ThinkingBudget(limits)
@@ -426,3 +429,72 @@ def test_seeded_block_below_its_close_keeps_the_answer_reserve_or_refuses():
                     [3, 7, 11], max_tokens=8, reasoning=limits, min_response_tokens=6
                 )
             )
+
+
+def test_budget_holds_while_another_prompt_prefills():
+    """While a prefill shares the worker, the generator decodes several
+    steps per call; the budget must see each token before the next step,
+    or the forced close arms late and the block overshoots its limit."""
+    model = tiny_hybrid()
+    # A large decode share: many decode steps per prefill slice of the
+    # other request, which is sliced small to keep it in the prefill.
+    with Engine(model, prefill_slice=2, decode_share=200.0) as engine:
+        free = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=40)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end, nl, nl2 = unused[:4]
+        limits = ReasoningLimits(
+            (start,), (end,), (nl, end, nl2), seeded=True, max_tokens=6
+        )
+        budgeted = engine.submit(
+            GenerationRequest([3, 7, 11], max_tokens=40, reasoning=limits)
+        )
+        other = engine.submit(GenerationRequest(list(range(1, 60)), max_tokens=2))
+        events = list(budgeted)
+        collect(other)
+        tokens = [e.token for e in events]
+        # Seeded: the block is open from the prompt; five free tokens, the
+        # forced newline is the sixth, the marker follows - whatever the
+        # prefill beside it did. Without the per-step observation the whole
+        # run decodes in one call and the close never comes.
+        assert end in tokens
+        assert tokens.index(end) == 6, tokens[:8]
+        assert (
+            tokens[tokens.index(end) - 1] == nl and tokens[tokens.index(end) + 1] == nl2
+        )
+
+
+def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
+    """Harmony and Muse open the answer and a tool call with the same
+    marker as the reasoning block, followed by a label. The budget waits
+    for the label: `analysis` opens a block that counts, `final` does not
+    - so a natural close followed by the answer's channel is not a second
+    block, and no forced close lands in the answer."""
+    A, F, MSG = 40, 41, 42  # "analysis", "final", "<|message|>"
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=6,
+        labels=((A,),),
+        label_end=(MSG,),
+    )
+    tracker = ThinkingBudget(limits)
+    # Analysis: opener, label, its end, three free tokens - counted.
+    for t in (START, A, MSG, 10, 11):
+        tracker.observe(t, None)
+    assert tracker.in_reasoning and tracker.reasoning_tokens == 5
+    tracker.observe(END, None)  # the model closes by itself
+    assert not tracker.in_reasoning
+    # The answer's channel: the same opener, another label - no block.
+    for t in (START, F, MSG, 12, 13, 14, 15, 16):
+        tracker.observe(t, None)
+    assert not tracker.in_reasoning and tracker.reasoning_tokens == 5
+    assert not tracker.thinking_truncated
+    tracker.observe(17, "length")
+    assert not tracker.thinking_truncated
+    # And a budget that is up forces the close inside the block, never in
+    # the answer that follows it.
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, A, MSG, 10, 11, 12, 13, 14, 15, 16]).run(10)
+    assert END in out and tracker.thinking_truncated
+    assert out.index(END) <= 6

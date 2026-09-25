@@ -1571,10 +1571,20 @@ class BatchGenerator:
         max_kv_size: Optional[int] = None,
         stream=None,
         generation_batch=None,
+        on_step=None,
         prompt_batch=None,
+        prefill_valve=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
+        # Called with each decode step's responses before the next step
+        # runs: the caller's per-token bookkeeping (a reasoning budget that
+        # arms a forced close) must see a token before the step after it,
+        # not when this call returns after several (VENDORED.md, scheduler).
+        self.on_step = on_step
+        # Asked before every prefill call for the width it may have (None:
+        # not this round), told the width afterwards; VENDORED.md, scheduler.
+        self.prefill_valve = prefill_valve
         self.sampler = sampler or greedy_sampler
         self.logits_processors = logits_processors or []
         self.uid_count = 0
@@ -1616,6 +1626,11 @@ class BatchGenerator:
         # nobody so that row gets its full width. Counted for /health.
         self._starved = 0
         self.starved_calls = 0
+        # Rounds the prefill valve held back for memory.
+        self.stalled_calls = 0
+        # Stalled rounds in a row; a prefill call that ran resets it. The
+        # caller reads it to relieve a stall that would never end by itself.
+        self.stall_streak = 0
 
         self._counters = BatchCounters()
 
@@ -1854,6 +1869,8 @@ class BatchGenerator:
             tic = time.perf_counter()
             while True:
                 step = self._generation_batch.next()
+                if self.on_step is not None and step:
+                    self.on_step(step)
                 generation_responses += step
                 self._counters.generation_tokens += len(step)
                 self._counters.generation_steps += 1
@@ -1932,6 +1949,17 @@ class BatchGenerator:
         # padded, and the width is capped by the step and the slice.
         remaining = [len(seq[0][0]) for seq in self._currently_processing]
         width = min(min(remaining), self.prefill_step_size, self.prefill_slice)
+        if self.prefill_valve is not None:
+            allowed = self.prefill_valve.width(width * len(remaining))
+            if allowed is None:
+                # Not even the narrowest call fits under the memory ceiling
+                # now: nobody is prefilled this round, decoding goes on.
+                self.stalled_calls += 1
+                self.stall_streak += 1
+                self._last_prefill_s = 0.0
+                return prompt_responses, generation_responses
+            self.stall_streak = 0
+            width = min(width, max(1, allowed // len(remaining)))
         full = min(self.prefill_step_size, self.prefill_slice)
         if max(remaining) >= full and width < full // 4:
             self._starved += 1
@@ -1960,6 +1988,8 @@ class BatchGenerator:
         toc = time.perf_counter()
         self._counters.prompt_time += toc - tic
         self._last_prefill_s = toc - tic
+        if self.prefill_valve is not None:
+            self.prefill_valve.observe(sum(len(p) for p in prompts))
 
         return prompt_responses, generation_responses
 

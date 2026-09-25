@@ -23,12 +23,15 @@ from mlx_beam.api.errors import (
     unsupported,
 )
 from mlx_beam.api.reasoning import (
+    EFFORT_KWARGS,
     effort_candidates,
+    effort_capability,
     is_effort_rejection,
-    map_effort,
     mirror_reasoning,
+    normalise_effort,
     read_aliases,
     renderer_reasoning_keys,
+    translate_effort,
 )
 from mlx_beam.api.text import (
     TextAssembler,
@@ -109,6 +112,10 @@ def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> Sampling
             raise ApiError("logit_bias values must be in -100..100", param="logit_bias")
     d = defaults
     penalty = _number(body, "repetition_penalty", d.repetition_penalty, 0.0)
+    if penalty is not None and penalty <= 0.0:
+        raise ApiError(
+            "repetition_penalty must be positive", param="repetition_penalty"
+        )
     presence = _number(body, "presence_penalty", d.presence_penalty or 0.0, -2.0, 2.0)
     frequency = _number(
         body, "frequency_penalty", d.frequency_penalty or 0.0, -2.0, 2.0
@@ -209,6 +216,9 @@ def _normalise_messages(messages: Any, images: list[Image] | None = None) -> lis
         if not isinstance(m, dict) or "role" not in m:
             raise ApiError(f"messages[{i}] needs a role", param="messages")
         m = dict(m)
+        if m["role"] == "developer":
+            # OpenAI's newer name for the system role; templates know one.
+            m["role"] = "system"
         content = m.get("content")
         if isinstance(content, list):
             parts: list[dict] = []
@@ -241,6 +251,10 @@ def _normalise_messages(messages: Any, images: list[Image] | None = None) -> lis
         elif not isinstance(content, str):
             raise ApiError(f"messages[{i}].content must be text", param="messages")
         if m.get("tool_calls"):
+            if not isinstance(m["tool_calls"], list):
+                raise ApiError(
+                    f"messages[{i}].tool_calls must be a list", param="messages"
+                )
             m["tool_calls"] = [
                 _normalise_tool_call(tc, f"messages[{i}].tool_calls[{j}]")
                 for j, tc in enumerate(m["tool_calls"])
@@ -295,12 +309,11 @@ def parse_chat_request(
     _reject_unsupported(body)
     images: list[Image] | None = [] if vision else None
     # max_tokens is OpenAI's old name; it is accepted here and nowhere else.
-    max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
-    max_tokens = (
-        defaults.max_completion_tokens
-        if max_tokens is None
-        else _number(body, "max_completion_tokens", max_tokens, 1, None, int)
-    )
+    # An explicit null under the new name does not hide a value under the old.
+    key = "max_completion_tokens"
+    if body.get(key) is None and body.get("max_tokens") is not None:
+        key = "max_tokens"
+    max_tokens = _number(body, key, defaults.max_completion_tokens, 1, None, int)
     tools = body.get("tools")
     if tools is not None:
         if not isinstance(tools, list) or any(
@@ -316,8 +329,21 @@ def parse_chat_request(
     level, thinking = parse_thinking(aliases)
     if thinking is not None:
         template_kwargs["enable_thinking"] = thinking
+    # The effort word reaches the template in build_prompt, translated to
+    # what the loaded template takes (effort_capability), above a server
+    # default; an explicit chat_template_kwargs entry goes through as written.
     if level is not None:
-        template_kwargs["reasoning_effort"] = level
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
+        # A word asks for thinking: it beats a server default that switched
+        # it off (the request is the more specific), not the request's own
+        # enable_thinking.
+        if thinking is None:
+            template_kwargs.pop("enable_thinking", None)
+    elif "reasoning_effort" in aliases:
+        # Effort none: off, and no server-default effort word either.
+        for name in EFFORT_KWARGS:
+            template_kwargs.pop(name, None)
     template_kwargs.update(object_field(body, "chat_template_kwargs"))
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
@@ -343,12 +369,13 @@ def parse_chat_request(
 
 
 def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
-    """(template level, enable_thinking) from the resolved aliases: an effort
-    of none switches thinking off, a level asks for it."""
+    """(effort word, enable_thinking) from the resolved aliases: an effort
+    of none switches thinking off, a word asks for it (and, in
+    parse_chat_request, lifts a server default that switched it off)."""
     thinking = aliases.get("enable_thinking")
     if "reasoning_effort" not in aliases:
         return None, thinking
-    level = map_effort(aliases["reasoning_effort"])
+    level = normalise_effort(aliases["reasoning_effort"])
     if level is None:
         return None, False if thinking is None else thinking
     return level, thinking
@@ -366,8 +393,18 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
+    cap = effort_capability(tokenizer)
+    effort_kwarg = cap.kwarg or "reasoning_effort"
+    if req.reasoning_effort and cap.kwarg and effort_kwarg not in kwargs:
+        # The client's word, as this template takes it: unchanged when it
+        # does not check, the nearest rung it accepts when it does; a
+        # template without the kwarg gets nothing.
+        value = translate_effort(req.reasoning_effort, cap)
+        if value is not None:
+            kwargs[effort_kwarg] = value
+            req.template_kwargs[effort_kwarg] = value
 
-    def render(**extra):
+    def render(add_generation_prompt=True, **extra):
         if req.images:
             built = frontend.build(req.messages, req.images, {**kwargs, **extra})
             req.spans = list(built.spans)
@@ -375,7 +412,7 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             return built.tokens
         return tokenizer.apply_chat_template(
             req.messages,
-            add_generation_prompt=True,
+            add_generation_prompt=add_generation_prompt,
             tokenize=True,
             **{**kwargs, **extra},
         )
@@ -385,33 +422,60 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
         if req.images
         else "the chat template rejected the messages"
     )
-    level = kwargs.get("reasoning_effort")
+    level = kwargs.get(effort_kwarg)
     try:
         tokens = render()
     except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
         if not (level and is_effort_rejection(e)):
             raise ApiError(f"{rejected}: {e}", param="messages") from None
-        # The template knows the levels but not this name: climb the ladder
-        # and remember the rung that rendered, so every re-render agrees.
+        # The template rejects this word after all (it answers differently
+        # with tools in the context, say): climb the ladder and remember
+        # the rung that rendered, so every re-render agrees.
         tokens = None
-        for candidate in effort_candidates(level)[1:]:
+        rungs = list(effort_candidates(level)[1:])
+        rungs += [w for w in cap.levels if w not in rungs and w != level]
+        for candidate in rungs:
             try:
-                tokens = render(reasoning_effort=candidate)
+                tokens = render(**{effort_kwarg: candidate})
             except Exception as e2:  # noqa: BLE001
                 if not is_effort_rejection(e2):
                     raise ApiError(f"{rejected}: {e2}", param="messages") from None
                 continue
-            req.template_kwargs["reasoning_effort"] = candidate
+            req.template_kwargs[effort_kwarg] = candidate
             break
         if tokens is None:
             raise ApiError(
-                f"the chat template accepts none of the reasoning_effort levels "
-                f"{', '.join(effort_candidates(level))}: {e}",
+                f"the chat template accepts none of the {effort_kwarg} levels "
+                f"{', '.join([level, *rungs])}: {e}",
                 param="reasoning_effort",
             ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
-    return list(tokens)
+    tokens = list(tokens)
+    # The rung the ladder settled on, so this render agrees with the last.
+    # With images the frontend said where the frame begins (a second build
+    # would move the spans); the probe is for text prompts.
+    settled = {k: v for k, v in req.template_kwargs.items() if k == effort_kwarg}
+    if not req.images:
+        req.assistant_start = _assistant_start(render, tokens, settled)
+    opener = getattr(tokenizer, "answer_opener_tokens", None)
+    if opener and kwargs.get("enable_thinking") is False:
+        # A family whose template has no switch (Harmony, Muse): the answer
+        # is opened in the prompt, so the model writes it without a block.
+        tokens += list(opener)
+    return tokens
+
+
+def _assistant_start(render, tokens: list[int], extra: dict) -> int:
+    """Where the generation prompt begins: the prompt rendered without it is
+    a prefix of the one with it, and what follows that prefix is the
+    assistant's frame. A template that will not render without it puts the
+    start at 0 - the whole prompt is searched, as before."""
+    try:
+        without = list(render(add_generation_prompt=False, **extra))
+    except Exception:  # noqa: BLE001 - the template's business
+        return 0
+    return _common_prefix(without, tokens)
 
 
 # Boundaries are found by re-rendering message prefixes; the last few user
@@ -496,7 +560,7 @@ def to_generation_request(
     completion_cap, reasoning_cap = budget(
         max_context, len(prompt), req.max_tokens, min_response
     )
-    markers = reasoning_limits(tokenizer, prompt, None)
+    markers = reasoning_limits(tokenizer, prompt[req.assistant_start :], None)
     if reasoning_cap is not None and markers is not None:
         reasoning_cap = max(0, reasoning_cap - close_tail(markers))
     bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
@@ -510,7 +574,7 @@ def to_generation_request(
             completion_cap, _ = budget(
                 max_context, len(prompt), req.max_tokens, min_response
             )
-        markers = reasoning_limits(tokenizer, prompt, None)
+        markers = reasoning_limits(tokenizer, prompt[req.assistant_start :], None)
         limits = markers
         if limits is not None and limits.seeded and len(limits.close) >= completion_cap:
             raise ApiError(
@@ -552,16 +616,24 @@ def reasoning_limits(
     end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
     if not start or not end:
         return None
-    newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
-    # Closed the way the models were trained to close: a line break, the
-    # marker, a blank line.
-    close = newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+    close = getattr(tokenizer, "think_close_tokens", None)
+    if not close:
+        newline = tuple(tokenizer.encode("\n", add_special_tokens=False))
+        # Closed the way the models were trained to close: a line break, the
+        # marker, a blank line.
+        close = (
+            newline + end + tuple(tokenizer.encode("\n\n", add_special_tokens=False))
+        )
+    label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
+    label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
     return ReasoningLimits(
         start=start,
         end=end,
         close=close,
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
+        labels=(label,) if label and label_end else (),
+        label_end=label_end if label else (),
     )
 
 
@@ -609,25 +681,29 @@ class ChatResponder:
         req: ChatRequest,
         prompt_tokens: list[int],
         reasoning_field: str = "reasoning",
+        fingerprint: str | None = None,
     ):
         if reasoning_field not in REASONING_FIELDS:
             raise ValueError(f"unknown reasoning field {reasoning_field!r}")
         self.req = req
         self._tokenizer = tokenizer
         self.id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        # The served configuration's id (model, version, KV layout): the
+        # same value for every answer the same set-up gives.
+        self.fingerprint = fingerprint
         self.created = int(time.time())
         self.prompt_len = len(prompt_tokens)
         self._sent_role = False
         self._reasoning_keys = REASONING_FIELDS[reasoning_field]
         self.assembler = TextAssembler(
             tokenizer,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=prompt_tokens[req.assistant_start :],
             stop_words=req.stop,
             tools=req.tools,
             streaming=req.stream,
             route_thinking=reasoning_field != "none",
             # Without tools on offer a tool-call block is the model's text.
-            tools_enabled=req.tools is not None,
+            tools_enabled=bool(req.tools),
         )
 
     def _envelope(self, kind: str) -> dict:
@@ -636,6 +712,7 @@ class ChatResponder:
             "object": kind,
             "created": self.created,
             "model": self.req.model,
+            "system_fingerprint": self.fingerprint,
         }
 
     def _message(self, d: TextDelta) -> dict:
@@ -647,7 +724,7 @@ class ChatResponder:
             msg["tool_calls"] = d.tool_calls
         return msg
 
-    def chunk(self, d: TextDelta, cached: int, final: bool = False) -> dict:
+    def chunk(self, d: TextDelta) -> dict:
         delta = {}
         if d.content:
             delta["content"] = d.content
@@ -682,7 +759,7 @@ class ChatResponder:
             d = self.assembler.feed(event)
             if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
                 continue
-            yield self.chunk(d, cached, final=d.finish_reason is not None)
+            yield self.chunk(d)
             if d.finish_reason is not None:
                 break  # a text-level stop ends before the engine does
         if self.req.stream_usage:

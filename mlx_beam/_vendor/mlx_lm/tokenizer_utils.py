@@ -304,11 +304,88 @@ def _infer_thinking(tokenizer):
             tuple(tokenizer.encode(think_end, add_special_tokens=False)),
         )
 
+    # Harmony (gpt-oss): every assistant message names a channel after the
+    # marker, `analysis` is the reasoning, `final` the answer, `commentary`
+    # a tool call when it names a recipient. The label runs to <|message|>
+    # and the recipient may also precede the channel (` to=functions.x`),
+    # so both open a label; the assembler routes by what the label says.
+    if _is_harmony_vocab(vocab):
+        return (
+            "<|channel|>",
+            "<|end|>",
+            (vocab["<|channel|>"],),
+            (vocab["<|end|>"],),
+        )
+
+    # Muse (ATEM): the same message frame without channels; the recipient
+    # after `<|start|>assistant` says what follows - `self` is the
+    # reasoning, a tool's name a call, none or `user` the answer.
+    if _is_muse_vocab(vocab):
+        return (
+            " to=",
+            "<|eom|>",
+            tuple(tokenizer.encode(" to=", add_special_tokens=False)),
+            (vocab["<|eom|>"],),
+        )
+
     return (None, None, None, None)
 
 
 # Openers whose block begins after a label: the text that ends the label.
-THINK_LABEL_END = {"<|channel>": "\n"}
+THINK_LABEL_END = {"<|channel>": "\n", "<|channel|>": "<|message|>", " to=": "<|message|>"}
+
+# Marker families by their opener: what /health reports and what the text
+# assembler routes by.
+THINK_FAMILIES = {
+    "<think>": "think",
+    "<longcat_think>": "think",
+    "<|think:start|>": "think",
+    "<|channel>": "channel",
+    "<|open|>think<|sep|>": "xtml",
+    "<|channel|>": "harmony",
+    " to=": "muse",
+}
+
+# Per family: the openers that start a label (all route through the label),
+# the sequence the budget forces to close the block and open the answer,
+# the opener of the answer for a request that switched thinking off (the
+# templates of these families have no switch), and the text the automaton
+# strips as frame in the answer.
+FAMILY_MARKERS = {
+    "harmony": {
+        "openers": ("<|channel|>", " to="),
+        "close": "<|end|><|start|>assistant<|channel|>final<|message|>",
+        "answer_opener": "<|channel|>final<|message|>",
+        "structural": ("<|start|>assistant", "<|end|>"),
+        # The marker that begins a message: only right after it is a
+        # textual opener (` to=`) the frame's, not the answer's text.
+        "frame": "<|start|>assistant",
+        # The label after the opener that means reasoning; any other label
+        # (the answer's channel, a tool's name) opens no block.
+        "reasoning_label": "analysis",
+    },
+    "muse": {
+        "openers": (" to=",),
+        "close": "<|eom|><|start|>assistant<|message|>",
+        "answer_opener": "<|message|>",
+        "structural": ("<|start|>assistant", "<|message|>", "<|eom|>"),
+        "frame": "<|start|>assistant",
+        "reasoning_label": "self",
+    },
+}
+
+
+def _is_harmony_vocab(vocab):
+    return all(
+        t in vocab
+        for t in ("<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|constrain|>")
+    )
+
+
+def _is_muse_vocab(vocab):
+    return "<|channel|>" not in vocab and all(
+        t in vocab for t in ("<|start|>", "<|message|>", "<|eom|>", "<|eot|>")
+    )
 
 
 def _is_xtml_vocab(vocab):
@@ -318,12 +395,17 @@ def _is_xtml_vocab(vocab):
 
 
 def _infer_structural_markers(tokenizer):
-    if _is_xtml_vocab(tokenizer.get_vocab()):
+    vocab = tokenizer.get_vocab()
+    if _is_xtml_vocab(vocab):
         return (
             "<|open|>response<|sep|>",
             "<|close|>response<|sep|>",
             "<|close|>message<|sep|>",
         )
+    if _is_harmony_vocab(vocab):
+        return FAMILY_MARKERS["harmony"]["structural"]
+    if _is_muse_vocab(vocab):
+        return FAMILY_MARKERS["muse"]["structural"]
     return ()
 
 
@@ -372,6 +454,33 @@ class TokenizerWrapper:
             self._think_end_tokens,
         ) = _infer_thinking(tokenizer)
         self._structural_markers = _infer_structural_markers(tokenizer)
+        self._think_family = THINK_FAMILIES.get(self._think_start)
+        family = FAMILY_MARKERS.get(self._think_family, {})
+        self._think_openers = family.get("openers") or (
+            (self._think_start,) if self._think_start else ()
+        )
+        self._think_close_tokens = (
+            tuple(tokenizer.encode(family["close"], add_special_tokens=False))
+            if "close" in family
+            else None
+        )
+        self._answer_opener_tokens = (
+            tuple(tokenizer.encode(family["answer_opener"], add_special_tokens=False))
+            if "answer_opener" in family
+            else None
+        )
+        self._frame_start = family.get("frame")
+        label = family.get("reasoning_label")
+        label_end = THINK_LABEL_END.get(self._think_start) if self._think_start else None
+        self._reasoning_label_tokens = (
+            tuple(tokenizer.encode(label, add_special_tokens=False)) if label else ()
+        )
+        self._think_label_end_tokens = (
+            tuple(tokenizer.encode(label_end, add_special_tokens=False))
+            if label and label_end
+            else ()
+        )
+        self._tool_parser_type = None
 
         self._chat_template = chat_template
         self._thinking_kwarg, has_custom_renderer = _infer_thinking_kwarg(tokenizer)
@@ -476,6 +585,57 @@ class TokenizerWrapper:
         """What ends the label after the opener, or None for an opener
         without one."""
         return THINK_LABEL_END.get(self._think_start)
+
+    @property
+    def think_family(self):
+        """think, channel, xtml, harmony, muse - or None without thinking."""
+        return self._think_family
+
+    @property
+    def think_openers(self):
+        """Every text that opens the block (or its label); the first is
+        `think_start`."""
+        return self._think_openers
+
+    @property
+    def think_close_tokens(self):
+        """The sequence a budget forces to end the block, when the family
+        closes with more than the end marker; None: the caller's default."""
+        return self._think_close_tokens
+
+    @property
+    def answer_opener_tokens(self):
+        """What a prompt gets appended when thinking is switched off and the
+        template has no switch of its own; None otherwise."""
+        return self._answer_opener_tokens
+
+    @property
+    def reasoning_label_tokens(self):
+        """The label (after the opener) that means reasoning, as ids; empty
+        for a family without labels or whose opener needs none."""
+        return self._reasoning_label_tokens
+
+    @property
+    def think_label_end_tokens(self):
+        """The ids that end a label, for the budget; empty without labels."""
+        return self._think_label_end_tokens
+
+    @property
+    def frame_start(self):
+        """The structural marker that begins an assistant message in a family
+        whose opener is plain text (` to=`): the opener counts only right
+        after it. None for the others."""
+        return self._frame_start
+
+    @property
+    def tool_call_via_label(self):
+        """The tool call is opened by the same label the reasoning is (its
+        recipient names the tool); no marker of its own."""
+        return self._think_family in ("harmony", "muse")
+
+    @property
+    def tool_parser_type(self):
+        return self._tool_parser_type
 
     @property
     def think_end(self):
@@ -638,6 +798,10 @@ def _infer_tool_parser(tokenizer):
         return None
     elif "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
+    elif "<|channel|>commentary" in chat_template or "<|constrain|>" in chat_template:
+        return "harmony"
+    elif "<atem:function_calls>" in chat_template:
+        return "atem"
     elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
         return "gemma4"
     elif "<start_function_call>" in chat_template:
@@ -724,7 +888,7 @@ def load(
         tool_call_start = None
         tool_call_end = None
 
-    return TokenizerWrapper(
+    wrapper = TokenizerWrapper(
         tokenizer,
         detokenizer_class,
         eos_token_ids=eos_token_ids,
@@ -733,6 +897,8 @@ def load(
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
     )
+    wrapper._tool_parser_type = tool_parser_type
+    return wrapper
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:
