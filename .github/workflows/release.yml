@@ -10,9 +10,9 @@ name: Release
 #     GitHub release is replaced with the wheel and sdist of that commit,
 #     titled with its version and date. Nothing goes to PyPI.
 #   - workflow_dispatch on main or a release-* branch: the .dev build of that
-#     branch goes to PyPI for a lab test that pins it, and to the `dev`
-#     release. Only on request: while the project has no final release,
-#     installers resolve to the newest pre-release, .dev included.
+#     branch goes to PyPI for a lab test that pins it. Only on request: while
+#     the project has no final release, installers resolve to the newest
+#     pre-release, .dev included. It never touches the `dev` release.
 # Versions come from hatch-vcs: an untagged commit is <next>.devN (0.1.0a5.devN
 # after v0.1.0a4), N = commits since the tag. The `pypi` environment can add a
 # required reviewer in the repository settings. The `dev` release has no
@@ -26,9 +26,9 @@ on:
 
 # Pushes to one branch run one at a time, and a newer push cancels the older
 # build: the dev release follows the newest commit anyway. Tags and dispatches
-# have groups of their own and are never cancelled. What can still overlap
-# (a dispatch beside a push) is settled by the head check before the dev
-# release is touched.
+# have groups of their own and are never cancelled - which is why only pushes
+# write the `dev` release: a dispatch in its own group could run beside a
+# push, pass the head check below and still overwrite the newer release.
 concurrency:
   group: release-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' && github.ref_type == 'branch' }}
@@ -134,8 +134,10 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   github-release:
+    # A tag gets its own release, a push to main the rolling `dev` one; a
+    # dispatch ends with PyPI and has nothing to do here.
     needs: [build, publish]
-    if: always() && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    if: always() && needs.build.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -159,16 +161,16 @@ jobs:
           awk -v v="$version" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" --notes-file notes.md $pre
-      - name: Rolling dev release for main and for a dispatch
-        if: github.ref_type != 'tag'
+      - name: Rolling dev release for pushes to main
+        if: github.event_name == 'push' && github.ref_type == 'branch'
         env:
           BUILT: ${{ needs.build.outputs.version }}
         run: |
           built="$BUILT"
           date=$(date -u +%Y-%m-%d)
           # The release follows the branch head. A run whose commit the
-          # branch has moved past (a dispatch or a build the cancel did not
-          # catch) leaves the newer release alone.
+          # branch has moved past (a build the cancel did not catch in time)
+          # leaves the newer release alone.
           head=$(git ls-remote origin "refs/heads/$GITHUB_REF_NAME" | cut -f1)
           if [ "$head" != "$GITHUB_SHA" ]; then
             echo "::notice::$GITHUB_REF_NAME moved on to ${head::7}; the dev release stays with the newer commit"
