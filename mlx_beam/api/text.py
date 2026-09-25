@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -27,7 +28,6 @@ class TextDelta:
     tool_calls: list[dict] = field(default_factory=list)
     # "stop", "length" or "tool_calls" on the last delta, else None.
     finish_reason: str | None = None
-    tokens: int = 0
 
     def empty(self) -> bool:
         return not (self.content or self.reasoning or self.tool_calls)
@@ -123,12 +123,41 @@ def holds_incomplete_bytes(detokenizer) -> bool:
     return False
 
 
+# A SentencePiece byte token names its byte in hex (`<0xE2>`); the
+# vendored SPM detokenizer reads it the same way.
+_SPM_BYTE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
+
+
+def token_bytes(tokenizer, token_id: int, text: str) -> list[int]:
+    """The token's bytes: the raw ones for a byte-level token (a piece of
+    a character decodes to U+FFFD, whose bytes are not the token's) - the
+    hex of a SentencePiece byte token, the byte alphabet of a BPE one -
+    the text's otherwise."""
+    if "\ufffd" in text and hasattr(tokenizer, "convert_ids_to_tokens"):
+        try:
+            from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
+
+            (piece,) = tokenizer.convert_ids_to_tokens([token_id])
+            spm = _SPM_BYTE.match(piece)
+            if spm:
+                return [int(spm.group(1), 16)]
+            decoder = _byte_decoder()
+            return [decoder[c] for c in piece]
+        except (KeyError, ValueError, TypeError):
+            pass
+    return list(text.encode())
+
+
 def logprob_entry(tokenizer, event: TokenEvent) -> dict:
     """One OpenAI logprobs item: the token's text, bytes and its alternatives."""
 
     def item(token_id: int, logprob: float) -> dict:
         text = tokenizer.decode([token_id])
-        return {"token": text, "logprob": logprob, "bytes": list(text.encode())}
+        return {
+            "token": text,
+            "logprob": logprob,
+            "bytes": token_bytes(tokenizer, token_id, text),
+        }
 
     out = item(event.token, event.logprob)
     if event.top_logprobs is not None:
@@ -367,6 +396,7 @@ class TextAssembler:
         streaming: bool = False,
         route_thinking: bool = True,
         tools_enabled: bool = True,
+        lead: bool = True,
     ):
         self._tokenizer = tokenizer
         self._detok = tokenizer.detokenizer
@@ -384,8 +414,10 @@ class TextAssembler:
         # many tokens it took (they count as reasoning only if it opens one).
         self._label = seeded[len(self._think_start) :] if start == "label" else ""
         self._label_tokens = 0
-        # A think block the prompt opened: the client sees it once, up front.
-        self._lead = seeded if not route_thinking else ""
+        # A think block the template opened: with routing off the client
+        # sees its opener once, up front - not for a raw prompt the client
+        # wrote itself (completions), where the opener is already theirs.
+        self._lead = seeded if lead and not route_thinking else ""
         self._tool_text = ""
         # (text, closed): a block still open when the stream ended was cut.
         self._pending_tools: list[tuple[str, bool, str | None]] = []
@@ -397,6 +429,12 @@ class TextAssembler:
         # A fragment the detokenizer held when the forced close began.
         self._fragment = False
         self._fragment_checked = False
+        # The engine's stop matcher holds the eos ids and the stop words
+        # alike; only an eos token is dropped unseen (feed).
+        self._eos = set(getattr(tokenizer, "eos_token_ids", None) or ())
+        # Byte tokens of a character still forming: content or not is
+        # decided by the token that completes it (logprobs).
+        self._held: list[TokenEvent] = []
         self._parse_tools = ToolCallParser(
             getattr(tokenizer, "tool_parser", None),
             tools,
@@ -406,8 +444,6 @@ class TextAssembler:
             dialect=getattr(tokenizer, "tool_parser_type", None),
         )
         self.tokens = 0
-        self.token_ids: list[int] = []
-        self.logprobs: list[float] = []
         # Events since the last chunk went out, each with whether its text
         # went to the content; the responder drains them for logprobs.
         self.pending_events: list[tuple[TokenEvent, bool]] = []
@@ -427,16 +463,19 @@ class TextAssembler:
         if self.stopped:
             return TextDelta()
         self.tokens += 1
-        self.token_ids.append(event.token)
-        self.logprobs.append(event.logprob)
         self.thinking_truncated |= event.thinking_truncated
         self.response_truncated |= event.response_truncated
-        delta = TextDelta(tokens=1)
+        delta = TextDelta()
 
         if event.finish_reason == "stop":
-            # The stop token itself is never shown; what the detokenizer and
-            # the automaton still held is text - a marker that never
-            # completed is what the model said.
+            # An eos token is never shown. The last token of a stop
+            # sequence is: it goes through the detokenizer so the automaton
+            # sees the whole word and cuts there - held back as a prefix,
+            # its start would otherwise come out as text. What the
+            # detokenizer and the automaton still hold is text - a marker
+            # that never completed is what the model said.
+            if event.token not in self._eos:
+                self._detok.add_token(event.token)
             self._detok.finalize()
             segment = self._detok.last_segment
             self._tail = self._tail[-self._tail_len() :] + segment
@@ -485,7 +524,7 @@ class TextAssembler:
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
             self.stopped = True
-            self.pending_events.append((event, bool(delta.content)))
+            self._book(event, "", bool(delta.content), own=False)
             self._prev = "normal"
             delta.finish_reason = "stop"
             if self._tool_text:
@@ -567,9 +606,14 @@ class TextAssembler:
                 closed = self._take_lead() + self._think_end
             self._label = ""
             delta.content = closed + clean
-        # A marker token releases no text; the stop token none either.
-        self.pending_events.append(
-            (event, bool(clean) and (current == "normal" or not self._route))
+        # A marker token releases no text; the stop token none either -
+        # what its arrival flushed belongs to the tokens held before it.
+        self._book(
+            event,
+            segment,
+            bool(clean) and (current == "normal" or not self._route),
+            released=bool(clean),
+            own=False if event.finish_reason == "stop" else None,
         )
         self._prev = current
 
@@ -594,6 +638,32 @@ class TextAssembler:
         self._made_tool_call |= bool(calls)
         if unparsed:
             delta.content += "".join(unparsed)
+
+    def _book(
+        self,
+        event: TokenEvent,
+        segment: str,
+        content: bool,
+        released: bool = True,
+        own: bool | None = None,
+    ) -> None:
+        """The event into `pending_events` with whether its text went to the
+        content. A token whose text is still held back - by the detokenizer
+        (a cut UTF-8 sequence, a lone space it waits with) or by the
+        automaton (the start of what may be a marker or a stop word) - is
+        not decided yet: it is booked with the token that releases the
+        text, under that one's verdict. A marker releases its segment and
+        the automaton swallows it: decided at once, not content. `own`
+        overrides the verdict for the event itself (the stop token: never
+        content, whatever it released)."""
+        buffered = bool(self._state[3]) if self._state is not None else False
+        if event.finish_reason is None and (not segment or (not released and buffered)):
+            self._held.append(event)
+            return
+        for held in self._held:
+            self.pending_events.append((held, content))
+        self._held = []
+        self.pending_events.append((event, content if own is None else own))
 
     def _tail_len(self) -> int:
         return max((len(w) for w in self._stop_words), default=0)

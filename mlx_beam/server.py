@@ -43,6 +43,9 @@ KEEPALIVE_S = 5.0
 # A socket that neither delivers the body nor takes the stream for this long
 # is given up: the request is cancelled instead of holding a batch slot.
 SOCKET_TIMEOUT_S = 30.0
+# How often a response that is not streamed looks whether its client is
+# still there: a peek at the socket, cheap, once a second.
+DISCONNECT_CHECK_S = 1.0
 # Tokens ready at once go out in one write; a slow socket blocks once per
 # batch of chunks instead of once per token.
 SSE_WRITE_BATCH_BYTES = 64 << 10
@@ -411,7 +414,7 @@ class Handler(BaseHTTPRequestHandler):
                 first = self._await_first(result, keepalive=False)
                 if first is None:
                     raise ApiError("the engine produced nothing", status=500)
-                events = _chain(first, result)
+                events = self._events(first, result, comment=False)
                 self._send_json(200, responder.complete(events, result.prompt_cached))
         finally:
             # A text-level stop word or an exception may end the response
@@ -444,31 +447,43 @@ class Handler(BaseHTTPRequestHandler):
                         f"prefill {p.processed}/{p.total}" if p else "waiting"
                     )
 
-    def _events(self, first, result) -> Iterator:
+    def _events(self, first, result, comment: bool = True) -> Iterator:
         """The token events, with an SSE comment whenever nothing went out
         for KEEPALIVE_S while the worker made progress. A tool call is
         collected until it closes, so a long one is decoded in silence and a
         client's idle timeout would give the request up in the middle of
         it. A worker that stopped stepping gets no comment: the silence is
-        what lets a watchdog see the hang."""
+        what lets a watchdog see the hang. Without `comment` (a response
+        that is not streamed) nothing goes out while waiting, but a client
+        that went away is still noticed and the row cancelled - it would
+        otherwise decode to max_tokens for nobody."""
         yield first
         if first.finish_reason is not None:
             return
         engine = self.served.engine
         seen_step = engine.last_step
+        checked = time.monotonic()
         while True:
             try:
                 event = result.next_event(timeout=KEEPALIVE_S)
             except queue.Empty:
                 if self._client_gone():
                     raise ConnectionResetError("client went away") from None
-                if engine.last_step != seen_step:
+                if comment and engine.last_step != seen_step:
                     seen_step = engine.last_step
                     self._comment("keepalive")
                 continue
             if event is None:
                 return
-            if time.monotonic() - self._last_write >= KEEPALIVE_S:
+            if not comment and time.monotonic() - checked >= DISCONNECT_CHECK_S:
+                # Nothing is written until the end, so a socket the client
+                # closed would not be noticed by a failing write: look.
+                checked = time.monotonic()
+                if self._client_gone():
+                    raise ConnectionResetError("client went away")
+            if comment and time.monotonic() - self._last_write >= KEEPALIVE_S:
+                # A chunk waited behind a tool call or a held prefix: out it
+                # goes, else a comment says the stream lives.
                 if self._pending:
                     self._flush_pending()
                 else:
@@ -570,12 +585,6 @@ class Handler(BaseHTTPRequestHandler):
             route_thinking=self.served.reasoning_field != "none",
         )
         self._run(gen_request, responder, req.stream, sse_events=True)
-
-
-def _chain(first, rest) -> Iterator:
-    yield first
-    if first.finish_reason is None:
-        yield from rest
 
 
 def make_handler(served: Served):

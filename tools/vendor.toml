@@ -27,6 +27,7 @@ modified = [
   "models/cache.py",
   "models/qwen3_5.py",
   "models/qwen3_next.py",
+  "models/granitemoehybrid.py",
   "utils.py",
   "tokenizer_utils.py",
   "models/plamo2.py",
@@ -49,3 +50,19 @@ modified = ["kv_batch.py", "fused_quant_sdpa.py"]
 [parts.optiq.files]
 "kv_batch.py" = "runtime/kv/batch.py"
 "fused_quant_sdpa.py" = "runtime/fused_quant_sdpa.py"
+
+[parts.mlx-vlm]
+# The exact-verify kernels only; the PyPI wheel is the upstream.
+wheel = "https://files.pythonhosted.org/packages/ae/fc/7fbd894db247582bfa16df9b0b7514a47e9c3971836fc8d3fbd9f6efdbe8/mlx_vlm-0.7.1-py3-none-any.whl"
+sha256 = "d9696bc3a2e961f43b5948a101dc0c966b5989d382e6910c37e2f3d555bc3408"
+version = "0.7.1"
+upstream_subdir = "mlx_vlm"
+dest = "mlx_beam/_vendor/mlx_vlm"
+local = ["__init__.py", "LICENSE"]
+# The switch-layer import points at the vendored mlx-lm.
+modified = ["quantized_verifier.py"]
+
+# dest file = upstream file
+[parts.mlx-vlm.files]
+"quantized_verifier.py" = "models/quantized_verifier.py"
+"exact_speculative_verify.py" = "models/exact_speculative_verify.py"

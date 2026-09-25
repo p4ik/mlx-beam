@@ -431,6 +431,38 @@ def test_seeded_block_below_its_close_keeps_the_answer_reserve_or_refuses():
             )
 
 
+def test_budget_holds_while_another_prompt_prefills():
+    """While a prefill shares the worker, the generator decodes several
+    steps per call; the budget must see each token before the next step,
+    or the forced close arms late and the block overshoots its limit."""
+    model = tiny_hybrid()
+    # A large decode share: many decode steps per prefill slice of the
+    # other request, which is sliced small to keep it in the prefill.
+    with Engine(model, prefill_slice=2, decode_share=200.0) as engine:
+        free = collect(engine.submit(GenerationRequest([3, 7, 11], max_tokens=40)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end, nl, nl2 = unused[:4]
+        limits = ReasoningLimits(
+            (start,), (end,), (nl, end, nl2), seeded=True, max_tokens=6
+        )
+        budgeted = engine.submit(
+            GenerationRequest([3, 7, 11], max_tokens=40, reasoning=limits)
+        )
+        other = engine.submit(GenerationRequest(list(range(1, 60)), max_tokens=2))
+        events = list(budgeted)
+        collect(other)
+        tokens = [e.token for e in events]
+        # Seeded: the block is open from the prompt; five free tokens, the
+        # forced newline is the sixth, the marker follows - whatever the
+        # prefill beside it did. Without the per-step observation the whole
+        # run decodes in one call and the close never comes.
+        assert end in tokens
+        assert tokens.index(end) == 6, tokens[:8]
+        assert (
+            tokens[tokens.index(end) - 1] == nl and tokens[tokens.index(end) + 1] == nl2
+        )
+
+
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     """Harmony and Muse open the answer and a tool call with the same
     marker as the reasoning block, followed by a label. The budget waits

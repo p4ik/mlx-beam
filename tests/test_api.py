@@ -1348,3 +1348,193 @@ def test_responses_cut_tail_next_to_a_recovered_call_is_the_incomplete_item():
     req.chat.stream = False
     whole = responses.ResponsesResponder(tok, req, gen.tokens).complete(iter(evs), 0)
     assert [i["status"] for i in whole["output"]] == ["completed", "incomplete"]
+
+
+def test_a_multi_token_stop_sequence_leaves_no_prefix_behind():
+    # The engine matches the sequence on token ids and ends on its last
+    # token; the automaton held the start as a possible prefix. The last
+    # token goes through the detokenizer so the word completes and is cut
+    # - only an eos token is dropped unseen.
+    tok = StubTokenizer()
+    for stream in (False, True):
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w1"}],
+                "stop": "w20 w34",
+                "stream": stream,
+            },
+            "m",
+        )
+        gen = chat.to_generation_request(tok, req)
+        assert (20, 34) in gen.stop_sequences
+        ev = [TokenEvent(20, -0.1), TokenEvent(34, -0.1, "stop")]
+        responder = chat.ChatResponder(tok, req, gen.tokens)
+        if stream:
+            chunks = list(responder.stream(iter(ev), 0))
+            text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        else:
+            text = responder.complete(iter(ev), 0)["choices"][0]["message"]["content"]
+        assert not text
+    # A prefix before an eos is text the model said; so is one cut by length.
+    for ev in (
+        [TokenEvent(20, -0.1), TokenEvent(EOS, -0.1, "stop")],
+        [TokenEvent(20, -0.1, "length")],
+    ):
+        asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=["w20 w34"])
+        assert "".join(asm.feed(e).content for e in ev) == "w20 "
+
+
+class _ByteTokenizer(StubTokenizer):
+    """Three tokens carry the bytes of one character (E2 82 AC = the euro
+    sign); the real byte-level detokenizer holds them until it completes."""
+
+    has_thinking = False
+    has_tool_calling = False
+
+    def __init__(self):
+        super().__init__()
+        self.raw = [w.encode() for w in self._words]
+        self.raw[40], self.raw[41], self.raw[42] = b"\xe2", b"\x82", b"\xac"
+
+    def __len__(self):
+        return len(self.raw)
+
+    def convert_ids_to_tokens(self, ids):
+        from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
+
+        to_char = {v: k for k, v in _byte_decoder().items()}
+        return ["".join(to_char[b] for b in self.raw[t]) for t in ids]
+
+    def decode(self, ids):
+        return b"".join(self.raw[t] for t in ids).decode("utf-8", "replace")
+
+    @property
+    def detokenizer(self):
+        from mlx_beam._vendor.mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+        return BPEStreamingDetokenizer(self)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs_keep_the_byte_tokens_of_a_character(stream):
+    tok = _ByteTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "stream": stream,
+        },
+        "m",
+    )
+    ev = [
+        TokenEvent(40, -0.1),
+        TokenEvent(41, -0.2),
+        TokenEvent(42, -0.3),
+        TokenEvent(EOS, -0.4, "stop"),
+    ]
+    responder = chat.ChatResponder(tok, req, [1])
+    if stream:
+        chunks = list(responder.stream(iter(ev), 0))
+        content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+        entries = [e for c in chunks for e in c["choices"][0]["logprobs"]["content"]]
+    else:
+        choice = responder.complete(iter(ev), 0)["choices"][0]
+        content = choice["message"]["content"]
+        entries = choice["logprobs"]["content"]
+    assert content == "€"
+    assert [e["logprob"] for e in entries] == [-0.1, -0.2, -0.3]
+
+
+def test_responses_take_a_null_tool_choice_as_auto():
+    # Clients send the default explicitly as null; that is not a choice.
+    req = responses.parse_responses_request({"input": "w1", "tool_choice": None}, "m")
+    assert req.tool_choice == "auto"
+
+
+def test_logprobs_book_a_held_prefix_with_the_token_that_releases_it():
+    """A token the automaton holds back as the possible start of a stop
+    word is content once the word does not come; the eos token itself is
+    never content, even when its arrival flushes held text."""
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {
+            "messages": [{"role": "user", "content": "w1"}],
+            "logprobs": True,
+            "stop": "w10 w11",
+        },
+        "m",
+    )
+    responder = chat.ChatResponder(tok, req, [1])
+    # w10 is held (prefix of the stop word), w12 releases both.
+    ev = [TokenEvent(10, -0.1), TokenEvent(12, -0.2), TokenEvent(EOS, -0.3, "stop")]
+    choice = responder.complete(iter(ev), 0)["choices"][0]
+    assert choice["message"]["content"] == "w10 w12 "
+    assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1, -0.2]
+    # Held at the end: the eos flushes w10 as content, but is none itself.
+    responder = chat.ChatResponder(tok, req, [1])
+    ev = [TokenEvent(10, -0.1), TokenEvent(EOS, -0.3, "stop")]
+    choice = responder.complete(iter(ev), 0)["choices"][0]
+    assert choice["message"]["content"] == "w10 "
+    assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1]
+
+
+def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():
+    # The raw prompt already carries `<think>`; the completion is what the
+    # model wrote after it, not the opener again.
+    tok = StubTokenizer()
+    req = completions.parse_completion_request(
+        {"prompt": [6, 1, 7, THINK_START], "max_tokens": 4}, "m"
+    )
+    responder = completions.CompletionResponder(tok, req, req.prompt)
+    out = responder.complete(events([10, THINK_END, 11]), 0)
+    assert out["choices"][0]["text"] == "w10 </think>w11 "
+
+
+def test_a_marker_inside_a_user_message_does_not_open_the_assistant_state():
+    """A `<think>` the user wrote (code, a question about the token) is
+    text; only the assistant's own frame seeds the reasoning state."""
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w2 <think> w3"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert THINK_START in gen.tokens and req.assistant_start == len(gen.tokens) - 1
+    assert gen.reasoning is not None and not gen.reasoning.seeded
+    responder = chat.ChatResponder(tok, req, gen.tokens)
+    out = responder.complete(events([10, 11]), 0)["choices"][0]["message"]
+    assert out["content"] == "w10 w11 " and not out.get("reasoning")
+
+
+def test_logprob_bytes_of_a_byte_level_token_are_its_own():
+    tok = _ByteTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    ev = [
+        TokenEvent(40, -0.1),
+        TokenEvent(41, -0.2),
+        TokenEvent(42, -0.3),
+        TokenEvent(EOS, -0.4, "stop"),
+    ]
+    choice = chat.ChatResponder(tok, req, [1]).complete(iter(ev), 0)["choices"][0]
+    assert [e["bytes"] for e in choice["logprobs"]["content"]] == [
+        [0xE2],
+        [0x82],
+        [0xAC],
+    ]
+
+
+def test_logprob_bytes_of_a_sentencepiece_byte_token_are_its_hex():
+    """A SentencePiece tokenizer names a byte token `<0xE2>`: the byte is
+    the hex, not the ASCII of the name."""
+    from mlx_beam.api.text import logprob_entry
+
+    class Spm(StubTokenizer):
+        def convert_ids_to_tokens(self, ids):
+            return ["<0xE2>" if i == 40 else self._words[i] for i in ids]
+
+        def decode(self, ids):
+            return "".join("\ufffd" if i == 40 else self._words[i] for i in ids)
+
+    entry = logprob_entry(Spm(), TokenEvent(40, -0.1))
+    assert entry["bytes"] == [0xE2]

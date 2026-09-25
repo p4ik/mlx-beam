@@ -64,6 +64,11 @@ class ChatRequest:
     min_response_tokens: int | None = None
     max_prompt_tokens: int | None = None
     template_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Where the assistant's own turn begins in the prompt (set by
+    # build_prompt): the marker search that seeds the reasoning state looks
+    # only from here - a `<think>` or a ` to=` inside a user message is
+    # text, not an open block.
+    assistant_start: int = 0
 
 
 def _number(body, key, default, lo=None, hi=None, kind=float):
@@ -99,6 +104,10 @@ def parse_sampling(body: dict, defaults: RequestDefaults = DEFAULTS) -> Sampling
             raise ApiError("logit_bias values must be in -100..100", param="logit_bias")
     d = defaults
     penalty = _number(body, "repetition_penalty", d.repetition_penalty, 0.0)
+    if penalty is not None and penalty <= 0.0:
+        raise ApiError(
+            "repetition_penalty must be positive", param="repetition_penalty"
+        )
     presence = _number(body, "presence_penalty", d.presence_penalty or 0.0, -2.0, 2.0)
     frequency = _number(
         body, "frequency_penalty", d.frequency_penalty or 0.0, -2.0, 2.0
@@ -164,6 +173,9 @@ def _normalise_messages(messages: Any) -> list[dict]:
         if not isinstance(m, dict) or "role" not in m:
             raise ApiError(f"messages[{i}] needs a role", param="messages")
         m = dict(m)
+        if m["role"] == "developer":
+            # OpenAI's newer name for the system role; templates know one.
+            m["role"] = "system"
         content = m.get("content")
         if isinstance(content, list):
             texts = []
@@ -188,6 +200,10 @@ def _normalise_messages(messages: Any) -> list[dict]:
         elif not isinstance(content, str):
             raise ApiError(f"messages[{i}].content must be text", param="messages")
         if m.get("tool_calls"):
+            if not isinstance(m["tool_calls"], list):
+                raise ApiError(
+                    f"messages[{i}].tool_calls must be a list", param="messages"
+                )
             m["tool_calls"] = [
                 _normalise_tool_call(tc, f"messages[{i}].tool_calls[{j}]")
                 for j, tc in enumerate(m["tool_calls"])
@@ -236,12 +252,11 @@ def parse_chat_request(
         raise ApiError("the request body must be a JSON object")
     _reject_unsupported(body)
     # max_tokens is OpenAI's old name; it is accepted here and nowhere else.
-    max_tokens = body.get("max_completion_tokens", body.get("max_tokens"))
-    max_tokens = (
-        defaults.max_completion_tokens
-        if max_tokens is None
-        else _number(body, "max_completion_tokens", max_tokens, 1, None, int)
-    )
+    # An explicit null under the new name does not hide a value under the old.
+    key = "max_completion_tokens"
+    if body.get(key) is None and body.get("max_tokens") is not None:
+        key = "max_tokens"
+    max_tokens = _number(body, key, defaults.max_completion_tokens, 1, None, int)
     tools = body.get("tools")
     if tools is not None:
         if not isinstance(tools, list) or any(
@@ -326,10 +341,10 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
             kwargs[effort_kwarg] = value
             req.template_kwargs[effort_kwarg] = value
 
-    def render(**extra):
+    def render(add_generation_prompt=True, **extra):
         return tokenizer.apply_chat_template(
             req.messages,
-            add_generation_prompt=True,
+            add_generation_prompt=add_generation_prompt,
             tokenize=True,
             **{**kwargs, **extra},
         )
@@ -369,12 +384,27 @@ def build_prompt(tokenizer, req: ChatRequest) -> list[int]:
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
     tokens = list(tokens)
+    # The rung the ladder settled on, so this render agrees with the last.
+    settled = {k: v for k, v in req.template_kwargs.items() if k == effort_kwarg}
+    req.assistant_start = _assistant_start(render, tokens, settled)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False:
         # A family whose template has no switch (Harmony, Muse): the answer
         # is opened in the prompt, so the model writes it without a block.
         tokens += list(opener)
     return tokens
+
+
+def _assistant_start(render, tokens: list[int], extra: dict) -> int:
+    """Where the generation prompt begins: the prompt rendered without it is
+    a prefix of the one with it, and what follows that prefix is the
+    assistant's frame. A template that will not render without it puts the
+    start at 0 - the whole prompt is searched, as before."""
+    try:
+        without = list(render(add_generation_prompt=False, **extra))
+    except Exception:  # noqa: BLE001 - the template's business
+        return 0
+    return _common_prefix(without, tokens)
 
 
 # Boundaries are found by re-rendering message prefixes; the last few user
@@ -389,12 +419,6 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
             break
         n += 1
     return n
-
-
-def prompt_boundaries(tokenizer, req: ChatRequest, prompt: list[int]) -> list[int]:
-    """Prompt positions where a recurrent-state checkpoint pays off: the end
-    of the system block and the end of the last user turns."""
-    return boundaries_and_system_end(tokenizer, req, prompt)[0]
 
 
 def boundaries_and_system_end(
@@ -464,7 +488,7 @@ def to_generation_request(
     completion_cap, reasoning_cap = budget(
         max_context, len(prompt), req.max_tokens, min_response
     )
-    markers = reasoning_limits(tokenizer, prompt, None)
+    markers = reasoning_limits(tokenizer, prompt[req.assistant_start :], None)
     if reasoning_cap is not None and markers is not None:
         reasoning_cap = max(0, reasoning_cap - close_tail(markers))
     bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
@@ -478,7 +502,8 @@ def to_generation_request(
             completion_cap, _ = budget(
                 max_context, len(prompt), req.max_tokens, min_response
             )
-        limits = reasoning_limits(tokenizer, prompt, 0)
+        markers = reasoning_limits(tokenizer, prompt[req.assistant_start :], None)
+        limits = markers
         if limits is not None and limits.seeded and len(limits.close) >= completion_cap:
             raise ApiError(
                 "the prompt opens a think block the template cannot switch off; "
@@ -497,7 +522,7 @@ def to_generation_request(
         top_logprobs=req.top_logprobs if req.logprobs else 0,
         min_response_tokens=min_response,
         max_prompt_tokens=req.max_prompt_tokens,
-        reasoning=reasoning_limits(tokenizer, prompt, limit),
+        reasoning=None if markers is None else replace(markers, max_tokens=limit),
     )
 
 
@@ -592,13 +617,13 @@ class ChatResponder:
         self._reasoning_keys = REASONING_FIELDS[reasoning_field]
         self.assembler = TextAssembler(
             tokenizer,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=prompt_tokens[req.assistant_start :],
             stop_words=req.stop,
             tools=req.tools,
             streaming=req.stream,
             route_thinking=reasoning_field != "none",
             # Without tools on offer a tool-call block is the model's text.
-            tools_enabled=req.tools is not None,
+            tools_enabled=bool(req.tools),
         )
 
     def _envelope(self, kind: str) -> dict:
@@ -619,7 +644,7 @@ class ChatResponder:
             msg["tool_calls"] = d.tool_calls
         return msg
 
-    def chunk(self, d: TextDelta, cached: int, final: bool = False) -> dict:
+    def chunk(self, d: TextDelta) -> dict:
         delta = {}
         if d.content:
             delta["content"] = d.content
@@ -654,7 +679,7 @@ class ChatResponder:
             d = self.assembler.feed(event)
             if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
                 continue
-            yield self.chunk(d, cached, final=d.finish_reason is not None)
+            yield self.chunk(d)
             if d.finish_reason is not None:
                 break  # a text-level stop ends before the engine does
         if self.req.stream_usage:

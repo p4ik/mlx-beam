@@ -199,6 +199,7 @@ class GatedDeltaNet(nn.Module):
                 # A speculative verify: keep what redoing the recurrence over
                 # an accepted prefix needs (VENDORED.md, recurrent stash).
                 cache.stash = dict(
+                    kind="gated_delta",
                     conv_input=conv_input,
                     n_keep=n_keep,
                     state=state,

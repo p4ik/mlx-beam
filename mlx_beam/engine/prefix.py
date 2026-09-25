@@ -1,13 +1,15 @@
 """The prefix store: one entry per conversation, checkpoints at its boundaries.
 
 A stored entry holds the caches of a finished request (KV for every token
-plus the recurrent state at the end) and, for the recurrent layers of a
-hybrid, snapshots taken at the segment boundaries of its prompt (system
-end, each user end). A new request that shares a prefix restores the entry,
-cuts it back to the last boundary at or before the shared length - KV
-layers trim to any position, recurrent layers only to a checkpoint - and
-prefills the rest. Plain-attention models need no checkpoints; every
-position is a boundary for them.
+plus the recurrent state at the end) and, for the recurrent and the
+sliding-window layers of a model, snapshots taken at the segment boundaries
+of its prompt (system end, each user end). A new request that shares a
+prefix restores the entry, cuts it back to the last boundary at or before
+the shared length - full-attention layers trim to any position, recurrent
+layers only to a checkpoint, and a sliding-window layer that has rotated
+past the boundary (its ring buffer overwrote the tokens a trim would need)
+only to a checkpoint as well - and prefills the rest. Plain-attention
+models need no checkpoints; every position is a boundary for them.
 """
 
 from __future__ import annotations
@@ -18,24 +20,58 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
 
-from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, PromptTrie
+from mlx_beam._vendor.mlx_lm.generate import _cache_arrays
+from mlx_beam._vendor.mlx_lm.models.cache import (
+    ArraysCache,
+    BatchRotatingKVCache,
+    PromptTrie,
+    RotatingKVCache,
+)
 
 # Bytes of a recurrent snapshot are counted like cache bytes.
-_ORDER = ("assistant", "user", "system")
+# Eviction order: assistant entries (one per finished turn) go before the
+# system entries (one per conversation, kept under their own cap).
+_ORDER = ("assistant", "system")
 
 
 def recurrent_layers(cache: list[Any]) -> list[int]:
     return [i for i, c in enumerate(cache) if isinstance(c, ArraysCache)]
 
 
-def snapshot_recurrent(cache: list[Any]) -> dict[int, list]:
-    """The recurrent layers' state, copied, keyed by layer index."""
-    return {
-        i: [None if a is None else copy.deepcopy(a) for a in cache[i].cache]
-        for i in recurrent_layers(cache)
-    }
+def window_layers(cache: list[Any]) -> list[int]:
+    return [
+        i
+        for i, c in enumerate(cache)
+        if isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
+    ]
+
+
+def snapshot_window(c: RotatingKVCache) -> list:
+    """A sliding-window layer's state as a checkpoint holds it: the ring
+    buffers (views; a later in-place write copies first) and the scalars
+    that place them - the same tuple ``state`` reads and writes."""
+    keys = None if c.keys is None else c.keys[:]
+    values = None if c.values is None else c.values[:]
+    return [keys, values, c.offset, c.keep, c.max_size, c._idx]
+
+
+def restore_window(c: RotatingKVCache, snap: list) -> None:
+    keys, values, offset, keep, max_size, idx = snap
+    c.state = (
+        None if keys is None else keys[:],
+        None if values is None else values[:],
+        offset,
+        keep,
+        max_size,
+        idx,
+    )
+
+
+def checkpoint_layers(cache: list[Any]) -> list[int]:
+    """Layers a boundary checkpoint must capture: recurrent state and
+    sliding windows. Full-attention layers trim to any position."""
+    return sorted(set(recurrent_layers(cache)) | set(window_layers(cache)))
 
 
 def _common_prefix(a: list[int], b: list[int]) -> int:
@@ -45,22 +81,6 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
             break
         n += 1
     return n
-
-
-def cache_arrays(cache: list[Any]) -> list:
-    """Every array a cache list holds, read as storage."""
-    out = []
-    for c in cache:
-        for leaf in getattr(c, "caches", None) or (c,):
-            if leaf is None:
-                continue
-            for v in vars(leaf).values():
-                if v is None or isinstance(v, (int, float, str, bool)):
-                    continue
-                for _, a in tree_flatten(v):
-                    if isinstance(a, mx.array):
-                        out.append(a)
-    return out
 
 
 def compact_kv(cache: list[Any]) -> None:
@@ -78,16 +98,24 @@ def compact_kv(cache: list[Any]) -> None:
         c.values = tree_map(lambda a, n=n: mx.contiguous(a[..., :n, :]), c.values)
 
 
-def _snapshot_bytes(snap: dict[int, list]) -> int:
-    return sum(a.nbytes for arrays in snap.values() for a in arrays if a is not None)
+# The key of the draft head's history in a checkpoint, beside the layer
+# indices: (keys, values, tail hidden) of the head's cache at that position,
+# taken back by the proposer when a request resumes exactly there.
+HEAD = "head"
+
+
+def _snapshot_bytes(snap: dict) -> int:
+    # A window snapshot carries scalars next to its arrays; only arrays weigh.
+    return sum(getattr(a, "nbytes", 0) for arrays in snap.values() for a in arrays)
 
 
 @dataclass
 class Entry:
     cache: list[Any]
     length: int
-    # position -> recurrent state at that position (empty for plain models)
-    checkpoints: dict[int, dict[int, list]]
+    # position -> layer index -> state at that position, and the draft
+    # head's history under HEAD (empty for plain models without a head)
+    checkpoints: dict[int, dict]
     cache_type: str
     nbytes: int = 0
 
@@ -106,25 +134,20 @@ class Hit:
     cache: list[Any]
     # tokens the restored cache already covers; the rest needs a prefill
     covered: int
-    # what the store found before cutting back (for the miss/hit accounting)
-    found: int
     kind: str  # "exact", "longer", "shorter"
     # the entry's checkpoints at or before ``covered``, still valid - and
     # for a recurrent model always one at ``covered`` itself
-    checkpoints: dict[int, dict[int, list]] = field(default_factory=dict)
+    checkpoints: dict[int, dict] = field(default_factory=dict)
 
 
 @dataclass
 class StoreStats:
-    entries: int = 0
-    nbytes: int = 0
     lookups: int = 0
     hits: int = 0
     tokens_found: int = 0
     tokens_restored: int = 0
     # Entries dropped to make room for a prefill the valve had stalled.
     evicted_for_memory: int = 0
-    by_type: dict = field(default_factory=dict)
 
 
 def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
@@ -136,8 +159,15 @@ def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
     if target >= entry_len:
         return entry_len
     rec = recurrent_layers(cache)
-    if rec:
-        usable = [p for p in checkpoints if p <= target]
+    # A rotated window cannot trim (the ring overwrote what a trim would
+    # need); until it rotates, it trims like a full-attention layer.
+    stuck = [i for i in window_layers(cache) if not cache[i].is_trimmable()]
+    if rec or stuck:
+        usable = [
+            p
+            for p, snap in checkpoints.items()
+            if p <= target and all(i in snap for i in (*rec, *stuck))
+        ]
         if not usable:
             return -1
         pos = max(usable)
@@ -148,6 +178,8 @@ def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
             c.cache = [
                 None if a is None else copy.deepcopy(a) for a in checkpoints[pos][i]
             ]
+        elif i in stuck:
+            restore_window(c, checkpoints[pos][i])
         else:
             if not c.is_trimmable():
                 return -1
@@ -201,20 +233,28 @@ class PrefixStore:
             self.stats.tokens_found += shared
             self.stats.tokens_restored += pos
             carried = {p: s for p, s in entry.checkpoints.items() if p <= pos}
-            rec = recurrent_layers(cache)
-            if rec and pos == entry.length and pos not in carried:
+            stateful = checkpoint_layers(cache)
+            if stateful and pos == entry.length:
                 # Restored whole: the entry's end state is the restore point
                 # this request stands on. Carried along (shared, not copied),
                 # it survives the entry being replaced or evicted before the
-                # request finishes.
-                carried[pos] = {i: entry.cache[i].cache for i in rec}
+                # request finishes. A head sidecar already there stays.
+                end = dict(carried.get(pos, {}))
+                for i in stateful:
+                    if i not in end:
+                        end[i] = (
+                            entry.cache[i].cache
+                            if isinstance(entry.cache[i], ArraysCache)
+                            else snapshot_window(entry.cache[i])
+                        )
+                carried[pos] = end
             if len(key) == len(tokens):
                 kind = "exact"
             elif len(key) < len(tokens):
                 kind = "shorter"
             else:
                 kind = "longer"
-            return Hit(cache, pos, shared, kind, carried)
+            return Hit(cache, pos, kind, carried)
         return None
 
     # -- insert and eviction ------------------------------------------------
@@ -224,12 +264,12 @@ class PrefixStore:
         model: Any,
         tokens: list[int],
         cache: list[Any],
-        checkpoints: dict[int, dict[int, list]] | None = None,
+        checkpoints: dict[int, dict] | None = None,
         cache_type: str = "assistant",
     ) -> None:
         # extract() hands out lazy slices of the batch buffers; evaluated
         # here they own their bytes and the batch can be released.
-        mx.eval(*cache_arrays(cache))
+        mx.eval(*_cache_arrays(cache))
         entry = Entry(cache, len(tokens), dict(checkpoints or {}), cache_type)
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:
@@ -238,19 +278,29 @@ class PrefixStore:
         self._lru[cache_type].append((model, tokens))
         # Prefixes this entry can be cut back to are redundant copies - except
         # a system entry, which exists to outlive the conversations above it.
-        rec = recurrent_layers(cache)
-        cuttable = all(c.is_trimmable() for i, c in enumerate(cache) if i not in rec)
+        stateful = checkpoint_layers(cache)
+        cuttable = all(
+            c.is_trimmable() for i, c in enumerate(cache) if i not in stateful
+        )
         for prefix_len, old in self._trie.pop_prefixes(model, tokens):
             if old.cache_type == "system" or not cuttable:
                 self._trie.add(model, tokens[:prefix_len], old)  # keep it
                 continue
-            if rec:
+            if stateful:
                 # Whatever the old entry could restore, the new one can too:
                 # its checkpoints and its end state (the recurrent state at
                 # prefix_len). Moved, not copied - the old KV cache is what
                 # goes away. One entry per conversation, not one per turn.
                 inherited = dict(old.checkpoints)
-                inherited[prefix_len] = {i: old.cache[i].cache for i in rec}
+                end = dict(inherited.get(prefix_len, {}))
+                for i in stateful:
+                    if i not in end:
+                        end[i] = (
+                            old.cache[i].cache
+                            if isinstance(old.cache[i], ArraysCache)
+                            else snapshot_window(old.cache[i])
+                        )
+                inherited[prefix_len] = end
                 for position, snap in inherited.items():
                     if position <= prefix_len and position not in entry.checkpoints:
                         entry.add_checkpoint(position, snap)
@@ -270,7 +320,7 @@ class PrefixStore:
         model: Any,
         tokens: list[int],
         cache: list[Any],
-        checkpoints: dict[int, dict[int, list]],
+        checkpoints: dict[int, dict],
         upto: int,
         cache_type: str = "system",
     ) -> bool:
@@ -314,10 +364,8 @@ class PrefixStore:
         return max(1, self.max_entries // 4)
 
     def _pop_victim(self):
-        # Assistant entries go first, then user, then system; within a type
-        # the least recently used. Surplus system entries go before anything.
-        if len(self._lru["system"]) > self.system_cap:
-            return self._lru["system"].popleft()
+        # Assistant entries go first, then system; within a type the least
+        # recently used (surplus system entries went in _evict already).
         for kind in _ORDER:
             if self._lru[kind]:
                 return self._lru[kind].popleft()

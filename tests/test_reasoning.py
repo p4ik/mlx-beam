@@ -158,8 +158,9 @@ def test_a_checking_template_gets_the_nearest_rung_it_accepts():
     tok.seen.clear()
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
     chat.build_prompt(tok, req)
-    # No ladder: the probe knew the set, `low` went up to `medium` at once.
-    assert tok.seen == ["medium"]
+    # No ladder: the probe knew the set, `low` went up to `medium` at once;
+    # every render after that (the assistant-start probe) uses that rung.
+    assert set(tok.seen) == {"medium"}
     assert req.template_kwargs["reasoning_effort"] == "medium"
     tok.seen.clear()
     chat.to_generation_request(tok, req)
@@ -167,7 +168,7 @@ def test_a_checking_template_gets_the_nearest_rung_it_accepts():
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "max"}, "m")
     tok.seen.clear()
     chat.build_prompt(tok, req)
-    assert tok.seen == ["xhigh"]
+    assert set(tok.seen) == {"xhigh"}
 
 
 def test_effort_ladder_climbs_only_on_an_effort_rejection():

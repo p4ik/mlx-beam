@@ -72,10 +72,6 @@ class KVPolicy:
     def bits_for(self, layer: int) -> int | None:
         return self.layers.get(layer, self.bits)
 
-    @property
-    def quantizes(self) -> bool:
-        return self.bits is not None or any(b for b in self.layers.values())
-
     def describe(self) -> dict:
         return {
             "bits": self.bits,
@@ -225,22 +221,81 @@ def for_store(caches: list[Any]) -> list[Any]:
     ]
 
 
+def _attention_modules(layer: Any) -> list[Any]:
+    """The attention module(s) of a decoder layer, found by what they hold
+    rather than by name: models call the attribute self_attn, attention or
+    attn, and a wrapper may nest one more level."""
+    found = []
+    for _, module in layer.named_modules():
+        if hasattr(module, "sinks") or hasattr(module, "kv_a_proj_with_mqa"):
+            found.append(module)
+        elif hasattr(module, "k_proj") and hasattr(module, "q_proj"):
+            found.append(module)
+    return found
+
+
+def kv_exceptions(model: Any, caches: list[Any] | None = None) -> list[dict]:
+    """The cache layers the KV policy must leave alone, each with the reason:
+    a sliding-window or recurrent cache has no quantized batch form; an
+    attention with sinks has no quantized SDPA (``base.py`` raises on it);
+    an MLA attention keeps the latent projection in its cache and reads it
+    back as an array, which a quantized cache does not return. Decided by
+    what the module holds, not by the cache type - both of the last two use
+    a plain ``KVCache``."""
+    caches = make_prompt_cache(model) if caches is None else caches
+    layers = list(getattr(model, "layers", []))
+    out = []
+    for i, c in enumerate(caches):
+        if type(c) is not KVCache:
+            kind = type(c).__name__
+            reason = (
+                "recurrent state"
+                if kind == "ArraysCache"
+                else "sliding window" if "Rotating" in kind else f"{kind} cache"
+            )
+            out.append({"layer": i, "reason": reason})
+            continue
+        if i >= len(layers):
+            continue
+        for attention in _attention_modules(layers[i]):
+            if getattr(attention, "sinks", None) is not None:
+                out.append({"layer": i, "reason": "attention sinks"})
+                break
+            if hasattr(attention, "kv_a_proj_with_mqa"):
+                out.append({"layer": i, "reason": "MLA latent cache"})
+                break
+    return out
+
+
 def make_request_cache(model: Any, policy: KVPolicy) -> list[Any]:
     """A fresh per-request cache list, quantized where the policy says so.
 
     Starts from what the model asks for (hybrids bring their own layout via
-    ``make_cache``) and swaps only plain ``KVCache`` entries.
+    ``make_cache``) and swaps only plain ``KVCache`` entries the model can
+    serve quantized (``kv_exceptions``); bits on an excepted layer are an
+    error here, at start, not a dead worker at the first decode step.
     """
     caches = make_prompt_cache(model)
+    excepted = {e["layer"]: e["reason"] for e in kv_exceptions(model, caches)}
     quantized = [
         i
         for i, c in enumerate(caches)
         if policy.bits_for(i) is not None and type(c) is KVCache
     ]
+    refused = [i for i in quantized if i in excepted]
+    if refused:
+        reasons = sorted({excepted[i] for i in refused})
+        raise ValueError(
+            f"kv policy asks for {policy.bits_for(refused[0])} bits on "
+            f"{len(refused)} layer(s) the model cannot serve quantized "
+            f"({', '.join(reasons)}; layers {refused[:8]}{'...' if len(refused) > 8 else ''}); "
+            "leave --kv-bits unset or exclude these layers in the kv_config"
+        )
     if quantized:
         # mx.quantize wants the head dim divisible by the group; say so in
-        # terms of the policy instead of a kernel error at warm-up.
-        args = getattr(model, "args", None)
+        # terms of the policy instead of a kernel error at warm-up. A
+        # multimodal wrapper keeps the sizes one level down.
+        args = getattr(getattr(model, "language_model", model), "args", None)
         for name in ("head_dim", "global_head_dim"):
             dim = getattr(args, name, None)
             if isinstance(dim, int) and dim % policy.group_size:

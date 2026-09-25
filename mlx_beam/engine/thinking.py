@@ -285,21 +285,28 @@ class ThinkingBudget:
     def in_reasoning(self) -> bool:
         return self._state == "reasoning"
 
-    def inert_for(self, tokens: int) -> bool:
-        """The processor leaves the next `tokens` logits alone whatever they
-        turn out to be: no force queued, no opener masked, and `tokens` more
-        counted tokens cannot arm the force or the mask. A speculative cycle
-        may then verify that many tokens without calling it."""
-        if self._block or self._pos < len(self._queue) or self._closing:
+    def stable_for(self, tokens: int) -> bool:
+        """The processor's state cannot change over the next `tokens`
+        logits: no force in progress or closing, and `tokens` more counted
+        tokens cannot arm one. A speculative cycle may then verify that
+        many positions, calling the processor per position like a plain
+        step would - the opener mask it may hold is a function of the
+        context alone. Whether the tokens turn out counted or not does not
+        matter: the bound assumes every one of them counts."""
+        if self._pos < len(self._queue) or self._closing:
             return False
         if self._state == "label":
             return False  # the label decides whether counting starts
         limit = self.limits.max_tokens
         if limit is None:
             return True
-        # Every token could count. The force arms at `limit - 1 - close`
-        # (_maybe_arm) and the opener mask at `limit - 2 - close` from the
-        # other side (_gate_opener): the same bound, written once.
+        if self._block and self._state != "reasoning":
+            # Outside a block with the opener masked nothing counts any
+            # more: the rest of the answer is stable.
+            return True
+        # The force arms at `limit - 1 - close` (_maybe_arm) and the opener
+        # mask at `limit - 2 - close` from the other side (_gate_opener):
+        # the same bound, written once.
         return self.reasoning_tokens + tokens < limit - 1 - self._close_counted
 
     def _is_forced(self, token: int) -> bool:

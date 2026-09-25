@@ -127,6 +127,7 @@ class CompletionResponder:
             stop_words=req.stop,
             route_thinking=False,
             tools_enabled=False,
+            lead=False,
         )
 
     def _envelope(self) -> dict:

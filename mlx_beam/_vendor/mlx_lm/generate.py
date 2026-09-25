@@ -1571,10 +1571,17 @@ class BatchGenerator:
         max_kv_size: Optional[int] = None,
         stream=None,
         generation_batch=None,
+        on_step=None,
+        prompt_batch=None,
         prefill_valve=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
+        # Called with each decode step's responses before the next step
+        # runs: the caller's per-token bookkeeping (a reasoning budget that
+        # arms a forced close) must see a token before the step after it,
+        # not when this call returns after several (VENDORED.md, scheduler).
+        self.on_step = on_step
         # Asked before every prefill call for the width it may have (None:
         # not this round), told the width afterwards; VENDORED.md, scheduler.
         self.prefill_valve = prefill_valve
@@ -1583,6 +1590,9 @@ class BatchGenerator:
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.generation_batch = generation_batch or GenerationBatch
+        # The class that prefills: the caller may hand in a subclass (mlx-beam's
+        # priming batch feeds the draft head along); VENDORED.md, generation batch.
+        self.prompt_batch = prompt_batch or PromptProcessingBatch
         # A model call cannot be interrupted, so its width is the wait a
         # newcomer sees. 512 ran at 125 tok/s against 114 for 2048 on a
         # 27B GDN hybrid (2026-09-13, M4 Pro 64 GB); VENDORED.md, scheduler.
@@ -1600,7 +1610,7 @@ class BatchGenerator:
             stop_tokens if stop_tokens else None,
         )
         self._uid_count = 0
-        self._prompt_batch = PromptProcessingBatch.empty(
+        self._prompt_batch = self.prompt_batch.empty(
             self.model,
             self.sampler,
             prefill_step_size=prefill_step_size,
@@ -1830,7 +1840,7 @@ class BatchGenerator:
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
 
-        return PromptProcessingBatch(
+        return self.prompt_batch(
             model=self.model,
             uids=uids,
             caches=caches,
@@ -1859,6 +1869,8 @@ class BatchGenerator:
             tic = time.perf_counter()
             while True:
                 step = self._generation_batch.next()
+                if self.on_step is not None and step:
+                    self.on_step(step)
                 generation_responses += step
                 self._counters.generation_tokens += len(step)
                 self._counters.generation_steps += 1

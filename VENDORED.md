@@ -28,7 +28,18 @@ have.
 
 `import paths` - `utils.py`, `tokenizer_utils.py`, `models/plamo2.py`: three
 dynamic imports and one absolute import used the top-level name `mlx_lm`;
-they now use the vendored package path. Nothing else about them changed.
+they now use the vendored package path. Nothing else about them changed
+except the next entry.
+
+`sidecar download` - `utils.py`, `_download` and `package_files`: after the
+default snapshot (`*.json`, `model*.safetensors`, ...) a second
+`snapshot_download` fetches the files the checkpoint itself names beyond
+those patterns - `mtp_file` in config.json, every `parts.<name>.file` of
+a package manifest, and the weight index's shards outside
+`model*.safetensors`. Without it a Hugging Face repo id loads the trunk
+but never its draft head (`mtp/weights.safetensors`) or a tower sidecar
+(`optiq/…`), and `--draft-model bundled` fails on a fresh machine. Tests:
+`tests/test_cli.py`.
 
 `mask` - `models/cache.py`, `ArraysCache.make_mask`: `lengths` decides before
 `left_padding`. A right-padded prefill sets `lengths`, but `merge()` of fresh
@@ -140,13 +151,25 @@ values typed by the tool's schema). Routing by label is in
 own chat templates (`tests/fixtures/templates`).
 
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
-one constructor argument, `generation_batch`, the class built at the move to
-decoding (`PromptProcessingBatch.generate`) and for the empty batch. Upstream
-names `GenerationBatch` there; the engine hands in
+two constructor arguments. `generation_batch` is the class built at the move
+to decoding (`PromptProcessingBatch.generate`) and for the empty batch;
+upstream names `GenerationBatch` there, the engine hands in
 `mlx_beam.engine.speculative.SpeculativeGenerationBatch`, which decodes
 several tokens per call when a proposer drafts them and plainly otherwise.
-Nothing about the plain path changed: with the argument left out the
-default is upstream's class. Tests: `tests/test_speculative.py`.
+`prompt_batch` (on `BatchGenerator` only) is the class that prefills, built
+for the empty batch and in `_make_batch`; upstream names
+`PromptProcessingBatch`, the engine hands in
+`mlx_beam.engine.priming.PrimingPromptBatch` when a proposer is configured,
+which runs the trunk without the `lm_head` over the prompt chunks and feeds
+the hidden states to the draft head. Nothing about the plain path changed:
+with the arguments left out the defaults are upstream's classes. Tests:
+`tests/test_speculative.py`.
+
+`exact verify` - `models/base.py`, `scaled_dot_product_attention`: with
+`EXACT_PER_QUERY` set (by `mlx_beam.engine.exact.exact_forward`) a block of
+L queries is attended one query at a time with its own mask row, so the
+quantized KV path sums the way plain decoding does; off, the function is
+upstream's.
 
 `recurrent stash` - `models/qwen3_5.py`, `models/qwen3_next.py`,
 `GatedDeltaNet.__call__`: when the layer's cache carries a `stash` attribute
@@ -164,6 +187,14 @@ in `speculative.py`. Without the attribute the layer runs as upstream.
 Tests: `tests/test_speculative.py` (`test_committed_tokens_equal_plain_greedy`
 with nothing, everything and a ragged mix accepted;
 `test_rollback_on_metal_matches_a_shorter_forward` on the Metal kernels).
+The stash names its `kind` (`gated_delta`); `models/granitemoehybrid.py`,
+`GraniteMoeHybridMamba2Mixer`, keeps the same kind of stash for Mamba-2
+(`kind` `mamba2`: the padded conv input, the SSM inputs and the state
+before the call), and `_conv` keeps the padded input on the module for it.
+`speculative.rollback_recurrent` replays either kind. Tests:
+`test_mamba2_rollback_matches_a_shorter_forward` (bit for bit, the scan
+runs the same ops on both sides) and the Granite class in
+`tests/test_model_classes.py`.
 
 `rotating merge` - `models/cache.py`, `BatchRotatingKVCache.merge`: a cache
 trimmed back to length 0 keeps its buffer, and the source slice `[..., -0:, :]`
@@ -277,3 +308,38 @@ tiles - fp16 stops resolving the sum past a few thousand tokens. Tests:
 `test_tiled_sdpa_matches_stock`,
 `test_tiled_sdpa_matches_stock_with_a_batch_mask`,
 `test_prefill_takes_the_tiled_path`.
+
+## mlx-vlm
+
+Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, the PyPI wheel
+0.7.1 (`tools/vendor.toml`, part `mlx-vlm`). Two files only,
+`mlx_beam/_vendor/mlx_vlm/`:
+
+- `quantized_verifier.py` (`models/quantized_verifier.py` upstream): Metal
+  kernels for quantized projections that give, for a block of T rows, the
+  bytes T single-row calls give (affine 4/5/8 bit, group 32/64/128, plus
+  fixed-format and MoE variants), and the native per-position fallback
+  `_exact_time_batch`.
+- `exact_speculative_verify.py`: the dense GEMV block kernel, kept with its
+  neighbour; not called yet.
+
+### Local changes
+
+`switch import` - `quantized_verifier.py` imports `QuantizedSwitchLinear`
+from the vendored mlx-lm instead of mlx-vlm's own module; the class is the
+same one mlx-lm serves. Nothing else changed.
+
+### Where it is used
+
+`mlx_beam/engine/exact.py`: inside `exact_forward()` every
+`nn.QuantizedLinear` of the model (its class swapped to a subclass of ours at
+start, the instance and its weights untouched) projects through
+`optimized_affine_linear`, falling back to `_exact_time_batch`; the vendored
+`base.scaled_dot_product_attention` attends one query at a time under the
+same switch (`EXACT_PER_QUERY`, the `exact verify` change to `base.py`).
+The engine measures at warm-up whether that is bit-equal to single forwards
+(`speculative.width_check`) and keeps the block verify otherwise, saying so
+in `/health.speculative.exact`. Tests: `tests/test_speculative.py`
+(`test_exact_install_…`, `test_width_check_…`), the `kernels` mode of
+`tests/test_model_classes.py`. The Metal kernels themselves run on Apple
+silicon only; the CPU suite exercises the fallback path.

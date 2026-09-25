@@ -286,8 +286,62 @@ def _download(
                 allow_patterns=allow_patterns,
             )
         )
+        # What the checkpoint's own files name beyond the default patterns:
+        # a package's draft head and tower sidecars live in subfolders
+        # (mtp/, optiq/) that `model*.safetensors` never matches. A second
+        # pass fetches exactly those (VENDORED.md, sidecar download).
+        extra = package_files(model_path)
+        if extra:
+            snapshot_download(
+                path_or_hf_repo, revision=revision, allow_patterns=extra
+            )
 
     return model_path
+
+
+def package_files(model_path: Path) -> List[str]:
+    """Files a checkpoint names that the default download patterns miss:
+    the weight index's shards outside `model*.safetensors`, `mtp_file` in
+    config.json, and every `parts.<name>.file` of a package manifest."""
+    import fnmatch
+
+    def matches_default(name: str) -> bool:
+        return any(fnmatch.fnmatch(name, p) for p in DEFAULT_ALLOW_PATTERNS)
+
+    named: List[str] = []
+    config_file = model_path / "config.json"
+    config = {}
+    if config_file.is_file():
+        try:
+            config = json.loads(config_file.read_text())
+        except ValueError:
+            config = {}
+    mtp_file = config.get("mtp_file") if isinstance(config, dict) else None
+    if isinstance(mtp_file, str):
+        named.append(mtp_file)
+    extras = config.get("extras") if isinstance(config, dict) else None
+    manifest_name = extras.get("manifest") if isinstance(extras, dict) else None
+    if isinstance(manifest_name, str) and (model_path / manifest_name).is_file():
+        try:
+            manifest = json.loads((model_path / manifest_name).read_text())
+        except ValueError:
+            manifest = {}
+        parts = manifest.get("parts") if isinstance(manifest, dict) else None
+        for entry in (parts or {}).values():
+            if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+                named.append(entry["file"])
+    index_file = model_path / "model.safetensors.index.json"
+    if index_file.is_file():
+        try:
+            weight_map = json.loads(index_file.read_text()).get("weight_map", {})
+        except ValueError:
+            weight_map = {}
+        named.extend(sorted(set(weight_map.values())))
+    seen: List[str] = []
+    for name in named:
+        if name not in seen and not matches_default(name):
+            seen.append(name)
+    return seen
 
 
 def hf_repo_to_path(hf_repo):
