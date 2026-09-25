@@ -52,7 +52,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `logprobs.content` books a token whose text the automaton held back (the
   start of a possible stop word or marker) with the token that releases
   it; the eos token is never an entry, whatever its arrival flushed. Byte
-  tokens carry their own bytes, not those of U+FFFD.
+  tokens carry their own bytes, not those of U+FFFD - a SentencePiece
+  byte token (`<0xE2>`) its hex, a BPE one its byte alphabet.
 - `/v1/completions` no longer repeats a think opener the raw prompt ends
   with; the reasoning state is seeded from the assistant's own frame only,
   so a `<think>` or a recipient label inside a user message is text.

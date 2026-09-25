@@ -1517,3 +1517,19 @@ def test_logprob_bytes_of_a_byte_level_token_are_its_own():
         [0x82],
         [0xAC],
     ]
+
+
+def test_logprob_bytes_of_a_sentencepiece_byte_token_are_its_hex():
+    """A SentencePiece tokenizer names a byte token `<0xE2>`: the byte is
+    the hex, not the ASCII of the name."""
+    from mlx_beam.api.text import logprob_entry
+
+    class Spm(StubTokenizer):
+        def convert_ids_to_tokens(self, ids):
+            return ["<0xE2>" if i == 40 else self._words[i] for i in ids]
+
+        def decode(self, ids):
+            return "".join("\ufffd" if i == 40 else self._words[i] for i in ids)
+
+    entry = logprob_entry(Spm(), TokenEvent(40, -0.1))
+    assert entry["bytes"] == [0xE2]

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -86,16 +87,25 @@ def holds_incomplete_bytes(detokenizer) -> bool:
     return False
 
 
+# A SentencePiece byte token names its byte in hex (`<0xE2>`); the
+# vendored SPM detokenizer reads it the same way.
+_SPM_BYTE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
+
+
 def token_bytes(tokenizer, token_id: int, text: str) -> list[int]:
     """The token's bytes: the raw ones for a byte-level token (a piece of
-    a character decodes to U+FFFD, whose bytes are not the token's), the
-    text's otherwise."""
+    a character decodes to U+FFFD, whose bytes are not the token's) - the
+    hex of a SentencePiece byte token, the byte alphabet of a BPE one -
+    the text's otherwise."""
     if "\ufffd" in text and hasattr(tokenizer, "convert_ids_to_tokens"):
         try:
             from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
 
-            decoder = _byte_decoder()
             (piece,) = tokenizer.convert_ids_to_tokens([token_id])
+            spm = _SPM_BYTE.match(piece)
+            if spm:
+                return [int(spm.group(1), 16)]
+            decoder = _byte_decoder()
             return [decoder[c] for c in piece]
         except (KeyError, ValueError, TypeError):
             pass
