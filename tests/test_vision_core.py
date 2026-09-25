@@ -688,3 +688,43 @@ def test_unequal_prefill_rows_with_spans_are_a_loud_error():
     batch = cls(model, [1, 2], caches, prefill_step_size=64)
     with pytest.raises(ValueError, match="unequal length"):
         batch.prompt([built.tokens, built.tokens[:-2]])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_think_marker_in_the_user_text_beside_an_image_is_text(stream):
+    """The frontend says where the assistant's frame begins, and the
+    reasoning state is seeded from there only: a `<think>` the user wrote
+    next to an image does not open a block, so the answer's tokens reach
+    the content, streamed or not."""
+    from mlx_beam.engine.request import TokenEvent
+    from tests.stub_tokenizer import EOS
+
+    tok = StubTokenizer()
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "<think> w1"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ],
+        "stream": stream,
+    }
+    req = chat.parse_chat_request(body, "m", vision=True)
+    gen = chat.to_generation_request(tok, req, frontend=FakeFrontend(tok))
+    assert not gen.reasoning.seeded and req.assistant_start == len(gen.tokens) - 1
+    responder = chat.ChatResponder(tok, req, gen.tokens)
+    events = [TokenEvent(3, -0.1), TokenEvent(EOS, -0.2, "stop")]
+    if stream:
+        chunks = list(responder.stream(iter(events), 0))
+        content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
+    else:
+        content = responder.complete(iter(events), 0)["choices"][0]["message"][
+            "content"
+        ]
+    assert content == "w3 "

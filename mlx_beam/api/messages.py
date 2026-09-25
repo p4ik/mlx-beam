@@ -29,9 +29,10 @@ from mlx_beam.api.chat import (
 )
 from mlx_beam.api.chat import to_generation_request as chat_to_generation_request
 from mlx_beam.api.defaults import RequestDefaults
-from mlx_beam.api.errors import ApiError, bool_field, missing_extra, unsupported
+from mlx_beam.api.errors import ApiError, bool_field, unsupported
 from mlx_beam.api.text import TextAssembler
 from mlx_beam.engine.request import GenerationRequest
+from mlx_beam.modalities import Image
 
 
 @dataclass
@@ -62,6 +63,29 @@ def _text_blocks(content: Any, where: str) -> str:
     return "".join(out)
 
 
+def _image_part(block: dict, where: str) -> dict:
+    """An Anthropic image block as the part the chat path decodes: a
+    base64 source becomes a `data:` URL; nothing is fetched, so a URL
+    source is refused with that reason."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ApiError(f"{where}.source must be an object", param="messages")
+    kind = source.get("type")
+    if kind == "url":
+        raise ApiError(
+            f"{where}: only base64 image sources are accepted; the server "
+            "fetches nothing",
+            param="messages",
+        )
+    if kind != "base64":
+        raise ApiError(f"{where}.source.type must be base64", param="messages")
+    data = source.get("data")
+    if not isinstance(data, str) or not data:
+        raise ApiError(f"{where}.source.data must be a base64 string", param="messages")
+    media = source.get("media_type") or "image/png"
+    return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
+
+
 def _convert_message(m: Any, i: int) -> list[dict]:
     """One Anthropic message into the OpenAI-shaped messages the chat path
     renders: text and thinking stay with the turn, tool_use becomes the
@@ -75,27 +99,35 @@ def _convert_message(m: Any, i: int) -> list[dict]:
         return [{"role": role, "content": content or ""}]
     if not isinstance(content, list):
         raise ApiError(f"{where}.content must be a string or blocks", param="messages")
-    texts: list[str] = []
+    parts: list[dict] = []
     thinking: list[str] = []
     tool_calls: list[dict] = []
     out: list[dict] = []
 
     def flush() -> None:
-        # The turn's own text and calls, in the order the blocks came.
-        if texts or thinking or tool_calls:
-            turn: dict[str, Any] = {"role": role, "content": "".join(texts)}
+        # The turn's own text and calls, in the order the blocks came. A
+        # turn with an image keeps its parts (the chat path decodes them,
+        # or refuses them without a frontend); text alone folds to a string.
+        if parts or thinking or tool_calls:
+            with_image = any(p["type"] != "text" for p in parts)
+            turn: dict[str, Any] = {
+                "role": role,
+                "content": (
+                    list(parts) if with_image else "".join(p["text"] for p in parts)
+                ),
+            }
             if thinking:
                 turn["reasoning_content"] = "".join(thinking)
             if tool_calls:
                 turn["tool_calls"] = list(tool_calls)
             out.append(turn)
-            texts.clear(), thinking.clear(), tool_calls.clear()
+            parts.clear(), thinking.clear(), tool_calls.clear()
 
     for j, block in enumerate(content):
         kind = block.get("type") if isinstance(block, dict) else None
         here = f"{where}.content[{j}]"
         if kind == "text":
-            texts.append(str(block.get("text", "")))
+            parts.append({"type": "text", "text": str(block.get("text", ""))})
         elif kind == "thinking":
             thinking.append(str(block.get("thinking", "")))
         elif kind == "redacted_thinking":
@@ -129,7 +161,7 @@ def _convert_message(m: Any, i: int) -> list[dict]:
                 }
             )
         elif kind == "image":
-            raise missing_extra("image input", "vision")
+            parts.append(_image_part(block, here))
         elif kind == "document":
             raise unsupported("document blocks", "messages")
         else:
@@ -167,8 +199,13 @@ def _tools_to_chat(tools: Any) -> list[dict] | None:
 
 
 def parse_messages_request(
-    body: dict, default_model: str, defaults: RequestDefaults = DEFAULTS
+    body: dict,
+    default_model: str,
+    defaults: RequestDefaults = DEFAULTS,
+    vision: bool = False,
 ) -> MessagesRequest:
+    """`vision` says a frontend serves images: image blocks are decoded
+    and kept; without one an image block is a 400 (as for chat)."""
     if not isinstance(body, dict):
         raise ApiError("the request body must be a JSON object")
     for key in ("mcp_servers", "container", "context_management"):
@@ -222,8 +259,9 @@ def parse_messages_request(
             )
     elif thinking is not None:
         raise ApiError("thinking must be an object", param="thinking")
+    images: list[Image] | None = [] if vision else None
     chat = ChatRequest(
-        messages=_normalise_messages(messages),
+        messages=_normalise_messages(messages, images),
         model=body.get("model") or default_model,
         max_tokens=max_tokens,
         sampling=parse_sampling(body, defaults),
@@ -232,6 +270,7 @@ def parse_messages_request(
         tools=tools,
         max_reasoning_tokens=max_reasoning,
         template_kwargs=template_kwargs,
+        images=images or [],
     )
     return MessagesRequest(chat=chat, stream=chat.stream)
 
@@ -241,13 +280,17 @@ def to_generation_request(
     req: MessagesRequest,
     defaults: RequestDefaults = DEFAULTS,
     max_context: int | None = None,
+    frontend=None,
 ) -> GenerationRequest:
-    return chat_to_generation_request(tokenizer, req.chat, defaults, max_context)
+    return chat_to_generation_request(
+        tokenizer, req.chat, defaults, max_context, frontend=frontend
+    )
 
 
-def count_tokens(tokenizer, req: MessagesRequest) -> dict:
-    """The prompt as the template renders it, counted."""
-    return {"input_tokens": len(build_prompt(tokenizer, req.chat))}
+def count_tokens(tokenizer, req: MessagesRequest, frontend=None) -> dict:
+    """The prompt as the template renders it, counted - with images, as
+    the frontend expands it."""
+    return {"input_tokens": len(build_prompt(tokenizer, req.chat, frontend))}
 
 
 # -- response ----------------------------------------------------------------

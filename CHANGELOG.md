@@ -6,6 +6,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a5] - 2026-09-25
+
 ### Added
 - One tiny model per architecture class in the test suite - attention
   sinks (gpt-oss), sliding window with NoPE full layers (Muse), MLA
@@ -74,9 +76,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   (`capabilities.effort.takes: tokens`). Before, every word was mapped
   onto one template's three names.
 - Anthropic's Messages API: `/v1/messages` (system field, content blocks
-  with text, thinking, tool_use and tool_result, tools with
-  `input_schema`, `tool_choice` auto or none, `stop_sequences`,
-  `thinking.budget_tokens`, `top_k`) answering in content blocks in the
+  with text, image - a base64 source, served like a chat image part -,
+  thinking, tool_use and tool_result, tools with `input_schema`,
+  `tool_choice` auto or none, `stop_sequences`, `thinking.budget_tokens`,
+  `top_k`) answering in content blocks in the
   order thinking, text, tool_use with Anthropic's stop reasons, usage
   (`cache_read_input_tokens` from the prefix cache) and stream events
   (`message_start`, per block start / delta / stop, `message_delta`,
