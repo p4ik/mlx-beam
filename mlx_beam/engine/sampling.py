@@ -94,13 +94,32 @@ def _xtc(logits, probability, threshold, special, key):
     )
 
 
-class SeededSampler:
-    """mlx-lm's chain with an explicit key per step, so the row's draws do not
-    depend on who else sits in the batch. Same seed, prompt and settings give
-    the same tokens; the logits themselves may still differ by batch."""
+# Folds a seed and a position into one 64-bit key seed; the odd constant
+# makes seed -> seed * PHI a bijection, so two seeds never share a stream.
+_PHI = 0x9E3779B97F4A7C15
+_MASK = (1 << 64) - 1
 
-    def __init__(self, p: SamplingParams):
-        self._key = mx.random.key(p.seed)
+
+def position_key(seed: int, position: int) -> mx.array:
+    """The key for a row's draw at `position` (its n-th generated token).
+    Keyed by position, not by call: a verify cycle that samples several
+    positions at once and a plain step that samples one use the same key
+    for the same position, so a seeded transcript is the same either way."""
+    return mx.random.key((seed * _PHI + position) & _MASK)
+
+
+class SeededSampler:
+    """mlx-lm's chain with an explicit key per position, so the row's draws
+    depend on neither the global state nor who else sits in the batch. Same
+    seed, prompt and settings give the same tokens; the logits themselves
+    may still differ by batch. The draw is Gumbel-max over the filtered
+    logprobs - the noise is independent of the logits, which is what lets a
+    speculative verify couple the target's draw to the proposer's."""
+
+    def __init__(self, p: SamplingParams, seed: int | None = None):
+        self.seed = p.seed if seed is None else seed
+        # Draws made so far: the position the next draw belongs to.
+        self.position = 0
         self._temp = p.temperature
         # Same order as make_sampler: top_p, min_p, xtc, top_k.
         self._steps = []
@@ -118,11 +137,24 @@ class SeededSampler:
         if p.top_k > 0:
             self._steps.append(lambda x, key: apply_top_k(x, p.top_k))
 
-    def __call__(self, logprobs: mx.array) -> mx.array:
-        self._key, k_xtc, k_draw = mx.random.split(self._key, 3)
+    def draw(self, logprobs: mx.array, position: int) -> mx.array:
+        """The token at `position` for these (1, V) logprobs: the filters,
+        the temperature, then argmax over logprobs plus Gumbel noise under
+        the position's key. Does not advance the position."""
+        k_xtc, k_noise = mx.random.split(position_key(self.seed, position))
         for step in self._steps:
             logprobs = step(logprobs, k_xtc)
-        return mx.random.categorical(logprobs * (1.0 / self._temp), key=k_draw)
+        scaled = logprobs * (1.0 / self._temp)
+        return mx.argmax(scaled + mx.random.gumbel(scaled.shape, key=k_noise), axis=-1)
+
+    def advance(self, n: int) -> None:
+        """`n` positions were drawn elsewhere (a verify cycle)."""
+        self.position += n
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        token = self.draw(logprobs, self.position)
+        self.position += 1
+        return token
 
 
 def top_logprobs(logprobs: mx.array, n: int) -> tuple[tuple[int, float], ...]:

@@ -6,8 +6,15 @@ target just sampled; the target runs one forward over those k + 1 tokens; the
 longest prefix of drafts the target's own argmax reproduces is committed,
 plus the target's token after it; everything the forward wrote past that
 point is rolled back - attention caches trim, recurrent layers redo their
-recurrence over the accepted prefix from what the layer stashed. Greedy only:
-every committed token is the target's own argmax over the verify forward.
+recurrence over the accepted prefix from what the layer stashed. Every
+committed token is the target's own: its argmax over the verify forward for
+a greedy row, its own draw for a sampled one. A sampled row draws by
+Gumbel-max under a key per position (`SeededSampler`); the proposer drafts
+under the same keys, and a draft is accepted when it equals the target's
+draw - no residual distribution, no draft probabilities: the noise does not
+depend on the logits, so the committed token at every position has exactly
+the target's distribution whatever was drafted (measured against
+Leviathan/Chen under the production sampler: within 0.005, 2026-09-19).
 Against plain decoding, one token per forward, that agrees up to the
 rounding of kernels that run at a different width: in bf16 the two were
 bit-identical in every measured case (recurrent layers, Metal, head dims 32
@@ -17,15 +24,17 @@ way. Nothing here can close that gap: the inputs of every layer already
 come from the wider forward below it.
 
 Rows speculate one at a time (measured: a batch of four gains under 1.2x on
-this hardware without a small-M kernel, 2026-09-19), greedy, without logits
-processors other than a logit bias (applied to every verify position) and
-an inert thinking budget; everything else decodes plainly through the same
-class, so no request is refused for it.
+this hardware without a small-M kernel, 2026-09-19). Logits processors run
+per verify position over the context that position would have seen in a
+plain step; a thinking budget only while its state cannot change within the
+cycle (`ThinkingBudget.stable_for`) - while it forces a close the row
+decodes plainly through the same class, so no request is refused for it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import mlx.core as mx
 
@@ -33,7 +42,6 @@ from mlx_beam._vendor.mlx_lm.generate import GenerationBatch, _cache_arrays
 from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, BatchRotatingKVCache
 from mlx_beam._vendor.mlx_lm.models.gated_delta import gated_delta_update
 from mlx_beam._vendor.mlx_lm.models.ssm import ssm_update
-from mlx_beam._vendor.mlx_lm.sample_utils import greedy_sampler
 from mlx_beam.engine.exact import exact_forward
 from mlx_beam.engine.proposer import Proposer, trunk
 
@@ -51,19 +59,17 @@ class Speculator:
         proposer: Proposer,
         depth: int,
         eligible: Callable[[int, int], bool],
-        logit_bias: Callable[
-            [int], tuple[mx.array, mx.array] | None
-        ] = lambda uid: None,
+        coupling: Callable[[int], Any] = lambda uid: None,
     ):
         self.proposer = proposer
         self.depth = depth
-        # eligible(uid, tokens_this_cycle): greedy, no logits processor that
-        # could act within the cycle.
+        # eligible(uid, tokens_this_cycle): no logits processor whose state
+        # could change within the cycle.
         self.eligible = eligible
-        # logit_bias(uid): (indices, values) of the row's additive bias, the
-        # one processor a verify can apply itself - it has no state and no
-        # context, so every position gets the same add as a plain step does.
-        self.logit_bias = logit_bias
+        # coupling(uid): the row's SeededSampler when it samples - the verify
+        # draws every position through it and the proposer drafts through
+        # it - or None for a greedy row (argmax on both sides).
+        self.coupling = coupling
         # "block": one forward over the k+1 tokens (the fast path);
         # "kernels": the same block through the exact projections and
         # per-query attention (mlx_beam.engine.exact), checked at warm-up
@@ -302,18 +308,12 @@ class SpeculativeGenerationBatch(GenerationBatch):
 
     # -- the cycle -------------------------------------------------------------
 
-    def _greedy(self, i: int) -> bool:
-        s = self.samplers[i] if self.samplers else None
-        s = self.fallback_sampler if s is None else s
-        return s is greedy_sampler
-
     def _can_speculate(self) -> bool:
         spec = self.speculator
         return (
             spec is not None
             and len(self.uids) == 1
             and self._hidden_slot is not None
-            and self._greedy(0)
             and spec.eligible(self.uids[0], spec.depth + 1)
         )
 
@@ -348,13 +348,47 @@ class SpeculativeGenerationBatch(GenerationBatch):
                 )
         return recurrent
 
-    def _logprobs(self, uid: int, logits: mx.array) -> mx.array:
-        bias = self.speculator.logit_bias(uid)
-        if bias is not None:
-            # The same scatter-add mlx-lm's processor does on one row.
-            indices, values = bias
-            logits = logits.at[:, :, indices].add(values)
+    def _processed(self, logits: mx.array, fed: list[int]) -> mx.array:
+        """The row's logits processors over the cycle's positions, each with
+        the context a plain step would have handed it: the tokens before
+        the cycle plus `fed` up to and including the token that produced
+        the position. Normalised to logprobs. The processors are stateless
+        here - a budget in a state that could change is kept out of the
+        cycle by `eligible`, a bias or penalty reads only the context."""
+        processors = self.logits_processors[0] if self.logits_processors else ()
+        if processors:
+            base = self._token_context[0].tokens
+            rows = []
+            for j in range(logits.shape[1]):
+                context = mx.concatenate([base, mx.array(fed[: j + 1], dtype=mx.int32)])
+                row = logits[:, j, :]
+                for processor in processors:
+                    row = processor(context, row)
+                rows.append(row)
+            logits = mx.stack(rows, axis=1)
         return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    def _choose(self, uid: int, logprobs: mx.array, offset: int) -> mx.array:
+        """The target's token at verify position `offset` from these (1, V)
+        logprobs: argmax for a greedy row, the row's own draw at the
+        position it will be for a sampled one."""
+        coupling = self.speculator.coupling(uid)
+        if coupling is None:
+            return mx.argmax(logprobs, axis=-1)
+        return coupling.draw(logprobs, coupling.position + offset)
+
+    def _chooser(self, uid: int):
+        """What the proposer drafts with: None (argmax) for a greedy row, the
+        row's draw under the key of the position each draft is for."""
+        coupling = self.speculator.coupling(uid)
+        if coupling is None:
+            return None
+
+        def choose(logits: mx.array, i: int) -> mx.array:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            return coupling.draw(logprobs, coupling.position + i)
+
+        return choose
 
     def _cycle_by_position(self, uid, y, lp_y, drafts, k):
         """The verify one token at a time: feed y, read the model's token;
@@ -364,15 +398,16 @@ class SpeculativeGenerationBatch(GenerationBatch):
         spec = self.speculator
         drafts_l = drafts.tolist()
         tokens = [int(y.item()), *drafts_l]
-        hiddens, logprob_rows = [], []
+        hiddens, logprob_rows, chosen = [], [], []
         m = 0
         for j, token in enumerate(tokens):
             hidden, logits = self._forward(mx.array([[token]], dtype=y.dtype))
-            logprobs = self._logprobs(uid, logits)
-            nxt = int(mx.argmax(logprobs[0, -1]).item())
+            logprobs = self._processed(logits[:, -1:, :], tokens[: j + 1])
+            nxt = self._choose(uid, logprobs[:, -1, :], j)
             hiddens.append(hidden)
             logprob_rows.append(logprobs[0, -1])
-            if j < k and nxt == drafts_l[j]:
+            chosen.append(nxt)
+            if j < k and int(nxt.item()) == drafts_l[j]:
                 m += 1
             else:
                 break
@@ -384,7 +419,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
             (drafts_l[i], logprob_rows[i]) for i in range(m)
         ]
         responses, finish = self._emit(emitted)
-        sampled = mx.array([[int(mx.argmax(r).item()) for r in logprob_rows]])
+        sampled = mx.concatenate(chosen)[None]
         return self._finish_cycle(
             uid, responses, finish, sampled, logprob_rows, hidden, m, drafts_l
         )
@@ -409,7 +444,7 @@ class SpeculativeGenerationBatch(GenerationBatch):
         y = self._next_tokens  # (1,), sampled, not yet in the caches
         lp_y = self._next_logprobs[0]
         h = self._hidden_slot
-        drafts = spec.proposer.propose(uid, h, y)
+        drafts = spec.proposer.propose(uid, h, y, self._chooser(uid))
         k = int(drafts.shape[0]) if drafts.ndim else 0
         if k == 0:
             return None
@@ -423,10 +458,15 @@ class SpeculativeGenerationBatch(GenerationBatch):
                     hidden, logits = self._forward(inputs)
             else:
                 hidden, logits = self._forward(inputs)
-            logprobs = self._logprobs(uid, logits)
-            sampled = mx.argmax(logprobs, axis=-1)  # (1, 1 + k)
-            mx.eval(sampled, drafts)
-            sampled_l, drafts_l = sampled[0].tolist(), drafts.tolist()
+            drafts_l = drafts.tolist()
+            logprobs = self._processed(logits, [int(y.item()), *drafts_l])
+            sampled = mx.concatenate(
+                [self._choose(uid, logprobs[:, j, :], j) for j in range(1 + k)]
+            )[
+                None
+            ]  # (1, 1 + k)
+            mx.eval(sampled)
+            sampled_l = sampled[0].tolist()
             m = 0
             while m < k and sampled_l[m] == drafts_l[m]:
                 m += 1
@@ -472,6 +512,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         spec = self.speculator
         committed = [t for t, _, _ in responses]
         self.tokens[0].extend(committed)
+        coupling = spec.coupling(uid)
+        if coupling is not None:
+            # Positions 0..m were drawn: the accepted drafts' successors and
+            # the token after them, the next cycle's start.
+            coupling.advance(m + 1)
         if self.logits_processors and self.logits_processors[0]:
             # An inert budget still watches the context for its opener.
             self._token_context[0].update_and_fetch(mx.array(committed, dtype=mx.int32))

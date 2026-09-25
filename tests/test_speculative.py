@@ -43,9 +43,12 @@ def plain_transcript(model, prompt, n):
 
 
 class OracleProposer:
-    """Drafts from a script: `start(transcript)` hands it the plain greedy
+    """Drafts from a script: `start(transcript)` hands it the plain
     continuation, `plan(call)` says how many of a call's drafts are right
-    before a wrong one follows."""
+    before a wrong one follows. It follows each row's position through the
+    script: the generation batch's first step feeds the prompt's last token
+    (a `drop` before position 0), a plain step feeds one token of the
+    script (`drop`), a cycle `1 + accepted` (`commit`)."""
 
     kind = "oracle"
 
@@ -55,9 +58,11 @@ class OracleProposer:
         self.calls = 0
         self.commits = []
         self.dropped = []
+        self._current = []
+        self._pos = {}
 
-    def propose(self, uid, hidden, token):
-        seq, pos = self._current, self._pos
+    def propose(self, uid, hidden, token, choose=None):
+        seq, pos = self._current, self._pos.get(uid, 0)
         if not seq:
             return mx.array([], dtype=mx.uint32)  # unscripted: decode plainly
         self.calls += 1
@@ -72,16 +77,17 @@ class OracleProposer:
 
     def commit(self, uid, hidden, tokens):
         self.commits.append(list(tokens))
-        self._pos += 1 + len(tokens)
+        self._pos[uid] = self._pos.get(uid, 0) + 1 + len(tokens)
 
     def drop(self, uid):
         self.dropped.append(uid)
+        self._pos[uid] = self._pos.get(uid, -1) + 1
 
     def describe(self):
         return {"kind": self.kind}
 
     def start(self, seq):
-        self._current, self._pos = seq, 0
+        self._current, self._pos = seq, {}
 
 
 def warm_script(model):
@@ -191,30 +197,199 @@ def test_two_rows_decode_plainly_and_alone_speculates_again():
     assert engine.speculator.describe()["plain_steps"] > 0
 
 
-def test_non_greedy_and_processed_rows_decode_plainly():
+class FixedDraftProposer:
+    """Drafts the same tokens on every call: what the target makes of a
+    draft must not depend on what was drafted."""
+
+    kind = "fixed"
+
+    def __init__(self, drafts):
+        self.drafts = list(drafts)
+        self.depth = len(self.drafts)
+
+    def propose(self, uid, hidden, token, choose=None):
+        return mx.array(self.drafts, dtype=mx.uint32)
+
+    def commit(self, uid, hidden, tokens):
+        pass
+
+    def drop(self, uid):
+        pass
+
+    def describe(self):
+        return {"kind": self.kind}
+
+    def start(self, seq):
+        pass
+
+
+SAMPLED = SamplingParams(temperature=0.9, top_k=16, seed=17)
+
+
+@pytest.mark.parametrize("mode", ["off", "positions"])
+def test_sampled_row_speculates_and_matches_its_plain_seeded_transcript(mode):
+    """Keyed by position, the draws inside a verify cycle are the draws a
+    plain step would have made: the transcript of a seeded request is the
+    same with and without the proposer, however the drafts fall."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    n = 24
+    with Engine(model) as plain:
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=n, sampling=SAMPLED))
+        )
+        assert truth != collect(plain.submit(GenerationRequest(prompt, max_tokens=n)))
+    oracle = OracleProposer(lambda call: [0, 3, 1, 2][call % 4])
+    engine = run_speculative(model, oracle, exact_verify=mode)
+    with engine:
+        oracle.start(truth)
+        out = collect(
+            engine.submit(GenerationRequest(prompt, max_tokens=n, sampling=SAMPLED))
+        )
+    assert out == truth
+    spec = engine.speculator.describe()
+    assert spec["cycles"] > 0 and spec["accepted"] > 0
+
+
+def test_unseeded_sampled_row_speculates():
     model = tiny_qwen35()
     oracle = OracleProposer(lambda call: 3)
     engine = run_speculative(model, oracle)
     with engine:
-        before = engine.speculator.cycles
         oracle.start([])
-        collect(
+        before = engine.speculator.cycles
+        # Unscripted, the oracle drafts nothing: the fixed proposer below
+        # is what runs the cycles.
+        engine.speculator.proposer = FixedDraftProposer([1, 2, 3])
+        out = collect(
             engine.submit(
                 GenerationRequest(
-                    [3, 7, 11], max_tokens=6, sampling=SamplingParams(temperature=0.8)
+                    [3, 7, 11], max_tokens=12, sampling=SamplingParams(temperature=0.8)
                 )
             )
         )
-        collect(
-            engine.submit(
-                GenerationRequest(
-                    [3, 7, 11],
-                    max_tokens=6,
-                    sampling=SamplingParams(repetition_penalty=1.3),
-                )
-            )
+        assert len(out) == 12
+        assert engine.speculator.cycles > before
+
+
+def test_every_draft_leaves_the_sampled_transcript_alone():
+    """The enumeration oracle: with the first draft run through the whole
+    vocabulary, the committed tokens are the target's own draws every time
+    - accepted when the draft hit them, replaced when it did not."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    vocab = TINY_QWEN35_WRAPPED["text_config"]["vocab_size"]
+    with Engine(model) as plain:
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=6, sampling=SAMPLED))
         )
-        assert engine.speculator.cycles == before
+    proposer = FixedDraftProposer([0, truth[2], truth[3]])
+    engine = Engine(model, proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    hits = 0
+    with engine:
+        for draft in range(vocab):
+            proposer.drafts[0] = draft
+            accepted = engine.speculator.accepted
+            out = collect(
+                engine.submit(GenerationRequest(prompt, max_tokens=4, sampling=SAMPLED))
+            )
+            assert out == truth[:4], draft
+            if draft == truth[1]:
+                hits += 1
+                assert engine.speculator.accepted - accepted >= 3
+    assert hits == 1
+
+
+def chi_square(counts, expected):
+    return sum((c - e) ** 2 / e for c, e in zip(counts, expected, strict=True))
+
+
+# Chi-square critical values at p = 0.001 by degrees of freedom.
+CRITICAL_001 = {
+    1: 10.83, 2: 13.82, 3: 16.27, 4: 18.47, 5: 20.52, 6: 22.46, 7: 24.32,
+    8: 26.12, 9: 27.88, 10: 29.59, 11: 31.26, 12: 32.91, 13: 34.53,
+    14: 36.12, 15: 37.70, 16: 39.25,
+}  # fmt: skip
+
+
+def test_committed_draws_follow_the_target_under_an_adversarial_draft():
+    """Chi-square over the first two tokens of 2048 seeds, drafted wrong on
+    purpose (always token 0, never in the top): the first token is a plain
+    step's draw, the second the verify's; their joint distribution is the
+    target's own, top-k-filtered at each position. Every pair falls in a
+    bucket, buckets with an expected count under 5 are pooled."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    proposer = FixedDraftProposer([0, 0, 0])
+    engine = Engine(model, proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    n = 2048
+    pairs = []
+    with engine:
+        for seed in range(n):
+            p = SamplingParams(temperature=1.0, top_k=4, seed=seed)
+            out = collect(
+                engine.submit(GenerationRequest(prompt, max_tokens=2, sampling=p))
+            )
+            pairs.append(tuple(out))
+        assert engine.speculator.cycles >= n and engine.speculator.accepted == 0
+
+    def top4(tokens):
+        logits = model(mx.array([tokens]))[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        top = mx.argsort(-logprobs)[:4].tolist()
+        return dict(zip(top, mx.softmax(logprobs[mx.array(top)]).tolist(), strict=True))
+
+    firsts = top4(prompt)
+    expected = {
+        (a, b): n * pa * pb
+        for a, pa in firsts.items()
+        for b, pb in top4([*prompt, a]).items()
+    }
+    assert set(pairs) <= set(expected)
+    counts = {key: pairs.count(key) for key in expected}
+    big = [k for k, e in expected.items() if e >= 5]
+    small = [k for k in expected if k not in big]
+    observed = [counts[k] for k in big]
+    wanted = [expected[k] for k in big]
+    if small:
+        observed.append(sum(counts[k] for k in small))
+        wanted.append(sum(expected[k] for k in small))
+    assert chi_square(observed, wanted) < CRITICAL_001[len(observed) - 1], (
+        observed,
+        wanted,
+    )
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        SamplingParams(repetition_penalty=1.3),
+        SamplingParams(presence_penalty=2.0, frequency_penalty=0.5),
+    ],
+)
+def test_penalised_row_speculates_and_matches_plain(sampling):
+    """A penalty reads the context: the verify hands every position the
+    context a plain step would have, so the transcript is the same."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=16)))
+        truth = collect(
+            plain.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+    assert truth != free
+    oracle = OracleProposer(lambda call: [3, 1, 0, 2][call % 4])
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(truth)
+        before = engine.speculator.cycles
+        out = collect(
+            engine.submit(GenerationRequest(prompt, max_tokens=16, sampling=sampling))
+        )
+        assert out == truth
+        assert engine.speculator.cycles > before
 
 
 def test_logit_bias_row_speculates_and_matches_plain():
@@ -261,6 +436,62 @@ def test_thinking_budget_row_speculates_while_inert():
         assert engine.speculator.cycles > before
 
 
+def _flags(events):
+    return [(e.token, e.forced, e.thinking_truncated, e.finish_reason) for e in events]
+
+
+def test_budget_row_speculates_after_the_forced_close():
+    """A seeded block cut at its budget: the close itself is forced in
+    plain steps (the processor's state changes there), the answer after
+    it speculates although the opener stays masked for its rest - the mask
+    is applied per verify position. Tokens and flags equal the plain run."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=32)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end, nl = unused[:3]
+        limits = ReasoningLimits((start,), (end,), (nl, end), seeded=True, max_tokens=6)
+        req = GenerationRequest(prompt, max_tokens=32, reasoning=limits)
+        truth = list(plain.submit(req))
+    tokens = [e.token for e in truth]
+    assert tokens[5:7] == [nl, end] and len(tokens) == 32
+    oracle = OracleProposer(lambda call: [3, 2, 3, 1][call % 4])
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(tokens)
+        before = engine.speculator.describe()
+        out = list(engine.submit(req))
+        after = engine.speculator.describe()
+    assert _flags(out) == _flags(truth)
+    # Cycles ran in the answer: more than one per plain step would allow.
+    assert after["cycles"] - before["cycles"] >= 4
+    assert after["accepted"] > before["accepted"]
+
+
+def test_budget_that_arms_inside_a_block_is_left_to_plain_steps():
+    """A budget one cycle away from arming holds the row in plain steps for
+    that stretch and speculates again once the close is through: the same
+    transcript as without a proposer, budget counter included."""
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13]
+    with Engine(model) as plain:
+        free = collect(plain.submit(GenerationRequest(prompt, max_tokens=24)))
+        unused = [t for t in range(63, 0, -1) if t not in free]
+        start, end = unused[:2]
+        limits = ReasoningLimits((start,), (end,), (end,), seeded=True, max_tokens=9)
+        req = GenerationRequest(prompt, max_tokens=24, reasoning=limits)
+        truth = list(plain.submit(req))
+    tokens = [e.token for e in truth]
+    assert tokens[9] == end and truth[-1].thinking_truncated
+    oracle = OracleProposer(lambda call: 3)
+    engine = run_speculative(model, oracle)
+    with engine:
+        oracle.start(tokens)
+        out = list(engine.submit(req))
+    assert _flags(out) == _flags(truth)
+
+
 def test_cancel_inside_a_cycle_keeps_the_worker():
     model = tiny_qwen35()
     prompt = [3, 7, 11, 13]
@@ -285,7 +516,7 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
     class Silent:
         kind, depth = "silent", 3
 
-        def propose(self, uid, hidden, token):
+        def propose(self, uid, hidden, token, choose=None):
             return mx.array([], dtype=mx.uint32)
 
         def commit(self, *a):

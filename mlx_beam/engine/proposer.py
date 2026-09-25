@@ -3,13 +3,17 @@
 A proposer is asked for up to `depth` draft tokens after the token the target
 just sampled, given the hidden state that produced it; after the verify it is
 told which drafts held, so a proposer with its own history (the MTP head's KV
-cache) stays in step with the target. Nothing here samples: the target's own
-logits decide every token, the proposer only saves forward passes.
+cache) stays in step with the target. The target's own logits decide every
+committed token, the proposer only saves forward passes: for a greedy row it
+drafts its argmax, for a sampled row it draws through the row's `choose`,
+the same filtered Gumbel-max under the same position key the verify uses -
+the draft then agrees with the target exactly when both argmaxes agree.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -25,10 +29,18 @@ class Proposer(Protocol):
     kind: str
     depth: int
 
-    def propose(self, uid: int, hidden: mx.array, token: mx.array) -> mx.array:
+    def propose(
+        self,
+        uid: int,
+        hidden: mx.array,
+        token: mx.array,
+        choose: Callable[[mx.array, int], mx.array] | None = None,
+    ) -> mx.array:
         """Up to `depth` draft ids (lazy, shape (n,)) following `token` (shape
         (1,)), given the target's hidden state at that position ((1, 1, H)).
-        An empty array means: nothing to draft, decode this step plainly."""
+        `choose(logits, i)` turns the (1, V) logits of draft i into its token
+        ((1,)); None means argmax. An empty array means: nothing to draft,
+        decode this step plainly."""
 
     def commit(self, uid: int, hidden: mx.array, tokens: list[int]) -> None:
         """The verify's outcome: `tokens` are the drafts that held (in order),
@@ -238,7 +250,7 @@ class BundledHeadProposer:
         self._pending: dict[int, tuple[list[mx.array], list[int]]] = {}
         self._chain: dict[int, int] = {}
 
-    def propose(self, uid: int, hidden: mx.array, token: mx.array) -> mx.array:
+    def propose(self, uid, hidden, token, choose=None):
         cache = self._cache.get(uid)
         if cache is None:
             cache = self._cache[uid] = [KVCache()]
@@ -252,8 +264,9 @@ class BundledHeadProposer:
         )
         drafts = []
         out = self.head(h_in, t_in, self._embed, cache)[:, -1:]
-        for _ in range(self.depth):
-            draft = mx.argmax(self._lm_head(out)[:, -1, :], axis=-1)  # (1,)
+        for i in range(self.depth):
+            logits = self._lm_head(out)[:, -1, :]
+            draft = mx.argmax(logits, axis=-1) if choose is None else choose(logits, i)
             drafts.append(draft)
             if len(drafts) == self.depth:
                 break

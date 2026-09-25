@@ -41,7 +41,7 @@ from mlx_beam.engine.request import (
     SamplingParams,
     TokenEvent,
 )
-from mlx_beam.engine.sampling import SamplerPool, is_greedy, top_logprobs
+from mlx_beam.engine.sampling import SamplerPool, SeededSampler, is_greedy, top_logprobs
 from mlx_beam.engine.speculative import (
     SpeculativeGenerationBatch,
     Speculator,
@@ -182,18 +182,18 @@ class Engine:
         # Speculative decoding: a proposer drafts, the verify cycle in
         # SpeculativeGenerationBatch checks. Depth is fixed at this stage;
         # the flag is a cap (measured 2.1x at depth 3 for one row, 19.09.).
-        # uid -> the row is greedy and carries no logits processor beyond a
-        # logit bias and its thinking budget (checked per cycle for inertness).
-        self._spec_rows: dict[int, bool] = {}
-        # uid -> (indices, values) of the row's logit bias, for the verify.
-        self._spec_bias: dict[int, tuple[mx.array, mx.array]] = {}
+        # uid -> None for a greedy row, its SeededSampler for a sampled one:
+        # the verify draws through it and the proposer drafts through it. A
+        # row present here may speculate; its thinking budget, if any, is
+        # checked per cycle.
+        self._spec_coupling: dict[int, SeededSampler | None] = {}
         self.speculator: Speculator | None = None
         if proposer is not None:
             if max_draft_tokens < 1:
                 raise ValueError("max_draft_tokens must be at least 1")
             proposer.depth = min(FIXED_DRAFT_DEPTH, max_draft_tokens)
             self.speculator = Speculator(
-                proposer, proposer.depth, self._may_speculate, self._spec_bias.get
+                proposer, proposer.depth, self._may_speculate, self._spec_coupling.get
             )
             if exact_verify not in ("off", "positions", "kernels"):
                 raise ValueError(
@@ -448,15 +448,15 @@ class Engine:
             self._cancelled.add(request_id)
 
     def _may_speculate(self, uid: int, tokens: int) -> bool:
-        """Whether a cycle of `tokens` may run for the row now: it was admitted
-        greedy without processors, and its thinking budget, if any, cannot
-        act within the cycle - the verify applies no processor, so one that
-        would have forced or masked a token inside the block must not be
+        """Whether a cycle of `tokens` may run for the row now: the row was
+        admitted with a proposer, and its thinking budget, if any, cannot
+        change state within the cycle - the verify runs the processors per
+        position, but a force that would arm inside the block must not be
         skipped over."""
-        if not self._spec_rows.get(uid, False):
+        if uid not in self._spec_coupling:
             return False
         thinking = self._budgets.get(uid)
-        return thinking is None or thinking.inert_for(tokens)
+        return thinking is None or thinking.stable_for(tokens)
 
     def _death_message(self) -> str:
         if self._error is not None:
@@ -542,8 +542,7 @@ class Engine:
         self._bookkeeping.clear()
         self._stride.clear()
         self._budgets.clear()
-        self._spec_rows.clear()
-        self._spec_bias.clear()
+        self._spec_coupling.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -579,6 +578,7 @@ class Engine:
             segments.append(rest[start:])
             stop = StopSequences(req.stop_sequences or None)
             processors = _logits_processors(req.sampling)
+            sampler = self._samplers.get(req.sampling)
             thinking = None
             if req.reasoning is not None:
                 # The tracker always runs, for the flags; it touches the
@@ -593,7 +593,7 @@ class Engine:
                 max_tokens=[stream.completion_cap],
                 caches=[cache],
                 all_tokens=[list(req.tokens[:covered])],
-                samplers=[self._samplers.get(req.sampling)],
+                samplers=[sampler],
                 logits_processors=[processors],
                 stop_sequences=[stop],
             )
@@ -608,21 +608,22 @@ class Engine:
         if thinking is not None:
             self._budgets[uid] = thinking
         if self.speculator is not None:
-            # Greedy, and nothing but a logit bias and the budget touches the
-            # logits: the verify applies the bias itself and skips an inert
-            # budget; a penalty reads the context per step and would need
-            # the per-position replay a later stage brings.
+            # A greedy row is verified by argmax; a sampled one draws under
+            # keys per position, through the seeded sampler it has anyway
+            # or one seeded here - the plain steps of an unseeded row keep
+            # the shared sampler, its draws inside a cycle come from the
+            # engine's own stream, both exact draws from the same
+            # distribution.
             p = req.sampling
-            penalised = any(
-                x
-                for x in (p.repetition_penalty, p.presence_penalty, p.frequency_penalty)
-            )
-            self._spec_rows[uid] = is_greedy(p) and not penalised
-            if p.logit_bias:
-                self._spec_bias[uid] = (
-                    mx.array(list(p.logit_bias.keys())),
-                    mx.array(list(p.logit_bias.values())),
+            if is_greedy(p):
+                coupling = None
+            elif isinstance(sampler, SeededSampler):
+                coupling = sampler
+            else:
+                coupling = SeededSampler(
+                    p, seed=int(mx.random.randint(0, 2**62).item())
                 )
+            self._spec_coupling[uid] = coupling
 
     def _checkpoint(
         self, gen: BatchGenerator, uid: int, position: int, windows: bool = True
@@ -730,8 +731,7 @@ class Engine:
                 traceback.print_exc()
 
     def _forget_row(self, uid: int) -> None:
-        self._spec_rows.pop(uid, None)
-        self._spec_bias.pop(uid, None)
+        self._spec_coupling.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
@@ -753,7 +753,7 @@ class Engine:
                 max_tokens=[self.speculator.depth + 2],
                 caches=[spec_cache],
             )
-            self._spec_rows[uid] = True
+            self._spec_coupling[uid] = None
             cycles = self.speculator.cycles
             while True:
                 _, generated = gen.next()

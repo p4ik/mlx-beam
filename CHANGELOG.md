@@ -56,8 +56,25 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   when it came from there.
 - The site's pages share one navigation; the current page is marked and
   links that leave the site say so.
+- Speculative decoding for sampled requests. The target draws every
+  verify position by Gumbel-max under a key per position, the draft head
+  drafts under the same keys, and a draft is accepted when it equals the
+  target's draw: no residual distribution, no draft probabilities, and
+  the committed token has the target's own distribution whatever was
+  drafted (chi-square over 2048 seeds against a draft that is always
+  wrong; every possible first draft enumerated against the plain
+  transcript). A seeded request gives the same tokens with and without
+  the draft head. Logit bias, repetition, presence and frequency
+  penalties apply per verify position over the context that position
+  would have seen; a thinking budget speculates whenever its state cannot
+  change within the cycle, the opener mask included - only the forced
+  close itself runs in plain steps.
 
 ### Changed
+- A seeded request draws by Gumbel-max under a key derived from the seed
+  and the position of the token, no longer from a key chain advanced per
+  step. Same seed, prompt and settings still give the same tokens; the
+  tokens themselves differ from earlier versions for the same seed.
 - Dead weight out: an unused recurrent snapshot helper, a duplicate of the
   cache-array walk, store statistics fields nothing set, a speculator flag
   nothing read, a test-only wrapper around the boundary finder; the think
