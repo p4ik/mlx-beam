@@ -128,10 +128,21 @@ keyword argument, `input_embeddings`, standing in for `embed_inputs(ids)`
 new too, so the engine's prefill can build the text positions the same
 way); `models/granite.py`, `GraniteModel` and `Model`: `input_embeddings`
 (standing in for `embed_tokens(ids)`, the multiplier still applies) and
-`layer_hook` as on Qwen3.5, for Granite Vision. Upstream's other text
+`layer_hook` as on Qwen3.5, for Granite Vision; `models/granitemoehybrid.py`,
+`GraniteMoeHybridModel` and `Model`: the same two, the Mamba-2 hybrid
+being the text model Granite Vision 4.1 ships with. Upstream's other text
 models took the argument already; Qwen3.5, Mistral 3 and Gemma 4 need
 nothing here. Tests:
 `packages/mlx-beam-vision/tests`.
+
+`granite4_vision` - `models/granite4_vision.py`, ours (no upstream file):
+the text-only view of a Granite Vision 4.1 checkpoint, after upstream's
+`qwen3_vl.py` - `language_model` is `granite` or `granitemoehybrid` by the
+text config, `sanitize` drops the tower and the projectors (the vision
+package loads them itself) and moves the nested `model.language_model`
+up, `make_cache` is the hybrid's. Without it the loader has no class for
+`model_type: granite4_vision` and the CLI cannot load the checkpoint at
+all. Tests: `tests/test_vision_core.py`.
 
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
 two constructor arguments. `generation_batch` is the class built at the move

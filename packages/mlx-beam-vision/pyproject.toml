@@ -30,6 +30,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "mlx[cpu]>=0.32; sys_platform == 'linux'"]
 
+# In the workspace the core is the checkout beside this package, not
+# PyPI's; the wheel's dependency stays the plain name.
+[tool.uv.sources]
+mlx-beam = { workspace = true }
+
 # What mlx-beam looks for: one provider, dispatching by model type.
 [project.entry-points."mlx_beam.modalities"]
 vision = "mlx_beam_vision.provider"

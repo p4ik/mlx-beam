@@ -448,3 +448,89 @@ def test_the_key_carries_the_whole_digest_not_a_slice_of_it():
 def test_the_request_still_rejects_bad_limits(field, value):
     with pytest.raises(ValueError):
         GenerationRequest([1, 2, 3], **{field: value})
+
+
+GRANITE_TEXT = dict(
+    model_type="granite",
+    hidden_size=32,
+    num_hidden_layers=2,
+    intermediate_size=64,
+    num_attention_heads=2,
+    num_key_value_heads=1,
+    rms_norm_eps=1e-5,
+    vocab_size=64,
+    logits_scaling=1.0,
+    attention_multiplier=0.25,
+    embedding_multiplier=2.0,
+    residual_multiplier=0.5,
+    max_position_embeddings=512,
+    attention_bias=False,
+    mlp_bias=False,
+    rope_theta=10000.0,
+)
+
+
+@pytest.mark.parametrize("text_type", ["granite", "granitemoehybrid"])
+def test_a_granite_vision_checkpoint_loads_through_the_model_loader(
+    tmp_path, text_type
+):
+    """`model_type: granite4_vision` has a text-only class in the vendored
+    loader: the language model by the text config's type, the tower's
+    weights dropped, the nested HF layout lifted - the path the CLI takes
+    before a vision provider is asked."""
+    import json
+
+    from mlx.utils import tree_flatten
+
+    from mlx_beam._vendor.mlx_lm.utils import load_model
+    from mlx_beam.engine.priming import image_capabilities
+
+    if text_type == "granite":
+        text = GRANITE_TEXT
+    else:
+        from tests.test_model_classes import CLASSES
+
+        text = CLASSES["granitemoehybrid"]["cfg"]
+    from mlx_beam._vendor.mlx_lm.models import granite, granitemoehybrid
+
+    module = granite if text_type == "granite" else granitemoehybrid
+    mx.random.seed(11)
+    inner = module.Model(module.ModelArgs.from_dict(dict(text)))
+    mx.eval(inner.parameters())
+    config = {
+        "model_type": "granite4_vision",
+        "image_token_index": 62,
+        "text_config": dict(text),
+        "vision_config": {"model_type": "siglip_vision_model", "hidden_size": 8},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    # The HF layout: the language model under model.language_model, the
+    # tower and the projectors beside it, all of which the text view drops.
+    weights = {
+        "model.language_model." + k[len("model.") :] if k.startswith("model.") else k: v
+        for k, v in tree_flatten(inner.parameters())
+    }
+    weights["model.vision_tower.embeddings.weight"] = mx.zeros((4, 8))
+    weights["model.layerwise_projectors.0.weight"] = mx.zeros((4, 8))
+    weights["model.image_newline"] = mx.zeros((32,))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    loaded, cfg = load_model(tmp_path)
+    assert type(loaded).__name__ == "Model" and loaded.model_type == "granite4_vision"
+    assert type(loaded.language_model) is module.Model
+    assert image_capabilities(loaded) == {"input_embeddings": True, "layer_hook": True}
+    x = mx.array([[3, 7, 11, 13]])
+    assert mx.array_equal(loaded(x), inner(x))
+    with Engine(loaded) as engine:
+        span = ImageSpan(
+            1,
+            3,
+            mx.zeros((2, text["hidden_size"])),
+            "c" * 64,
+            {1: mx.ones((2, text["hidden_size"]))},
+        )
+        out = list(
+            engine.submit(
+                GenerationRequest([1, 62, 62, 2, 3], spans=[span], max_tokens=2)
+            )
+        )
+        assert len(out) == 2 and engine.health()["alive"]
