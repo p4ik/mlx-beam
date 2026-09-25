@@ -27,7 +27,9 @@ def shards_for(model_path: Path, prefixes: Iterable[str]) -> dict[str, list[str]
     single = model_path / "model.safetensors"
     if single.is_file():
         return {single.name: []}  # every tensor under the prefix, read below
-    raise FileNotFoundError(f"{model_path} has no safetensors index and no model.safetensors")
+    raise FileNotFoundError(
+        f"{model_path} has no safetensors index and no model.safetensors"
+    )
 
 
 def load_prefixed(model_path: Path, prefixes: Iterable[str]) -> dict[str, mx.array]:

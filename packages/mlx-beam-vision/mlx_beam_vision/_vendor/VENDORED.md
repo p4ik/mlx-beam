@@ -14,6 +14,9 @@ language model is mlx-beam's.
 | Family here | Upstream directory | Serves |
 |---|---|---|
 | `qwen3_vl` | `mlx_vlm/models/qwen3_vl/` (`vision.py`, `config.py`) | Qwen3-VL, Qwen3.5, Qwen3.8 (the same tower; DeepStack features returned alongside) |
+| `pixtral` | `mlx_vlm/models/pixtral/` (`vision.py`, `config.py`) | Mistral 3 (the projector is ours, after upstream's `mistral3.py`) |
+| `gemma4` | `mlx_vlm/models/gemma4/` (`vision.py`, `config.py`) | Gemma 4 (the embedder is ours, after upstream's `gemma4.py`) |
+| `muse_glimmer` | `mlx_vlm/models/muse_glimmer/` (`vision.py`, `config.py`) | Muse Glimmer (adapter and projection ours, after upstream's `muse_glimmer.py`) |
 
 `tools/vendor_diff.py` in the repository root compares these files against
 the wheel (`tools/vendor.toml`, part `mlx-vlm-vision`).

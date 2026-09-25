@@ -12,18 +12,21 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
+from mlx_beam_vision.cache import FeatureCache
+
 from mlx_beam.engine.request import ImageSpan
 from mlx_beam.modalities import Built, Image
-
-from mlx_beam_vision.cache import FeatureCache
 
 logger = logging.getLogger("beam.vision")
 
 
-def _spans_from(ids: list[int], token: int, counts: list[int]) -> list[tuple[int, int]]:
-    """[start, end) of each image's placeholders: the positions holding
-    `token`, in order, dealt out by the images' token counts; each image's
-    positions must be one contiguous run."""
+def _spans_from(
+    ids: list[int], token: int, counts: list[int]
+) -> list[list[tuple[int, int]]]:
+    """Per image, the runs [start, end) of its placeholders: the positions
+    holding `token`, in order, dealt out by the images' token counts. A
+    layout that breaks an image's row with another token (Mistral's
+    `[IMG_BREAK]`) gives an image several runs."""
     positions = [i for i, t in enumerate(ids) if t == token]
     if len(positions) != sum(counts):
         raise ValueError(
@@ -34,10 +37,14 @@ def _spans_from(ids: list[int], token: int, counts: list[int]) -> list[tuple[int
     at = 0
     for n in counts:
         chunk = positions[at : at + n]
-        if chunk and chunk[-1] - chunk[0] + 1 != n:
-            raise ValueError("an image's placeholders are not contiguous")
-        spans.append((chunk[0], chunk[0] + n) if chunk else (0, 0))
         at += n
+        runs = []
+        for pos in chunk:
+            if runs and runs[-1][1] == pos:
+                runs[-1][1] = pos + 1
+            else:
+                runs.append([pos, pos + 1])
+        spans.append([tuple(r) for r in runs])
     return spans
 
 
@@ -80,12 +87,23 @@ class VisionFrontend:
         ids = [int(t) for t in processed["input_ids"][0]]
         encoded = self._encode(images, processed)
         counts = [int(enc.features.shape[0]) for enc in encoded]
-        runs = _spans_from(ids, self._placeholder(), counts)
-        spans = [
-            ImageSpan(start, end, enc.features, image.digest, enc.deepstack)
-            for (start, end), image, enc in zip(runs, images, encoded, strict=True)
-            if end > start
-        ]
+        spans = []
+        for runs, image, enc in zip(
+            _spans_from(ids, self._placeholder(), counts), images, encoded, strict=True
+        ):
+            off = 0
+            for start, end in runs:
+                n = end - start
+                spans.append(
+                    ImageSpan(
+                        start,
+                        end,
+                        enc.features[off : off + n],
+                        image.digest,
+                        tuple(d[off : off + n] for d in enc.deepstack),
+                    )
+                )
+                off += n
         return Built(ids, spans)
 
     def _encode(self, images: Sequence[Image], processed: dict) -> list:
@@ -96,8 +114,7 @@ class VisionFrontend:
         found = [self.cache.get(k) for k in keys]
         missing = [i for i, f in enumerate(found) if f is None]
         if missing:
-            pixel_values, grid = family.pixel_inputs(processed)
-            fresh = self.tower.encode(pixel_values, grid)
+            fresh = self.tower.encode(*family.pixel_inputs(processed))
             if len(fresh) != len(images):
                 raise ValueError("the processor's grids do not match the images")
             for i in missing:
@@ -127,4 +144,6 @@ class VisionFrontend:
 def load_processor(model_path: Path, trust_remote_code: bool = False):
     from transformers import AutoProcessor
 
-    return AutoProcessor.from_pretrained(str(model_path), trust_remote_code=trust_remote_code)
+    return AutoProcessor.from_pretrained(
+        str(model_path), trust_remote_code=trust_remote_code
+    )

@@ -16,6 +16,18 @@ see `mlx_beam_vision/_vendor/VENDORED.md`):
 | Family | Models | Notes |
 |---|---|---|
 | `qwen3_vl` | Qwen3-VL, Qwen3.5, Qwen3.8 | DeepStack applied: the tower's intermediate features are added after the text model's first layers |
+| `mistral3` | Mistral Small 3.x (Pixtral tower) | the image's rows are separate spans (`[IMG_BREAK]` between them) |
+| `gemma4` | Gemma 4 12B, E4B | image only; audio is not served yet |
+| `muse_glimmer` | Muse Glimmer | the projector's norm matches the text model's input norm |
+
+Not yet: Granite Vision 4.1 (AnyRes tiles with a Q-Former downsampler and
+per-layer injection - the family is planned), audio and video input,
+quantized towers (the towers load at model precision; a package that
+ships a quantized tower is refused with a message).
+
+Every family is exercised in the tests on a tiny random tower against a
+direct forward; the real towers and processors are validated on Apple
+silicon with the checkpoints themselves.
 
 `/health.vision` reports the family, the tower, the processor and the
 feature cache (encoder outputs by image digest, bounded in bytes).

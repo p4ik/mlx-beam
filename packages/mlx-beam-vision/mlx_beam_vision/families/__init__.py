@@ -25,4 +25,8 @@ FAMILIES: dict[str, str] = {
     "qwen3_vl_moe": "qwen3_vl",
     "qwen3_5": "qwen3_vl",
     "qwen3_5_moe": "qwen3_vl",
+    "mistral3": "mistral3",
+    "gemma4": "gemma4",
+    "gemma4_unified": "gemma4",
+    "muse_glimmer": "muse_glimmer",
 }

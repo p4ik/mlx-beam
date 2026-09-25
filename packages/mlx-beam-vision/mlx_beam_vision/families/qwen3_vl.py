@@ -13,7 +13,6 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_beam_vision._vendor.mlx_vlm.qwen3_vl.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.qwen3_vl.vision import VisionModel
 from mlx_beam_vision.families import Encoded
@@ -48,7 +47,10 @@ class Tower:
         weights = self.model.sanitize(strip_prefix(raw, prefix))
         if any(k.endswith(".scales") for k in weights):
             raise ValueError("a quantized vision tower is not supported yet")
-        weights = {k: v.astype(self.dtype) if v.dtype != mx.uint32 else v for k, v in weights.items()}
+        weights = {
+            k: v.astype(self.dtype) if v.dtype != mx.uint32 else v
+            for k, v in weights.items()
+        }
         self.model.load_weights(list(weights.items()), strict=True)
         mx.eval(self.model.parameters())
         self.loaded_from = sorted({k.split("/")[0] for k in raw})
@@ -62,7 +64,8 @@ class Tower:
         concatenated with their grids), split back per image."""
         features, deepstack = self.model(pixel_values.astype(self.dtype), grid_thw)
         counts = [
-            int(t * h * w) // self.tokens_per_patch_group for t, h, w in grid_thw.tolist()
+            int(t * h * w) // self.tokens_per_patch_group
+            for t, h, w in grid_thw.tolist()
         ]
         out = []
         start = 0

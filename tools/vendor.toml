@@ -33,6 +33,7 @@ modified = [
   "models/plamo2.py",
   "tool_parsers/qwen3_coder.py",
   "tool_parsers/mistral.py",
+  "models/muse_glimmer.py",
 ]
 
 [parts.optiq]
@@ -74,7 +75,14 @@ sha256 = "d9696bc3a2e961f43b5948a101dc0c966b5989d382e6910c37e2f3d555bc3408"
 version = "0.7.1"
 upstream_subdir = "mlx_vlm"
 dest = "packages/mlx-beam-vision/mlx_beam_vision/_vendor/mlx_vlm"
-local = ["__init__.py", "LICENSE", "qwen3_vl/__init__.py"]
+local = [
+  "__init__.py",
+  "LICENSE",
+  "qwen3_vl/__init__.py",
+  "pixtral/__init__.py",
+  "gemma4/__init__.py",
+  "muse_glimmer/__init__.py",
+]
 # base.py holds two pieces of upstream's models/base.py, nothing else.
 modified = ["base.py"]
 
@@ -82,3 +90,9 @@ modified = ["base.py"]
 "base.py" = "models/base.py"
 "qwen3_vl/vision.py" = "models/qwen3_vl/vision.py"
 "qwen3_vl/config.py" = "models/qwen3_vl/config.py"
+"pixtral/vision.py" = "models/pixtral/vision.py"
+"pixtral/config.py" = "models/pixtral/config.py"
+"gemma4/vision.py" = "models/gemma4/vision.py"
+"gemma4/config.py" = "models/gemma4/config.py"
+"muse_glimmer/vision.py" = "models/muse_glimmer/vision.py"
+"muse_glimmer/config.py" = "models/muse_glimmer/config.py"

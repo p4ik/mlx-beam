@@ -271,3 +271,37 @@ def test_served_reports_the_frontend_and_the_registry_finds_a_provider():
         )
     finally:
         modalities._registered.remove(Provider)
+
+
+def test_a_model_that_norms_its_embeddings_takes_the_features_as_they_are():
+    """Muse norms token embeddings before the first layer (embed_inputs);
+    the prefill builds the text positions the same way and the image
+    features go in untouched - one direct forward says the same."""
+    from tests.test_model_classes import tiny
+
+    model = tiny("muse_glimmer")
+    inner, lm_head, _ = trunk(model)
+    assert hasattr(inner, "embed_inputs")
+    tokens = [3, 7, 11, PAD, PAD, PAD, 5, 9]
+    mx.random.seed(11)
+    feats = mx.random.normal((K, 64))
+    feats = mx.fast.rms_norm(feats, None, 1e-5)
+    span = ImageSpan(3, 6, feats, "ab" * 32)
+    with Engine(model) as engine:
+        out = [
+            e.token
+            for e in engine.submit(
+                GenerationRequest(tokens, max_tokens=5, spans=(span,))
+            )
+        ]
+    cache = make_request_cache(model, KVPolicy())
+    ids = mx.array([tokens])
+    h = inner.embed_inputs(ids)
+    h[0, 3:6, :] = feats
+    logits = lm_head(inner(ids, cache=cache, input_embeddings=h))
+    want = []
+    y = mx.argmax(logits[0, -1])
+    for _ in range(5):
+        want.append(int(y.item()))
+        y = mx.argmax(lm_head(inner(y.reshape(1, 1), cache=cache))[0, -1])
+    assert out == want

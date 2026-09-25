@@ -117,6 +117,14 @@ left out the loop is upstream's. The text model already took
 `input_embeddings` upstream; that is how the image features enter at the
 placeholder positions. Tests: `tests/test_vision_core.py`.
 
+`input embeddings` - `models/muse_glimmer.py`, `MuseGlimmerModel`: one
+keyword argument, `input_embeddings`, standing in for `embed_inputs(ids)`
+(the token embeddings after the model's scaleless RMSNorm; that method is
+new too, so the engine's prefill can build the text positions the same
+way). Upstream's other text models took the argument already; Qwen3.5,
+Mistral 3 and Gemma 4 need nothing here. Tests:
+`packages/mlx-beam-vision/tests`.
+
 `generation batch` - `generate.py`, `BatchGenerator`, `PromptProcessingBatch`:
 two constructor arguments. `generation_batch` is the class built at the move
 to decoding (`PromptProcessingBatch.generate`) and for the empty batch;

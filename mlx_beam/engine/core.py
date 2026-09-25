@@ -330,6 +330,10 @@ class Engine:
 
     def submit(self, request: GenerationRequest) -> ResultStream:
         self._validate(request)
+        for span in request.spans:
+            # Materialised here, on the caller's stream: a graph left lazy
+            # would be evaluated on the worker's stream, which cannot see it.
+            mx.eval(span.features, *span.deepstack)
         stream = ResultStream(request, self._request_cancel)
         stream.completion_cap, stream.reasoning_cap = self.admit(request)
         with self._lock:

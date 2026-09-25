@@ -125,16 +125,19 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   before. `/health.vision` and `capabilities.vision` say what was found.
 - `mlx-beam-vision`, the first package beside the core
   (`packages/mlx-beam-vision`, its own project on PyPI, installed by
-  `mlx-beam[vision]`): the Qwen3-VL tower vendored from mlx-vlm (MIT),
-  which Qwen3.5 and Qwen3.8 carry unchanged, DeepStack included; the
-  checkpoint's own processor through transformers renders the template
-  and expands the placeholders; the tower's tensors come from the
-  checkpoint's index (a package's own vision file included); encoder
-  outputs are cached by image digest, bounded in bytes. The workspace
-  builds and tests both packages, the release ships both wheels at the
-  same version, and import-linter keeps the core from importing the
-  package. Exercised on a tiny tower against a direct forward; the
-  processor and the real towers are a Mac round.
+  `mlx-beam[vision]`): four tower families vendored from mlx-vlm (MIT) -
+  Qwen3-VL (which Qwen3.5 and Qwen3.8 carry unchanged, DeepStack
+  included), Pixtral for Mistral 3 (an image's rows as separate spans),
+  Gemma 4 (image), Muse Glimmer - each with its projector after the
+  reference implementation; the checkpoint's own processor through
+  transformers renders the template and expands the placeholders; the
+  tower's tensors come from the checkpoint's index (a package's own
+  vision file included); encoder outputs are cached by image digest,
+  bounded in bytes. The workspace builds and tests both packages, the
+  release ships both wheels at the same version, and import-linter keeps
+  the core from importing the package. Exercised on tiny towers against a
+  direct forward; the processors and the real towers are a Mac round.
+  Not yet: Granite Vision, audio, video, quantized towers.
 
 ### Changed
 - A seeded request draws by Gumbel-max under a key derived from the seed

@@ -40,7 +40,10 @@ class PrimingPromptBatch(PromptProcessingBatch):
         )
 
     def __init__(self, model, *args, **kwargs):
-        self._inner, _, self._embed = trunk(model)
+        self._inner, _, embed = trunk(model)
+        # What the model's input_embeddings stand in for: its own embedding
+        # of the ids, normed when the model norms them first (Muse).
+        self._embed = getattr(self._inner, "embed_inputs", None) or embed
         self._embeds_kw = _inner_takes(self._inner, "input_embeddings")
         self._hook_kw = _inner_takes(self._inner, "layer_hook")
         super().__init__(model, *args, **kwargs)
@@ -107,7 +110,15 @@ class PrimingPromptBatch(PromptProcessingBatch):
             chunk = tokens[:, :n]
             overlaps = self._overlaps(starts, done, n)
             kwargs = {}
+            ids = chunk
             if overlaps:
+                # With embeddings given the ids feed only what a model reads
+                # per position beside them (Gemma's per-layer inputs); the
+                # image positions read the pad id there, as the reference
+                # implementations do.
+                ids = mx.array(chunk)
+                for i, a, b, _, _ in overlaps:
+                    ids[i, a:b] = 0
                 if not self._embeds_kw:
                     raise ValueError(
                         f"{type(self.model).__name__} takes no input embeddings; "
@@ -122,7 +133,7 @@ class PrimingPromptBatch(PromptProcessingBatch):
                             "frontend's per-layer image features cannot be applied"
                         )
                     kwargs["layer_hook"] = hook
-            hidden = self._inner(chunk, cache=self.prompt_cache, **kwargs)
+            hidden = self._inner(ids, cache=self.prompt_cache, **kwargs)
             mx.eval(hidden, *_cache_arrays(self.prompt_cache))
             if proposer is not None:
                 for i, uid in enumerate(self.uids):
