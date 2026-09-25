@@ -48,6 +48,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   links that leave the site say so.
 
 ### Changed
+- Dead weight out: an unused recurrent snapshot helper, a duplicate of the
+  cache-array walk, store statistics fields nothing set, a speculator flag
+  nothing read, a test-only wrapper around the boundary finder; the think
+  markers of a request are read once instead of up to three times. A fixed
+  request series against the tiny model gives the same bytes before and
+  after (golden transcript), the suite is unchanged.
 - `--prompt-cache-bytes` is the store's own limit: the caches of running
   requests no longer count against it, so a parallel request cannot push a
   stored conversation out. The budget bounds what the store holds, nothing

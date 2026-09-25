@@ -67,7 +67,6 @@ class Speculator:
         self.plain_steps = 0
         self.drafted = 0
         self.accepted = 0
-        self.checked = False
 
     def describe(self) -> dict:
         return {

@@ -355,12 +355,6 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
     return n
 
 
-def prompt_boundaries(tokenizer, req: ChatRequest, prompt: list[int]) -> list[int]:
-    """Prompt positions where a recurrent-state checkpoint pays off: the end
-    of the system block and the end of the last user turns."""
-    return boundaries_and_system_end(tokenizer, req, prompt)[0]
-
-
 def boundaries_and_system_end(
     tokenizer, req: ChatRequest, prompt: list[int]
 ) -> tuple[list[int], int | None]:
@@ -442,7 +436,8 @@ def to_generation_request(
             completion_cap, _ = budget(
                 max_context, len(prompt), req.max_tokens, min_response
             )
-        limits = reasoning_limits(tokenizer, prompt, 0)
+        markers = reasoning_limits(tokenizer, prompt, None)
+        limits = markers
         if limits is not None and limits.seeded and len(limits.close) >= completion_cap:
             raise ApiError(
                 "the prompt opens a think block the template cannot switch off; "
@@ -461,7 +456,7 @@ def to_generation_request(
         top_logprobs=req.top_logprobs if req.logprobs else 0,
         min_response_tokens=min_response,
         max_prompt_tokens=req.max_prompt_tokens,
-        reasoning=reasoning_limits(tokenizer, prompt, limit),
+        reasoning=None if markers is None else replace(markers, max_tokens=limit),
     )
 
 

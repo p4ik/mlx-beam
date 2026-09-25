@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
 
+from mlx_beam._vendor.mlx_lm.generate import _cache_arrays
 from mlx_beam._vendor.mlx_lm.models.cache import (
     ArraysCache,
     BatchRotatingKVCache,
@@ -66,14 +66,6 @@ def restore_window(c: RotatingKVCache, snap: list) -> None:
     )
 
 
-def snapshot_recurrent(cache: list[Any]) -> dict[int, list]:
-    """The recurrent layers' state, copied, keyed by layer index."""
-    return {
-        i: [None if a is None else copy.deepcopy(a) for a in cache[i].cache]
-        for i in recurrent_layers(cache)
-    }
-
-
 def checkpoint_layers(cache: list[Any]) -> list[int]:
     """Layers a boundary checkpoint must capture: recurrent state and
     sliding windows. Full-attention layers trim to any position."""
@@ -87,22 +79,6 @@ def _common_prefix(a: list[int], b: list[int]) -> int:
             break
         n += 1
     return n
-
-
-def cache_arrays(cache: list[Any]) -> list:
-    """Every array a cache list holds, read as storage."""
-    out = []
-    for c in cache:
-        for leaf in getattr(c, "caches", None) or (c,):
-            if leaf is None:
-                continue
-            for v in vars(leaf).values():
-                if v is None or isinstance(v, (int, float, str, bool)):
-                    continue
-                for _, a in tree_flatten(v):
-                    if isinstance(a, mx.array):
-                        out.append(a)
-    return out
 
 
 def compact_kv(cache: list[Any]) -> None:
@@ -159,13 +135,10 @@ class Hit:
 
 @dataclass
 class StoreStats:
-    entries: int = 0
-    nbytes: int = 0
     lookups: int = 0
     hits: int = 0
     tokens_found: int = 0
     tokens_restored: int = 0
-    by_type: dict = field(default_factory=dict)
 
 
 def cut_back(cache: list[Any], entry_len: int, target: int, checkpoints) -> int:
@@ -286,7 +259,7 @@ class PrefixStore:
     ) -> None:
         # extract() hands out lazy slices of the batch buffers; evaluated
         # here they own their bytes and the batch can be released.
-        mx.eval(*cache_arrays(cache))
+        mx.eval(*_cache_arrays(cache))
         entry = Entry(cache, len(tokens), dict(checkpoints or {}), cache_type)
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:

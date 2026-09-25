@@ -747,7 +747,6 @@ class Engine:
                     "the speculative warm-up ran no verify cycle; the proposer "
                     "drafted nothing"
                 )
-            self.speculator.checked = True
         self._last_step = time.monotonic()
 
     def _loop(self) -> None:
