@@ -2,6 +2,7 @@
 messages, tools both ways, blocks in order, the stream's events, the
 error envelope, count_tokens, cache markers at boundaries only."""
 
+import base64
 import json
 
 import pytest
@@ -133,6 +134,9 @@ def test_refusals_are_explicit():
         messages.parse_messages_request({**base, "tool_choice": {"type": "any"}}, "m")
     assert exc.value.code == "unsupported"
     with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request({**base, "messages": [IMAGE_TURN]}, "m")
+    assert exc.value.code == "extra_not_installed"
+    with pytest.raises(ApiError, match="source.type"):
         messages.parse_messages_request(
             {
                 **base,
@@ -141,8 +145,8 @@ def test_refusals_are_explicit():
                 ],
             },
             "m",
+            vision=True,
         )
-    assert exc.value.code == "extra_not_installed"
     with pytest.raises(ApiError):
         messages.parse_messages_request(
             {**base, "messages": [{"role": "system", "content": "x"}]}, "m"
@@ -159,6 +163,56 @@ def test_refusals_are_explicit():
         {**base, "tools": TOOLS, "tool_choice": {"type": "none"}}, "m"
     )
     assert req.chat.tools is None
+
+
+IMAGE_TURN = {
+    "role": "user",
+    "content": [
+        {"type": "text", "text": "w1"},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64.b64encode(b"\x89PNG" * 8).decode(),
+            },
+        },
+        {"type": "text", "text": "w3"},
+    ],
+}
+
+
+def test_image_blocks_reach_the_frontend_like_chat_parts():
+    """An Anthropic image block is the same image the chat path takes: a
+    base64 source decoded with a frontend, the turn's parts kept in block
+    order; a URL source is refused since nothing is fetched. The token
+    count sees the expanded prompt."""
+    from tests.test_vision_core import FakeFrontend
+
+    body = {"max_tokens": 4, "messages": [IMAGE_TURN]}
+    req = messages.parse_messages_request(body, "m", vision=True)
+    assert len(req.chat.images) == 1
+    assert req.chat.images[0].data == b"\x89PNG" * 8
+    assert req.chat.images[0].media_type == "image/png"
+    assert req.chat.messages[-1]["content"] == [
+        {"type": "text", "text": "w1"},
+        {"type": "image"},
+        {"type": "text", "text": "w3"},
+    ]
+    tok = StubTokenizer()
+    front = FakeFrontend(tok)
+    gen = messages.to_generation_request(tok, req, frontend=front)
+    assert len(gen.spans) == 1
+    counted = messages.count_tokens(tok, req, front)
+    assert counted["input_tokens"] == len(gen.tokens)
+    remote = {
+        "role": "user",
+        "content": [{"type": "image", "source": {"type": "url", "url": "https://x/y"}}],
+    }
+    with pytest.raises(ApiError, match="only base64"):
+        messages.parse_messages_request(
+            {"max_tokens": 4, "messages": [remote]}, "m", vision=True
+        )
 
 
 def run(ids, finish="stop", tools=None):
