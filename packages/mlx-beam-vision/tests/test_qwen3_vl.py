@@ -293,6 +293,27 @@ def test_provider_dispatches_by_model_type():
     )
 
 
+def test_a_checkpoint_without_an_image_processor_is_refused_at_load(
+    tmp_path, monkeypatch
+):
+    """AutoProcessor hands a bare tokenizer back for a directory without
+    preprocessor_config.json; that is refused with the reason at load, not
+    with a KeyError on the first image."""
+    import transformers
+    from mlx_beam_vision import frontend
+
+    class Bare:  # a tokenizer: no image_processor
+        pass
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor,
+        "from_pretrained",
+        staticmethod(lambda path, trust_remote_code=False: Bare()),
+    )
+    with pytest.raises(ValueError, match="no image processor"):
+        frontend.load_processor(tmp_path)
+
+
 def test_engine_path_matches_a_direct_forward():
     model = tiny_qwen35()
     front = VisionFrontend(FakeProcessor([(1, 4, 4)]), tower(), "qwen3_vl")

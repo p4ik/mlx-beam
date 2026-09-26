@@ -581,21 +581,30 @@ class Model(nn.Module):
             for l in range(self.args.num_hidden_layers):
                 prefix = f"model.layers.{l}.shared_mlp"
 
-                # Transform shared_mlp weights to standard mlp weights
-                input_weight = weights.pop(f"{prefix}.input_linear.weight")
-                # Split into gate and up projections (each half)
-                gate_proj, up_proj = mx.split(input_weight, 2, axis=0)
-                weights[f"model.layers.{l}.mlp.gate_proj.weight"] = gate_proj
-                weights[f"model.layers.{l}.mlp.up_proj.weight"] = up_proj
+                # Transform shared_mlp weights to standard mlp weights. A
+                # checkpoint quantized under these names (mlx-vlm's
+                # conversions) carries scales and biases beside the weight;
+                # all three split along the output axis the same way. The
+                # two projections are renamed independently: a loader may
+                # quantize one and keep the other at full precision.
+                for suffix in ("weight", "scales", "biases"):
+                    key = f"{prefix}.input_linear.{suffix}"
+                    if key in weights:
+                        # Split into gate and up projections (each half)
+                        gate_proj, up_proj = mx.split(weights.pop(key), 2, axis=0)
+                        weights[f"model.layers.{l}.mlp.gate_proj.{suffix}"] = gate_proj
+                        weights[f"model.layers.{l}.mlp.up_proj.{suffix}"] = up_proj
+                    key = f"{prefix}.output_linear.{suffix}"
+                    if key in weights:
+                        weights[f"model.layers.{l}.mlp.down_proj.{suffix}"] = (
+                            weights.pop(key)
+                        )
 
-                weights[f"model.layers.{l}.mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.output_linear.weight"
-                )
-
-        # Some checkpoints ship a redundant lm_head.weight even though
-        # embeddings are tied and this model never instantiates lm_head.
+        # Some checkpoints ship a redundant lm_head even though embeddings
+        # are tied and this model never instantiates lm_head.
         if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
+            for suffix in ("weight", "scales", "biases"):
+                weights.pop(f"lm_head.{suffix}", None)
 
         return weights
 

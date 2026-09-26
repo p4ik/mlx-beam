@@ -108,6 +108,14 @@ class GenerationRequest:
         for span in self.spans:
             if span.end > len(self.tokens):
                 raise ValueError("an image span reaches past the prompt")
+            if span.end == len(self.tokens):
+                # The last prompt token is fed by the first generation
+                # step, which knows no image features: an image there
+                # would be read as its placeholder's embedding.
+                raise ValueError(
+                    "an image cannot be the last prompt token; the frame "
+                    "of the assistant's turn must follow it"
+                )
 
     @property
     def cache_key(self) -> list[int]:
@@ -195,6 +203,10 @@ class ResultStream:
         """The next token event; None once the stream has ended. Raises
         ``queue.Empty`` when ``timeout`` passes without one (progress updates
         are folded into ``self.progress`` while waiting)."""
+        if self._done:
+            # Ended already: a finishing token leaves no sentinel behind, so
+            # a further read would wait on an empty queue for ever.
+            return None
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             remaining = (

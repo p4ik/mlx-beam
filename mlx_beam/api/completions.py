@@ -128,6 +128,7 @@ class CompletionResponder:
             route_thinking=False,
             tools_enabled=False,
             lead=False,
+            raw=True,
         )
 
     def _envelope(self) -> dict:

@@ -609,9 +609,11 @@ class Engine:
         if self._admitting is not None:
             self._admitting.put(EngineDead(message))
             self._admitting = None
-        for stream in self._live.values():
+        with self._lock:
+            streams = list(self._live.values())
+            self._live.clear()
+        for stream in streams:
             stream.put(EngineDead(message))
-        self._live.clear()
         self._bookkeeping.clear()
         self._stride.clear()
         self._budgets.clear()
@@ -677,7 +679,10 @@ class Engine:
             return
         stream.prompt_cached = covered
         stream.put(PromptProgress(0, len(rest), covered))
-        self._live[uid] = stream
+        # The handler threads count `_live` under the lock (admission,
+        # health); the worker changes it under the same lock.
+        with self._lock:
+            self._live[uid] = stream
         if req.spans:
             self._spans[uid] = tuple(req.spans)
         # Copies of the store's own checkpoint dicts: a sidecar written into
@@ -713,7 +718,8 @@ class Engine:
             except Exception as e:  # noqa: BLE001 - this row's, not the worker's
                 # Admitted a moment ago: take it back before anything runs.
                 gen.remove([uid])
-                self._live.pop(uid, None)
+                with self._lock:
+                    self._live.pop(uid, None)
                 self._bookkeeping.pop(uid, None)
                 self._stride.pop(uid, None)
                 self._budgets.pop(uid, None)
@@ -826,7 +832,8 @@ class Engine:
             partial = {}
             gen.remove(uids)
         for u in uids:
-            stream = self._live.pop(u)
+            with self._lock:
+                stream = self._live.pop(u)
             stream.put(None)
             covered, checkpoints = self._bookkeeping.pop(u, (0, {}))
             self._stride.pop(u, None)
@@ -928,7 +935,8 @@ class Engine:
             "for the narrowest call)"
         )
         gen.remove([uid])
-        stream = self._live.pop(uid, None)
+        with self._lock:
+            stream = self._live.pop(uid, None)
         self._bookkeeping.pop(uid, None)
         self._stride.pop(uid, None)
         self._budgets.pop(uid, None)
@@ -1120,7 +1128,8 @@ class Engine:
                         )
                     )
                     if r.finish_reason is not None:
-                        del self._live[r.uid]
+                        with self._lock:
+                            del self._live[r.uid]
                         self._budgets.pop(r.uid, None)
                         self._observed.pop(r.uid, None)
                         self._forget_row(r.uid)

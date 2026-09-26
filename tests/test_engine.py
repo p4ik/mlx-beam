@@ -72,6 +72,24 @@ def test_prompt_cache_is_reused():
         assert again.prompt_cached >= len(prompt) - 1
 
 
+@pytest.mark.parametrize("ending", ["length", "stop", "cancel"])
+def test_next_event_is_terminal_after_the_end(ending):
+    """None once the stream ended, on every later call too: a finishing
+    token leaves no sentinel in the queue, so the flag has to answer."""
+    import queue
+
+    from mlx_beam.engine.request import ResultStream, TokenEvent
+
+    stream = ResultStream(GenerationRequest([1]), lambda _: None)
+    stream.put(None if ending == "cancel" else TokenEvent(2, -0.1, ending))
+    first = stream.next_event(timeout=0.5)
+    assert (first is None) == (ending == "cancel")
+    try:
+        assert stream.next_event(timeout=0.05) is None
+    except queue.Empty:
+        raise AssertionError("next_event waited on an ended stream") from None
+
+
 def test_cancel_drops_the_request():
     model = tiny_hybrid()
     with Engine(model) as engine:

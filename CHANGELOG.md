@@ -6,6 +6,138 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Added
+- Access control that follows the bind: on loopback nothing is asked; on
+  any other `--host` the server starts only with `--api-key <key>`
+  (`Authorization: Bearer` or `x-api-key`, `/health` and `/metrics`
+  included, 401 otherwise) or `--skip-api-key`, and warns at start that it
+  is reachable. The `Host` header must be `localhost`, the bind address or
+  one of `--allowed-hosts`, else 403 - a browser's DNS rebinding sends
+  another. `/health.api.auth` reports the mode and the hosts.
+
+### Changed
+- CORS admits no origin by default; `--allowed-origins` names the pages
+  that may call the server (was `*`, any page in a browser could read the
+  answers of a server on loopback).
+- Python 3.12 or newer (was 3.11; CI has run on 3.12 and 3.14 since the
+  first release). `transformers` is capped below 6 in both packages and
+  `torch` below 3 in the vision package: a new major of either changes
+  the processors and tokenizers the engine is built on, and a cap makes
+  that a pull request instead of a surprise. Dependabot watches the
+  Actions and both packages weekly and widens a range when a release
+  falls outside it.
+- The mlx-vlm parts are pinned to the commit tagged `v0.7.1` instead of
+  the wheel, so the vendor clock can measure how far upstream moved on
+  those files. `tools/vendor_diff.py --clock` reports the age of each git
+  pin and the upstream commits since it that touched the vendored files;
+  with `--max-days`/`--max-commits` it exits 2 past the limits, and a
+  weekly workflow turns that into one issue.
+- `SECURITY.md`: vulnerabilities through GitHub's private reporting.
+
+### Fixed
+- Muse: the reasoning went into the answer, with `to=self` leaking in
+  front of it. The detokenizer drops the space a sequence starts with, so
+  the frame's opener ` to=` arrived as `to=`; and the vocabulary merges
+  `=self` into one token, so the budget's token form of the opener never
+  matched. The frame now takes the opener without its space, and the
+  opener's token form is read from the encoding of opener plus label.
+- A tool call whose `arguments` are a JSON string (the wire format's own
+  shape, which Granite writes inside its block) was refused as "not an
+  object"; it is decoded first, reported as `arguments decoded`.
+- Harmony and Muse with thinking off and tools declared: the answer's
+  opener was forced into the prompt, which skips the channel or recipient
+  a tool call needs, so the model could only answer in text. With tools on
+  offer the opener stays out and the reasoning budget is set to zero
+  instead, which masks the reasoning label alone: the model may call a
+  tool, not think.
+- A message role outside the format (`system`, `developer`, `user`,
+  `assistant`, `tool`) was handed to the template, which rendered it as
+  a foreign frame or failed; it is refused with 400 naming the roles.
+- `developer` was always rewritten to `system`. A template that knows the
+  role (gpt-oss) now gets it as sent; one that would only write the word
+  into its frame gets `system` - measured once at load,
+  `/health.template.roles.developer`.
+- A connection that failed while the body was read (an aborted socket)
+  raised out of the handler thread after a 500 was written into the
+  fault; it is closed quietly.
+- `HEAD`, `PUT`, `DELETE` and `PATCH` answered 405 with the error type
+  `not_found_error`; now `invalid_request_error` with the code
+  `method_not_allowed`. Responses: `background: true` (a stored response
+  polled later) is refused as unsupported instead of ignored.
+- The engine's table of live requests was read under its lock by the
+  handler threads and written without it by the worker; every change now
+  happens under the lock.
+- A reasoning budget of two or three on a labelled family (Harmony) let
+  the block open and counted four: the gate that keeps a block from
+  opening reckoned the opener as one token, but the header is three
+  (opener, label, label end). The gate counts the whole entry.
+- A stop word inside a tool call dropped the call's text between the last
+  segment and the word; it stays in the cut-off block, which goes back as
+  text or is parsed as the client's parser allows.
+- `ResultStream.next_event()` waited on an ended stream instead of
+  returning `None` again; the ended flag answers first.
+- `top_p` could remove every candidate - in bfloat16 from `top_p 0.001`
+  on, in float32 from `1e-8` - and the draw fell on token 0. The vendored
+  filter sums in float32 and always keeps the most likely token.
+- Text held back inside a think block because it could have begun the
+  end marker (`<`, `</`, `</thi`) was released with the real marker and
+  read as the answer's; and text on either side of a marker within one
+  decoded segment all went to the state after it. The text automaton now
+  reports what it released by the state it was released in, and the
+  assembler routes each part to its own side - reasoning, answer or tool
+  call, a call the block ended in included.
+- `/v1/completions` cut the structural markers of a message frame
+  (`<|start|>assistant`) out of the raw text; the raw endpoint puts every
+  marker back where it was, what the end of the stream flushed included.
+- A reasoning budget of zero (or one used up) masked Harmony's shared
+  `<|channel|>` marker, which the answer's and a tool's channel need as
+  much as the reasoning; the mask now cuts the reasoning label after the
+  marker, so `final` and `commentary` stay open.
+- `mlx-beam-vision` claimed vision for a checkpoint without
+  `preprocessor_config.json` (AutoProcessor hands a bare tokenizer back)
+  and every image request failed with a KeyError; such a checkpoint is
+  refused at load with the reason.
+- A dense Granite checkpoint quantized under the HF names (mlx-vlm's
+  conversions, the Granite Vision 8-bit packs) failed to load: only the
+  weights of `shared_mlp` and `lm_head` were renamed or dropped, their
+  scales and biases stayed behind as "parameters not in model". The two
+  projections are renamed independently, so a checkpoint that quantizes
+  one of them loads too.
+- An emptied generation batch kept the current tokens of its last step,
+  and every batch extended onto it concatenated its own: cleared when the
+  batch empties.
+- Images inside tool results reach the vision frontend: parts in a
+  Responses `function_call_output.output` were serialized to JSON text,
+  image blocks in a Messages `tool_result.content` were refused with 400.
+- An image span ending at the last prompt token is refused before
+  admission: that token is fed by the first generation step, which knows
+  no image features, so the image would have been read as its
+  placeholder's embedding.
+- A streamed chat answer dropped the text released with a tool call's
+  opener (a `<` held back as a possible marker, the rest of the segment
+  the opener sat in), which the whole answer kept; the stream sends it.
+- Harmony's reasoning label with stray whitespace (` analysis`,
+  `analysis `) was shown as reasoning but not counted against the
+  reasoning budget - the budget matched one token form, the routing the
+  text. The budget asks the routing's verdict for the label the model
+  wrote, the mask that keeps a block from forming cuts the label in both
+  forms the vocabulary has, and a header longer than the canonical one
+  has its close forced in the step the label ends - judged against what
+  the budget has left - so the budget holds to the token.
+- `logprobs.content` listed the tokens a think block's end marker
+  released (a held space, the start of a marker that was not one) and
+  the marker itself as the answer's; the booking now follows the text's
+  routing, so the entries describe the content's tokens and nothing else
+  - and with `--reasoning-field none`, or on `/v1/completions`, the
+  block's markers and label the client sees are among them, a marker
+  that ends a message (Harmony's `<|end|>` after the answer) or a
+  channel's header (`<|message|>`) is not.
+- `temperature nan` and `repetition_penalty 0` were accepted as server
+  defaults (flag or `generation_config.json`) and every request that left
+  the field failed with 400; a default is checked as a request is.
+- An API key offered with a non-ASCII character dropped the connection
+  (an exception in the comparison) instead of answering 401.
+
 ## [0.1.0a6] - 2026-09-25
 
 ### Fixed

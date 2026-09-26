@@ -4,12 +4,16 @@
     tools/vendor_diff.py                 diff every part against its pin
     tools/vendor_diff.py --part mlx-lm   one part
     tools/vendor_diff.py --clock         also report how far a git upstream moved
+    tools/vendor_diff.py --clock --max-days 30 --max-commits 20
+                                         exit 2 when a pin is older than that, or
+                                         upstream changed the vendored files that
+                                         often since (the weekly clock job)
 
-A part is pinned to a git commit (repo + commit + include list) or to a PyPI
-wheel (wheel + sha256 + a dest-to-upstream file map). Exit status 1 when a
-file differs that tools/vendor.toml does not list as modified, when a listed
-file is missing or identical, or when the vendored tree carries files that are
-neither upstream's nor listed as local.
+A part is pinned to a git commit (repo + commit, with an include list or a
+dest-to-upstream file map) or to a PyPI wheel (wheel + sha256 + a file map).
+Exit status 1 when a file differs that tools/vendor.toml does not list as
+modified, when a listed file is missing or identical, or when the vendored
+tree carries files that are neither upstream's nor listed as local.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.request
 import zipfile
@@ -68,6 +73,8 @@ def fetch_upstream(part, tmp):
     if "repo" in part:
         checkout(part["repo"], part["commit"], tmp)
         src = Path(tmp) / part["upstream_subdir"]
+        if "files" in part:
+            return {Path(d): src / u for d, u in part["files"].items()}
         return {rel: src / rel for rel in upstream_files(src, part["include"])}
     unpack_wheel(part["wheel"], part["sha256"], tmp)
     src = Path(tmp) / part["upstream_subdir"]
@@ -78,7 +85,27 @@ def pin_label(part):
     return part["commit"][:12] if "repo" in part else f"wheel {part['version']}"
 
 
-def diff_part(name, part, clock):
+def clock(name, part, upstream, tmp):
+    """How far a git upstream moved since the pin: days since the pinned
+    commit, and commits since it that touched the vendored files (the
+    ones that would land in a re-vendoring) - not every commit upstream."""
+    head = git("ls-remote", part["repo"], "HEAD").split()[0]
+    git("fetch", "-q", "--depth", "200", "origin", head, cwd=tmp)
+    pinned_at = int(git("log", "-1", "--format=%ct", part["commit"], cwd=tmp).strip())
+    days = (time.time() - pinned_at) / 86400
+    paths = [str(f.relative_to(tmp)) for f in upstream.values()]
+    touched = git(
+        "rev-list", "--count", f"{part['commit']}..{head}", "--", *paths, cwd=tmp
+    ).strip()
+    print(
+        f"{name}: pin {days:.0f} days old; upstream HEAD {head[:12]}, "
+        f"{touched} commits since the pin touched the vendored files "
+        "(history capped at 200)"
+    )
+    return days, int(touched)
+
+
+def diff_part(name, part, tick, limits):
     dest = ROOT / part["dest"]
     with tempfile.TemporaryDirectory() as tmp:
         upstream = fetch_upstream(part, tmp)
@@ -115,29 +142,40 @@ def diff_part(name, part, clock):
             sys.stdout.writelines(
                 difflib.unified_diff(a, b, f"upstream/{rel}", f"vendored/{rel}", n=2)
             )
-        if clock and "repo" in part:
-            head = git("ls-remote", part["repo"], "HEAD").split()[0]
-            git("fetch", "-q", "--depth", "200", "origin", head, cwd=tmp)
-            behind = git("rev-list", "--count", f"{part['commit']}..{head}", cwd=tmp)
-            print(
-                f"{name}: upstream HEAD {head[:12]}, {behind.strip()} commits "
-                "after the pin (capped at 200)"
-            )
+        stale = False
+        if tick and "repo" in part:
+            days, touched = clock(name, part, upstream, tmp)
+            max_days, max_commits = limits
+            if max_days is not None and days > max_days:
+                print(f"STALE {name}: pin older than {max_days} days")
+                stale = True
+            if max_commits is not None and touched > max_commits:
+                print(
+                    f"STALE {name}: more than {max_commits} upstream commits on the vendored files"
+                )
+                stale = True
         for e in errors:
             print(f"ERROR {name}: {e}")
-        return not errors
+        return not errors, stale
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--part")
     ap.add_argument("--clock", action="store_true")
+    ap.add_argument("--max-days", type=float, help="with --clock: exit 2 past this age")
+    ap.add_argument(
+        "--max-commits", type=int, help="with --clock: exit 2 past this many changes"
+    )
     args = ap.parse_args()
     parts = tomllib.loads(CONFIG.read_text())["parts"]
     if args.part:
         parts = {args.part: parts[args.part]}
-    ok = all([diff_part(n, p, args.clock) for n, p in parts.items()])
-    sys.exit(0 if ok else 1)
+    limits = (args.max_days, args.max_commits)
+    results = [diff_part(n, p, args.clock, limits) for n, p in parts.items()]
+    if not all(ok for ok, _ in results):
+        sys.exit(1)
+    sys.exit(2 if any(stale for _, stale in results) else 0)
 
 
 if __name__ == "__main__":

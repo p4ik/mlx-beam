@@ -195,3 +195,38 @@ def test_a_trickle_of_short_prompts_cannot_starve_a_long_prefill():
     # A newcomer waits at most one call more than without the guard (7).
     delays = [v[1] for v in waited.values() if isinstance(v, tuple)]
     assert delays and max(delays) <= 8, delays
+
+
+def test_an_emptied_batch_keeps_no_current_tokens():
+    """filter([]) leaves the batch empty; extend() must then start from the
+    incoming batch's current tokens instead of concatenating onto the
+    stale ones (a verify cycle takes the next tokens and never replaces
+    the current ones, so an emptied batch would hold them for good)."""
+    import mlx.core as mx
+
+    from mlx_beam._vendor.mlx_lm.generate import GenerationBatch, StopSequences
+
+    def batch(uids, tokens):
+        # A model whose step samples a constant: the constructor runs one.
+        def model(inputs, cache=None):
+            return mx.zeros((inputs.shape[0], 1, 4))
+
+        return GenerationBatch(
+            model=model,
+            uids=list(uids),
+            inputs=mx.array(tokens),
+            prompt_cache=[],
+            tokens=[[] for _ in uids],
+            samplers=[None] * len(uids),
+            fallback_sampler=lambda lp: mx.argmax(lp, axis=-1),
+            logits_processors=[[] for _ in uids],
+            stop_sequences=[StopSequences([]) for _ in uids],
+            max_tokens=[4] * len(uids),
+        )
+
+    a = batch([1, 2], [11, 12])
+    assert a._current_tokens.tolist() == [11, 12]
+    a.filter([])
+    assert a._current_tokens is None and a._current_logprobs == []
+    a.extend(batch([3], [13]))
+    assert a.uids == [3] and a._current_tokens.tolist() == [13]

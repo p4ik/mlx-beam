@@ -8,6 +8,7 @@ which of the four each value came from, for the start banner and /health.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -41,6 +42,8 @@ RANGES = {
     "max_reasoning_tokens": (0, None),
     "min_response_tokens": (0, None),
 }
+# Bounded below without the bound itself (a request refuses a penalty of 0).
+POSITIVE = frozenset({"repetition_penalty"})
 
 # The generation_config.json keys we read, and what they map to.
 GENERATION_CONFIG_KEYS = {
@@ -110,15 +113,25 @@ class RequestDefaults:
             value = values.get(key)
             if value is None:
                 continue
-            bad = isinstance(value, bool) or not isinstance(value, (int, float))
+            # The request parser's rules (chat.py): a finite number in the
+            # range, and a penalty above zero - a default a request could
+            # not ask for would fail every request that leaves the field.
+            bad = (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            )
             if not bad and (
-                (lo is not None and value < lo) or (hi is not None and value > hi)
+                (lo is not None and value < lo)
+                or (hi is not None and value > hi)
+                or (key in POSITIVE and value <= lo)
             ):
                 bad = True
             if bad:
                 raise ValueError(
-                    f"{key} from {sources[key]} is {value!r}; "
-                    f"a request may use {lo} to {hi if hi is not None else 'any'}"
+                    f"{key} from {sources[key]} is {value!r}; a request may use "
+                    f"{'above ' if key in POSITIVE else ''}{lo} to "
+                    f"{hi if hi is not None else 'any'}"
                 )
         out = cls(**{k: values[k] for k in values})
         out.sources = sources
