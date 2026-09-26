@@ -6,6 +6,36 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Fixed
+- Muse: the reasoning went into the answer, with `to=self` leaking in
+  front of it. The detokenizer drops the space a sequence starts with, so
+  the frame's opener ` to=` arrived as `to=`; and the vocabulary merges
+  `=self` into one token, so the budget's token form of the opener never
+  matched. The frame now takes the opener without its space, and the
+  opener's token form is read from the encoding of opener plus label.
+- A tool call whose `arguments` are a JSON string (the wire format's own
+  shape, which Granite writes inside its block) was refused as "not an
+  object"; it is decoded first, reported as `arguments decoded`.
+- Harmony and Muse with thinking off and tools declared: the answer's
+  opener was forced into the prompt, which skips the channel or recipient
+  a tool call needs, so the model could only answer in text. With tools on
+  offer the opener stays out.
+- `mlx-beam-vision` claimed vision for a checkpoint without
+  `preprocessor_config.json` (AutoProcessor hands a bare tokenizer back)
+  and every image request failed with a KeyError; such a checkpoint is
+  refused at load with the reason.
+- A dense Granite checkpoint quantized under the HF names (mlx-vlm's
+  conversions, the Granite Vision 8-bit packs) failed to load: only the
+  weights of `shared_mlp` and `lm_head` were renamed or dropped, their
+  scales and biases stayed behind as "parameters not in model".
+- Images inside tool results reach the vision frontend: parts in a
+  Responses `function_call_output.output` were serialized to JSON text,
+  image blocks in a Messages `tool_result.content` were refused with 400.
+- An image span ending at the last prompt token is refused before
+  admission: that token is fed by the first generation step, which knows
+  no image features, so the image would have been read as its
+  placeholder's embedding.
+
 ## [0.1.0a6] - 2026-09-25
 
 ### Fixed

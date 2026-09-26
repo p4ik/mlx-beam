@@ -79,6 +79,24 @@ def test_values_are_coerced_to_the_declared_type_and_reported():
     ]
 
 
+def test_arguments_as_a_json_string_are_decoded_and_reported():
+    """The wire format's own shape (Granite writes it inside its block): the
+    object is read out of the string; a string that is no object stays
+    what it is and fails the schema like any other."""
+    text = '{"name": "weather", "arguments": "{\\n  \\"city\\": \\"Hamburg\\"\\n}"}'
+    calls, unparsed = parse(text)
+    assert not unparsed
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Hamburg"}
+    assert calls[0]["repair_actions"] == ["arguments decoded"]
+    # Decoded and then coerced: both actions reported, in that order.
+    calls, _ = parse(
+        '{"name": "weather", "arguments": "{\\"city\\": \\"X\\", \\"days\\": \\"2\\"}"}'
+    )
+    assert calls[0]["repair_actions"] == ["arguments decoded", "days: str -> integer"]
+    calls, unparsed = parse('{"name": "weather", "arguments": "Hamburg"}')
+    assert not calls and unparsed
+
+
 def test_what_the_schema_still_rejects_comes_back_as_text():
     before = repair.STATS["failed"]
     # A required key is missing: nothing is invented.

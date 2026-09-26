@@ -180,6 +180,24 @@ drops the tower under either layout (`vision_tower.*` and
 path against a direct forward per text model); the towers themselves in
 `packages/mlx-beam-vision/tests`.
 
+`quantized HF names` - `models/granitemoehybrid.py`, `sanitize`: a dense
+checkpoint quantized under the HF names (mlx-vlm's conversions, the
+Granite Vision 8-bit packs) carries `shared_mlp.input_linear.{scales,biases}`
+and a quantized `lm_head` beside the weights; upstream renames the weight
+alone and the load fails with "parameters not in model". All three
+tensors of a projection are split and renamed, and the head's three are
+dropped under tied embeddings. Upstream's own conversions save under the
+renamed keys already, which is why it never sees this. Tests:
+`tests/test_model_classes.py`
+(`test_a_dense_granite_quantized_under_hf_names_loads`).
+
+`opener token forms` - `tokenizer_utils.py`, `TokenizerWrapper`: the
+reasoning label's token form is read from the encoding of opener plus
+label, not of the label alone; where the vocabulary merges the two
+(Muse: ` to=self` is ` to`, `=self`) the opener's token form becomes the
+pair and no label follows. Tests: `tests/test_families.py`
+(`test_muse_opener_tokens_follow_the_vocabulary`).
+
 `granite4_vision` - `models/granite4_vision.py`, ours (no upstream file):
 the text-only view of a Granite Vision 4.1 checkpoint, after upstream's
 `qwen3_vl.py` - `language_model` is `granite` or `granitemoehybrid` by the

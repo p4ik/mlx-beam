@@ -308,3 +308,48 @@ def test_speculative_verify_matches_plain_greedy(name, mode):
             assert spec["exact"]["fallback"] == "block" and spec["exact"]["reason"]
     else:
         assert spec["mode"] == mode
+
+
+def test_a_dense_granite_quantized_under_hf_names_loads():
+    """A conversion that quantized the checkpoint under the HF names
+    (mlx-vlm's) carries `shared_mlp.input_linear.{weight,scales,biases}`
+    and a redundant quantized `lm_head`; sanitize maps all three tensors
+    of each projection, not only the weight, and drops the head."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    cfg = dict(
+        CLASSES["granitemoehybrid"]["cfg"], num_local_experts=0, intermediate_size=64
+    )
+    mx.random.seed(5)
+    dense = granitemoehybrid.Model(granitemoehybrid.ModelArgs.from_dict(cfg))
+    nn.quantize(dense, group_size=32, bits=8)
+    mx.eval(dense.parameters())
+    x = mx.array([[3, 7, 11, 13]])
+    expected = dense(x)
+    # The same tensors under the HF layout: gate and up stacked into
+    # input_linear, down as output_linear, the embedding also as lm_head.
+    flat = dict(tree_flatten(dense.parameters()))
+    hf = {}
+    for k, v in flat.items():
+        if ".mlp." not in k:
+            hf[k] = v
+    for layer in range(cfg["num_hidden_layers"]):
+        for suffix in ("weight", "scales", "biases"):
+            p = f"model.layers.{layer}.mlp"
+            hf[f"model.layers.{layer}.shared_mlp.input_linear.{suffix}"] = (
+                mx.concatenate(
+                    [flat[f"{p}.gate_proj.{suffix}"], flat[f"{p}.up_proj.{suffix}"]],
+                    axis=0,
+                )
+            )
+            hf[f"model.layers.{layer}.shared_mlp.output_linear.{suffix}"] = flat[
+                f"{p}.down_proj.{suffix}"
+            ]
+    for suffix in ("weight", "scales", "biases"):
+        hf[f"lm_head.{suffix}"] = flat[f"model.embed_tokens.{suffix}"]
+    fresh = granitemoehybrid.Model(granitemoehybrid.ModelArgs.from_dict(cfg))
+    nn.quantize(fresh, group_size=32, bits=8)
+    fresh.load_weights(list(fresh.sanitize(hf).items()), strict=True)
+    mx.eval(fresh.parameters())
+    assert mx.array_equal(fresh(x), expected)

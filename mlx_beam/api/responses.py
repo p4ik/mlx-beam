@@ -145,13 +145,19 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
         elif kind == "function_call_output":
             flush_calls()
             output = item.get("output")
+            if isinstance(output, list):
+                # A tool's result may be parts (text, an image a screenshot
+                # tool took): the same conversion as a message's content,
+                # so the image reaches the frontend instead of the prompt
+                # as serialized base64.
+                output = _content_parts(output, i)
+            elif not isinstance(output, str):
+                output = json.dumps(output)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("call_id"),
-                    "content": (
-                        output if isinstance(output, str) else json.dumps(output)
-                    ),
+                    "content": output,
                 }
             )
         elif kind == "reasoning":

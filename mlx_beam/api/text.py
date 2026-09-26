@@ -193,6 +193,10 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
             textual = not opener.startswith("<")
             if frame:
                 transitions.setdefault("frame", []).append((opener, "label"))
+                if textual and opener != opener.lstrip():
+                    # The detokenizer drops the space a sequence starts
+                    # with: at the frame, ` to=` arrives as `to=`.
+                    transitions["frame"].append((opener.lstrip(), "label"))
             if not (frame and textual):
                 transitions.setdefault("normal", []).append((opener, "label"))
         transitions["label"] = [(tokenizer.think_end, "normal")]
@@ -341,6 +345,16 @@ class ToolCallParser:
                 return None
             args = tc["arguments"]
             own = list(actions)
+            if isinstance(args, str):
+                # The wire format's own shape (arguments as a JSON string),
+                # which Granite writes inside its block: decoded, not refused.
+                try:
+                    decoded = json.loads(args)
+                except ValueError:
+                    decoded = None
+                if isinstance(decoded, dict):
+                    args = decoded
+                    own.append("arguments decoded")
             schema = repair.schema_for(self._tools, tc["name"])
             if schema is None and repair.declared_names(self._tools):
                 # A tool the request never declared: the model's text, not a

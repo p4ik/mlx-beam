@@ -459,9 +459,12 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     if not req.images:
         req.assistant_start = _assistant_start(render, tokens, settled)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
-    if opener and kwargs.get("enable_thinking") is False:
+    if opener and kwargs.get("enable_thinking") is False and not req.tools:
         # A family whose template has no switch (Harmony, Muse): the answer
         # is opened in the prompt, so the model writes it without a block.
+        # Not with tools on offer: a call needs the channel or recipient
+        # the opener would skip past (Harmony's `commentary`, Muse's
+        # ` to=<tool>`), so there the model keeps the choice.
         tokens += list(opener)
     return tokens
 

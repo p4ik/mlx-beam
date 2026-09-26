@@ -4,6 +4,7 @@ The reasoning, the answer and a tool call all sit behind a label - the
 channel or the recipient - and the text assembler routes by what the label
 says. The chat templates are the models' own (tests/fixtures/templates)."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -140,7 +141,47 @@ def test_muse_is_inferred_from_vocab_and_template():
     assert t.tool_call_via_label and t.tool_call_end == "</atem:function_calls>"
     assert t.answer_opener_tokens == tuple(t._tokenizer.encode("<|message|>"))
     assert t.frame_start == "<|start|>assistant"
-    assert t.reasoning_label_tokens == tuple(t._tokenizer.encode("self"))
+    # This vocabulary keeps `to=self` in one token: the opener's token form
+    # is the whole pair, no label follows (see MergingHF below).
+    assert t.think_start_tokens == tuple(t._tokenizer.encode(" to=self"))
+    assert t.reasoning_label_tokens == ()
+
+
+class MergingHF(FakeHF):
+    """A vocabulary that merges the opener's tail into the label, as Muse's
+    does (` to=self` is ` to`, `=self`; ` to=` alone is ` to`, `=`)."""
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        for piece in _split_specials(text, self._specials):
+            if piece in self._vocab:
+                ids.append(self._vocab[piece])
+                continue
+            for word in re.findall(r" to(?==)|=\w+|=|\S+|\s+", piece):
+                ids.append(self._vocab.setdefault(word, len(self._vocab) + 1))
+        return ids
+
+
+def test_muse_opener_tokens_follow_the_vocabulary():
+    """The budget matches tokens: with the label merged into the opener's
+    last token, the opener's token form is the pair and no label follows."""
+    hf = MergingHF(MUSE_SPECIALS, (TEMPLATES / "muse-glimmer-30b.jinja").read_text())
+    assert hf.encode(" to=self") != hf.encode(" to=") + hf.encode("self")
+    t = tu.TokenizerWrapper(hf, tool_parser=atem.parse_tool_call,
+                            tool_call_start=atem.tool_call_start,
+                            tool_call_end=atem.tool_call_end)  # fmt: skip
+    assert t.think_start == " to=" and t.think_start_tokens == tuple(
+        hf.encode(" to=self")
+    )
+    assert t.reasoning_label_tokens == ()
+    # An answer's recipient is not the reasoning's opener.
+    assert (
+        t.rfind_think_start(hf.encode("<|start|>assistant to=user<|message|>x")) == -1
+    )
+    prompt = hf.encode(
+        "<|start|>assistant to=self<|message|>x<|eom|><|start|>assistant"
+    )
+    assert initial_state(t, prompt) == ("frame", "")
 
 
 # -- the stream ---------------------------------------------------------------
@@ -213,6 +254,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_weather",
+            "description": "The weather in a city.",
             "parameters": {
                 "type": "object",
                 "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
@@ -322,6 +364,19 @@ def test_thinking_off_opens_the_answer_in_the_prompt():
             {"messages": [{"role": "user", "content": "hi"}]}, "m"
         )
         assert chat.build_prompt(tok, on)[-len(tail) :] != tail
+        # With tools on offer the opener stays out: a call needs the channel
+        # or recipient it would skip past, so the frame is left to the model.
+        with_tools = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_thinking": False,
+                "tools": TOOLS,
+            },
+            "m",
+        )
+        tokens = chat.build_prompt(tok, with_tools)
+        assert tokens[-len(tail) :] != tail
+        assert initial_state(tok, tokens) == ("frame", "")
 
 
 def test_budget_forces_the_whole_close_sequence():
@@ -395,3 +450,25 @@ def test_a_recipient_marker_inside_the_answer_is_text():
     ]  # fmt: skip
     content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces)
     assert reasoning == "think" and content == "answer to=x"
+
+
+def test_muse_opener_survives_the_trimmed_leading_space():
+    """The detokenizer drops the space a sequence starts with, so the first
+    recipient arrives as `to=self`; it is the frame's opener all the same,
+    and the reasoning goes where it belongs instead of into the answer."""
+    pieces = [
+        "to=", "self", "<|message|>", "plan ", "first", "<|eom|>", "<|start|>",
+        "assistant", " to=", "user", "<|message|>", "Done.",
+    ]  # fmt: skip
+    content, reasoning, calls, asm = run(ScriptTokenizer(MUSE, pieces), pieces)
+    assert reasoning == "plan first" and content == "Done." and not calls
+    # The same for a tool named at the frame without the space.
+    block = (
+        '<atem:function_calls>\n<atem:invoke name="get_weather">\n'
+        '<atem:parameter name="city">Kiel</atem:parameter>\n'
+        "</atem:invoke>\n</atem:function_calls>"
+    )
+    pieces = ["to=", "get_weather", "<|message|>", block[:30], block[30:]]
+    content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces, TOOLS)
+    assert reasoning == "" and content == ""
+    assert calls[0]["function"]["arguments"] == '{"city": "Kiel"}'
