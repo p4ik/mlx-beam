@@ -6,6 +6,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a8] - 2026-09-26
+
 ### Fixed
 - Qwen3, Qwen3-MoE and Qwen3-Next checkpoints with an MRoPE layout
   (`mrope_section` in `rope_scaling`: the Qwen3-VL, Qwen3.5 and Qwen3.8
