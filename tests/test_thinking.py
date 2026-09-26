@@ -497,10 +497,12 @@ def test_a_label_variant_the_api_routes_as_reasoning_is_counted_and_cut(limit):
     is asked for the label the model wrote; the mask that keeps a block
     from forming cuts every label form it was given - a form it does not
     know (the label and a space) begins with one it does. A header longer
-    than the canonical one overshoots by its extra tokens: the token after
-    the label's end is sampled before the arming reaches the logits."""
-    A, A_SPACED, SP, F, MSG = 40, 39, 38, 41, 42
-    reasoning = ((A,), (A_SPACED,), (A, SP))
+    than the canonical one leaves no room for the free token the arming
+    counts on: the close is forced in the same step the label ends, decided
+    in the graph, so the budget holds exactly - unless the header alone
+    exceeds it. A label that goes on into a tool's name forces nothing."""
+    A, A_SPACED, SP, T, F, MSG = 40, 39, 38, 37, 41, 42
+    reasoning = ((A,), (A_SPACED,), (A, SP), (A, SP, SP))
     limits = ReasoningLimits(
         start=(START,),
         end=(END,),
@@ -511,19 +513,29 @@ def test_a_label_variant_the_api_routes_as_reasoning_is_counted_and_cut(limit):
         label_means_reasoning=lambda ids: ids in reasoning,
     )
     body = list(range(10, 26))
-    for label in ((A,), (A_SPACED,), (A, SP)):
+    for label in ((A,), (A_SPACED,), (A, SP), (A, SP, SP)):
         tracker = ThinkingBudget(limits)
-        out = Steps(tracker, [START, *label, MSG, *body]).run(20)
+        steps = Steps(tracker, [START, *label, MSG, *body])
+        out = steps.run(20)
+        header = 2 + len(label)
         if limit == 0:
             assert label[0] not in out and tracker.reasoning_tokens == 0, label
         else:
-            extra = len(label) - 1
-            assert END in out and tracker.reasoning_tokens == limit + extra, label
-            assert tracker.thinking_truncated
-    # A label the API routes elsewhere (the answer's channel) opens nothing.
-    tracker = ThinkingBudget(limits)
-    out = Steps(tracker, [START, F, MSG, *body]).run(20)
-    assert END not in out and tracker.reasoning_tokens == 0
+            assert END in out and tracker.thinking_truncated, label
+            assert tracker.reasoning_tokens == max(limit, header), label
+            # The close sits right where the budget is up: after the free
+            # token, or right after the label's end when the header used
+            # that token up.
+            assert out.index(END) == header + (limit > header), label
+            assert steps.forced[out.index(END)]
+    # A label the API routes elsewhere opens nothing - the answer's channel,
+    # and a tool's name that began like the reasoning label.
+    for label in ((F,), (A, SP, T)):
+        tracker = ThinkingBudget(limits)
+        steps = Steps(tracker, [START, *label, MSG, *body])
+        out = steps.run(20)
+        assert END not in out and tracker.reasoning_tokens == 0, label
+        assert not any(steps.forced)
 
 
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():

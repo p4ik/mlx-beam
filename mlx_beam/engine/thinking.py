@@ -146,6 +146,13 @@ class ThinkingBudget:
         self._end = _Matcher(limits.end)
         self._label_end = _Matcher(limits.label_end)
         self._label: list[int] = []
+        # Set while the label written so far means reasoning and its header
+        # leaves no room for the free token the arming counts on (a form
+        # longer than the canonical one): the step that ends the label
+        # forces the close at once, decided in the graph (observe is a
+        # step behind the logits, the label's end is not known to it yet).
+        self._close_on_end = False
+        self._label_end_ids = mx.array(limits.label_end or (0,), dtype=mx.int32)
         self.reasoning_tokens = 0
         self.thinking_truncated = False
         # Set by observe(): the token just seen came from the force queue.
@@ -209,6 +216,11 @@ class ThinkingBudget:
         shape, vocab = logits.shape, logits.shape[-1]
         if self._block:
             logits = self._mask_opener(context, logits, vocab)
+        if self._close_on_end and self._pos >= len(self._queue):
+            ends = self._ends_label(context)
+            if ends is not None:
+                forced = self._forced(self.limits.close[0], vocab, logits.dtype)
+                logits = mx.broadcast_to(mx.where(ends, forced, logits), shape)
         if self._pos < len(self._queue):
             k = self._pos
             self._pos += 1
@@ -241,6 +253,13 @@ class ThinkingBudget:
                 hot = hot | self._hot(token, vocab)
             self._one_hot[tokens] = hot
         return hot
+
+    def _ends_label(self, context: mx.array):
+        """Lazy: the context ends with the label's end sequence."""
+        n = len(self.limits.label_end)
+        if not n or context.shape[-1] < n:
+            return None
+        return mx.all(context[-n:] == self._label_end_ids)
 
     def _mask_opener(self, context: mx.array, logits: mx.array, vocab: int):
         cut = self._cut
@@ -295,14 +314,25 @@ class ThinkingBudget:
             self._label.append(token)
             if self._label_end.feed(token):
                 label = tuple(self._label[: -len(self.limits.label_end)])
+                fired = self._close_on_end
+                self._close_on_end = False
                 if self._means_reasoning(label):
                     self._state = "reasoning"
                     self.reasoning_tokens += 1 + len(self._label)
+                    if fired:
+                        # This step's logits forced the close's first token:
+                        # armed from here without a free token, the queue
+                        # goes on from its second.
+                        self._arm(free=0)
+                        self._pos = 1
+                        self._closed = mx.array(False)
                     self._gate_opener()
                     self._maybe_arm()
                 else:
                     self._state = "normal"
                 self._label = []
+            else:
+                self._close_on_end = self._header_overruns()
         elif self._start.feed(token):
             if self.limits.labels:
                 self._state = "label"
@@ -314,6 +344,18 @@ class ThinkingBudget:
                 self._maybe_arm()
         if finish_reason == "length" and self._state == "reasoning":
             self.thinking_truncated = True
+
+    def _header_overruns(self) -> bool:
+        """The label so far, were it to end now, means reasoning and costs
+        more than the gate planned for: no free token fits after it."""
+        limit = self.limits.max_tokens
+        if limit is None:
+            return False
+        so_far = tuple(self._label[: len(self._label) - self._label_end.matched])
+        if not so_far or not self._means_reasoning(so_far):
+            return False
+        cost = 1 + len(so_far) + len(self.limits.label_end)
+        return cost > limit - 1 - self._close_counted
 
     def _means_reasoning(self, label: tuple[int, ...]) -> bool:
         verdict = self.limits.label_means_reasoning

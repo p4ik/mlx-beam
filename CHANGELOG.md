@@ -120,8 +120,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `analysis `) was shown as reasoning but not counted against the
   reasoning budget - the budget matched one token form, the routing the
   text. The budget asks the routing's verdict for the label the model
-  wrote, and the mask that keeps a block from forming cuts the label in
-  both forms the vocabulary has.
+  wrote, the mask that keeps a block from forming cuts the label in both
+  forms the vocabulary has, and a header longer than the canonical one
+  has its close forced in the step the label ends, so the budget holds
+  to the token.
 - `temperature nan` and `repetition_penalty 0` were accepted as server
   defaults (flag or `generation_config.json`) and every request that left
   the field failed with 400; a default is checked as a request is.
