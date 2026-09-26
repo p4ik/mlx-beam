@@ -41,6 +41,13 @@ but never its draft head (`mtp/weights.safetensors`) or a tower sidecar
 (`optiq/…`), and `--draft-model bundled` fails on a fresh machine. Tests:
 `tests/test_cli.py`.
 
+`top-p floor` - `sample_utils.py`, `apply_top_p`: the probabilities are
+summed in float32 and the most likely token is always kept. Upstream sums in
+the logits' width and keeps what passes `cumulative > 1 - top_p`: in
+bfloat16 `1 - 0.001` is already 1.0, the sum reaches 1.0, nothing passes
+and the draw falls on token 0 (in float32 the same from top_p 1e-8 on).
+Test: `test_top_p_always_keeps_the_most_likely_token`.
+
 `mask` - `models/cache.py`, `ArraysCache.make_mask`: `lengths` decides before
 `left_padding`. A right-padded prefill sets `lengths`, but `merge()` of fresh
 caches leaves `left_padding = [0] * B` behind, and upstream checks that first:

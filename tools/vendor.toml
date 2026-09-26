@@ -29,6 +29,7 @@ local = [
 # Upstream files we changed on purpose; a diff anywhere else is an error.
 modified = [
   "generate.py",
+  "sample_utils.py",
   "models/base.py",
   "models/cache.py",
   "models/qwen3_5.py",

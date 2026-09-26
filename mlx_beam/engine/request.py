@@ -203,6 +203,10 @@ class ResultStream:
         """The next token event; None once the stream has ended. Raises
         ``queue.Empty`` when ``timeout`` passes without one (progress updates
         are folded into ``self.progress`` while waiting)."""
+        if self._done:
+            # Ended already: a finishing token leaves no sentinel behind, so
+            # a further read would wait on an empty queue for ever.
+            return None
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             remaining = (

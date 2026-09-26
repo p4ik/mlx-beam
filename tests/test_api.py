@@ -957,6 +957,29 @@ def test_a_tool_call_that_does_not_parse_comes_back_as_text():
     assert choice["message"]["content"] == "<tool_call>bad w11 </tool_call>"
 
 
+def test_a_stop_word_inside_a_tool_call_keeps_the_text_before_it():
+    """The call is cut at the stop word and goes back as text; what stood
+    between the last segment and the word is part of it, not lost."""
+    tok = StubTokenizer()
+    tok._words[10] = "search "
+    tok._words[11] = "beforeSTOPafter"
+    asm = TextAssembler(tok, prompt_tokens=[], stop_words=["STOP"], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (TOOL_START, 10, 11)]
+    # The stub's parser reads any text as a call, so the cut block becomes
+    # one; its arguments carry the text up to the stop word.
+    calls = [c for d in deltas for c in d.tool_calls]
+    assert deltas[-1].finish_reason == "tool_calls"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"words": "before"}
+    # With a parser that refuses the cut block, the same text goes back
+    # as content.
+    picky = PickyTokenizer()
+    picky._words[10] = "bad "
+    picky._words[11] = "beforeSTOPafter"
+    asm = TextAssembler(picky, prompt_tokens=[], stop_words=["STOP"], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (TOOL_START, 10, 11)]
+    assert "".join(d.content for d in deltas) == "<tool_call>bad before"
+
+
 def test_valid_calls_survive_next_to_an_invalid_one():
     tok = PickyTokenizer()
     tok._words[20] = "bad "

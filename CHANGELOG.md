@@ -67,6 +67,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - The engine's table of live requests was read under its lock by the
   handler threads and written without it by the worker; every change now
   happens under the lock.
+- A reasoning budget of two or three on a labelled family (Harmony) let
+  the block open and counted four: the gate that keeps a block from
+  opening reckoned the opener as one token, but the header is three
+  (opener, label, label end). The gate counts the whole entry.
+- A stop word inside a tool call dropped the call's text between the last
+  segment and the word; it stays in the cut-off block, which goes back as
+  text or is parsed as the client's parser allows.
+- `ResultStream.next_event()` waited on an ended stream instead of
+  returning `None` again; the ended flag answers first.
+- `top_p` could remove every candidate - in bfloat16 from `top_p 0.001`
+  on, in float32 from `1e-8` - and the draw fell on token 0. The vendored
+  filter sums in float32 and always keeps the most likely token.
 - A reasoning budget of zero (or one used up) masked Harmony's shared
   `<|channel|>` marker, which the answer's and a tool's channel need as
   much as the reasoning; the mask now cuts the reasoning label after the

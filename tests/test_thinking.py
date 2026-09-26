@@ -465,6 +465,30 @@ def test_budget_holds_while_another_prompt_prefills():
         )
 
 
+@pytest.mark.parametrize("limit", range(9))
+def test_a_labelled_block_never_exceeds_a_small_budget(limit):
+    """A labelled opener costs three counted tokens before the first free
+    one (opener, label, label end); the gate that keeps a block from
+    opening must count them, or budgets of two and three overshoot to four."""
+    A, MSG = 40, 42
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, 41, MSG),
+        max_tokens=limit,
+        labels=((A,),),
+        label_end=(MSG,),
+    )
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, A, MSG] + list(range(10, 25))).run(18)
+    assert tracker.reasoning_tokens <= limit
+    if limit < 4:
+        # Header (3) plus one free token do not fit: no block at all.
+        assert A not in out and tracker.reasoning_tokens == 0
+    else:
+        assert tracker.reasoning_tokens == limit and END in out
+
+
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     """Harmony and Muse open the answer and a tool call with the same
     marker as the reasoning block, followed by a label. The budget waits

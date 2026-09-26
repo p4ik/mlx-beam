@@ -537,6 +537,10 @@ class TextAssembler:
                 delta.reasoning = self._after_label(clean) or ""
             elif self._prev != "tool":
                 delta.content = self._take_lead() + clean
+            else:
+                # The call's last text before the stop word: it belongs to
+                # the cut-off block, which goes back as text unrepaired.
+                self._tool_text += clean
             self.stopped = True
             self._book(event, "", bool(delta.content), own=False)
             self._prev = "normal"

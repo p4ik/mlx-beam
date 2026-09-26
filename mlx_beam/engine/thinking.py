@@ -163,6 +163,12 @@ class ThinkingBudget:
         # Lazy scalar: the model began the close itself on the free token.
         self._closed = None
         self._close_counted = close_counted(limits)
+        # What a block costs before its first free token: the opener, and
+        # for a labelled family the label with its end - Harmony's header
+        # is three counted tokens, not one (observe books them together).
+        self._entry = 1
+        if limits.labels:
+            self._entry += len(limits.labels[0]) + len(limits.label_end)
         self._one_hot: dict[int, mx.array] = {}
         # What the mask cuts to keep a block from forming: the opener's last
         # token - or, for a family whose opener is shared by every channel
@@ -362,14 +368,15 @@ class ThinkingBudget:
         self._closing = 0
 
     def _gate_opener(self) -> None:
-        """Another block costs the opener, a free token and the counted part
-        of the close before the force can land: mask the opener as soon as
-        the allowance left cannot hold that. Checked on every counted token,
-        because the mask reaches the logits two tokens later - by the time a
-        block closes it must already be in place."""
+        """Another block costs its entry (opener, label and label end), a
+        free token and the counted part of the close before the force can
+        land: mask the opener as soon as the allowance left cannot hold
+        that. Checked on every counted token, because the mask reaches the
+        logits two tokens later - by the time a block closes it must
+        already be in place."""
         limit = self.limits.max_tokens
         if (
             limit is not None
-            and limit - self.reasoning_tokens < 2 + self._close_counted
+            and limit - self.reasoning_tokens < self._entry + 1 + self._close_counted
         ):
             self._block = True
