@@ -24,8 +24,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `torch` below 3 in the vision package: a new major of either changes
   the processors and tokenizers the engine is built on, and a cap makes
   that a pull request instead of a surprise. Dependabot watches the
-  Actions and both packages weekly and widens a range when a release
-  falls outside it.
+  Actions and both packages weekly and opens a pull request when a
+  release falls outside a range.
 - The mlx-vlm parts are pinned to the commit tagged `v0.7.1` instead of
   the wheel, so the vendor clock can measure how far upstream moved on
   those files. `tools/vendor_diff.py --clock` reports the age of each git

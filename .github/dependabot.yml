@@ -1,7 +1,7 @@
 # Actions and the two Python packages, weekly. Python dependencies carry a
-# major cap in pyproject (`transformers>=5.7,<6`); with `widen` a pull
-# request comes only when a release falls outside such a range, and it
-# widens the range rather than pinning a version.
+# major cap in pyproject (`transformers>=5.7,<6`); with
+# `increase-if-necessary` a pull request comes only when a release falls
+# outside such a range (pip knows no `widen`; Dependabot refused it).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -12,9 +12,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    versioning-strategy: widen
+    versioning-strategy: increase-if-necessary
   - package-ecosystem: pip
     directory: /packages/mlx-beam-vision
     schedule:
       interval: weekly
-    versioning-strategy: widen
+    versioning-strategy: increase-if-necessary
