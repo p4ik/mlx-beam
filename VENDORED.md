@@ -344,6 +344,12 @@ vendored mlx-lm commit and are wired in explicitly - `models/base.py` calls
 the tiled attention, and the engine builds the quantized per-request caches
 itself and hands them to `BatchGenerator.insert`.
 
+For these two files the upstream is, in effect, cut off: optiq publishes no
+source repository, the wheel changes are read release by release (the dates
+above), and the ports have moved onto another cache API. They are carried
+here as our own code from now on - a later optiq release is a source of
+ideas to compare against, not something these files get re-vendored from.
+
 ### Local changes
 
 `kv_batch.py` - `BatchQuantizedKVCache`, `MergeableQuantizedKVCache`: imports
@@ -379,8 +385,11 @@ tiles - fp16 stops resolving the sum past a few thousand tokens. Tests:
 
 ## mlx-vlm
 
-Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, the PyPI wheel
-0.7.1 (`tools/vendor.toml`, part `mlx-vlm`). Two files only,
+Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, at commit
+`1ecf1ecd` - the commit tagged `v0.7.1`, the same files the PyPI wheel 0.7.1
+carries (`tools/vendor.toml`, parts `mlx-vlm` and `mlx-vlm-vision`). A
+commit pin rather than the wheel so the vendor clock can say how far
+upstream moved on exactly these files. Two files only,
 `mlx_beam/_vendor/mlx_vlm/`:
 
 - `quantized_verifier.py` (`models/quantized_verifier.py` upstream): Metal

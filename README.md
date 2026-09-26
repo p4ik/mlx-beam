@@ -41,7 +41,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Multi-token prediction** — The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
 - **Responses and Messages APIs** — Next to chat completions, stateless: OpenAI's Responses shape and Anthropic's Messages shape on the same token path.
-- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned.
+- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned. Nothing in the core talks to the network on its own.
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 
@@ -55,14 +55,16 @@ Existing MLX servers either stop at the basics or grow things that have no place
 |---|---|
 | CLI, packaging, CI | done |
 | Vendored mlx-lm base (pinned; the local changes are listed in `VENDORED.md`) | done |
-| OpenAI-compatible server, continuous batching, quantized KV cache | done, text only |
+| OpenAI-compatible server, continuous batching, quantized KV cache | done |
 | Prefix cache with recurrent-state checkpoints | done, RAM tier |
 | Reasoning budget, request defaults, sampling controls | done |
-| Multi-token prediction | done for one request at a time (greedy); in the batch and under sampling planned |
-| Vision, structured output | planned, as extras |
+| Multi-token prediction | done, greedy or sampled, one request at a time; in the batch planned |
+| Vision | done as the package `mlx-beam-vision`: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite Vision towers |
+| Responses and Messages APIs, `/metrics`, tool-call repair | done |
+| Structured output, GGUF | planned, as extras with a guard |
 | Expert streaming from SSD | planned |
 
-Measured numbers are published as they are measured, with machine, model and date.
+Measured numbers are published as they are measured, with machine, model and date. Mac mini M4 Pro 64 GB, Qwen3.8-27B 5-bit with 8-bit KV, one request, 2026-09-26 (`0.1.0a6`): decode 11.4 tok/s at 12 000 generated tokens; prefill 115 tok/s over a 16 588-token prompt; a short request answered in 2.4 s while that prefill ran; 45 minutes under a steady stream, 5 057 requests, none failed. Speculative acceptance and batch numbers follow when they are measured the same way.
 
 ## Contributing
 

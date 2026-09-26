@@ -19,6 +19,20 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - CORS admits no origin by default; `--allowed-origins` names the pages
   that may call the server (was `*`, any page in a browser could read the
   answers of a server on loopback).
+- Python 3.12 or newer (was 3.11; CI has run on 3.12 and 3.14 since the
+  first release). `transformers` is capped below 6 in both packages and
+  `torch` below 3 in the vision package: a new major of either changes
+  the processors and tokenizers the engine is built on, and a cap makes
+  that a pull request instead of a surprise. Dependabot watches the
+  Actions and both packages weekly and widens a range when a release
+  falls outside it.
+- The mlx-vlm parts are pinned to the commit tagged `v0.7.1` instead of
+  the wheel, so the vendor clock can measure how far upstream moved on
+  those files. `tools/vendor_diff.py --clock` reports the age of each git
+  pin and the upstream commits since it that touched the vendored files;
+  with `--max-days`/`--max-commits` it exits 2 past the limits, and a
+  weekly workflow turns that into one issue.
+- `SECURITY.md`: vulnerabilities through GitHub's private reporting.
 
 ### Fixed
 - Muse: the reasoning went into the answer, with `to=self` leaking in
@@ -50,6 +64,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `not_found_error`; now `invalid_request_error` with the code
   `method_not_allowed`. Responses: `background: true` (a stored response
   polled later) is refused as unsupported instead of ignored.
+- The engine's table of live requests was read under its lock by the
+  handler threads and written without it by the worker; every change now
+  happens under the lock.
 - A reasoning budget of zero (or one used up) masked Harmony's shared
   `<|channel|>` marker, which the answer's and a tool's channel need as
   much as the reasoning; the mask now cuts the reasoning label after the

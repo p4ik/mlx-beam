@@ -42,8 +42,11 @@ list. CI runs the same check.
 
 ## Issues
 
-Use GitHub issues for bugs. Include the machine (chip, memory, macOS), the
-`beam doctor --json` output, the model, and the steps to reproduce.
+Use GitHub issues for bugs and for questions about behaviour. Include the
+machine (chip, memory, macOS), the `beam doctor --json` output, the model,
+and the steps to reproduce. Every issue is read and answered; what is taken
+up gets a note in the issue naming the release that carries it. Security
+problems go through private reporting instead (SECURITY.md).
 
 ## License
 

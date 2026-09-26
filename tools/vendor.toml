@@ -62,9 +62,11 @@ modified = ["kv_batch.py", "fused_quant_sdpa.py"]
 "fused_quant_sdpa.py" = "runtime/fused_quant_sdpa.py"
 
 [parts.mlx-vlm]
-# The exact-verify kernels only; the PyPI wheel is the upstream.
-wheel = "https://files.pythonhosted.org/packages/ae/fc/7fbd894db247582bfa16df9b0b7514a47e9c3971836fc8d3fbd9f6efdbe8/mlx_vlm-0.7.1-py3-none-any.whl"
-sha256 = "d9696bc3a2e961f43b5948a101dc0c966b5989d382e6910c37e2f3d555bc3408"
+# The exact-verify kernels only, at the commit tagged v0.7.1 (the same
+# files the PyPI wheel 0.7.1 carries); a commit pin so the clock can say
+# how far upstream moved.
+repo = "https://github.com/Blaizzy/mlx-vlm"
+commit = "1ecf1ecdd28af102eded679be0daa5c76ab2a068"
 version = "0.7.1"
 upstream_subdir = "mlx_vlm"
 dest = "mlx_beam/_vendor/mlx_vlm"
@@ -78,9 +80,9 @@ modified = ["quantized_verifier.py"]
 "exact_speculative_verify.py" = "models/exact_speculative_verify.py"
 
 [parts.mlx-vlm-vision]
-# The towers of the vision package, from the same wheel.
-wheel = "https://files.pythonhosted.org/packages/ae/fc/7fbd894db247582bfa16df9b0b7514a47e9c3971836fc8d3fbd9f6efdbe8/mlx_vlm-0.7.1-py3-none-any.whl"
-sha256 = "d9696bc3a2e961f43b5948a101dc0c966b5989d382e6910c37e2f3d555bc3408"
+# The towers of the vision package, from the same commit.
+repo = "https://github.com/Blaizzy/mlx-vlm"
+commit = "1ecf1ecdd28af102eded679be0daa5c76ab2a068"
 version = "0.7.1"
 upstream_subdir = "mlx_vlm"
 dest = "packages/mlx-beam-vision/mlx_beam_vision/_vendor/mlx_vlm"
