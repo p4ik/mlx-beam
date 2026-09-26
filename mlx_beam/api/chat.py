@@ -33,6 +33,7 @@ from mlx_beam.api.reasoning import (
     renderer_reasoning_keys,
     translate_effort,
 )
+from mlx_beam.api.roles import check_role, for_template
 from mlx_beam.api.text import (
     TextAssembler,
     TextDelta,
@@ -216,9 +217,9 @@ def _normalise_messages(messages: Any, images: list[Image] | None = None) -> lis
         if not isinstance(m, dict) or "role" not in m:
             raise ApiError(f"messages[{i}] needs a role", param="messages")
         m = dict(m)
-        if m["role"] == "developer":
-            # OpenAI's newer name for the system role; templates know one.
-            m["role"] = "system"
+        # A role outside the format is refused here; how the template takes
+        # `developer` is decided where the prompt is rendered (roles.py).
+        check_role(m["role"], f"messages[{i}]")
         content = m.get("content")
         if isinstance(content, list):
             parts: list[dict] = []
@@ -404,14 +405,16 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             kwargs[effort_kwarg] = value
             req.template_kwargs[effort_kwarg] = value
 
+    messages = for_template(tokenizer, req.messages)
+
     def render(add_generation_prompt=True, **extra):
         if req.images:
-            built = frontend.build(req.messages, req.images, {**kwargs, **extra})
+            built = frontend.build(messages, req.images, {**kwargs, **extra})
             req.spans = list(built.spans)
             req.assistant_start = built.assistant_start
             return built.tokens
         return tokenizer.apply_chat_template(
-            req.messages,
+            messages,
             add_generation_prompt=add_generation_prompt,
             tokenize=True,
             **{**kwargs, **extra},
@@ -503,7 +506,7 @@ def boundaries_and_system_end(
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    messages = req.messages
+    messages = for_template(tokenizer, req.messages)
     ends: set[int] = set()
 
     def render(msgs, generation_prompt):
@@ -568,6 +571,18 @@ def to_generation_request(
         reasoning_cap = max(0, reasoning_cap - close_tail(markers))
     bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
     limit = min(bounded) if bounded else None
+    if (
+        req.tools
+        and req.template_kwargs.get("enable_thinking") is False
+        and getattr(tokenizer, "answer_opener_tokens", None)
+    ):
+        # A family without a template switch (Harmony, Muse), thinking off
+        # with tools on offer: the answer's opener stays out of the prompt
+        # (build_prompt - a call needs the channel it would skip past), so
+        # the block is kept out by the budget instead. Zero masks the
+        # reasoning label behind the shared opener and leaves the answer's
+        # and the tools' channels open: the model may call, not think.
+        limit = 0
     if limit == 0 and getattr(tokenizer, "has_thinking", False):
         # No room to think: ask the template to leave the block out, which
         # a Qwen template does; then check whether it did.

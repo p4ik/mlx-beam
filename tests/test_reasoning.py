@@ -14,6 +14,7 @@ from mlx_beam.api.reasoning import (
     renderer_reasoning_keys,
     translate_effort,
 )
+from mlx_beam.api.roles import developer_rendering
 from tests.stub_tokenizer import StubTokenizer
 
 MSGS = [{"role": "user", "content": "w1"}]
@@ -155,6 +156,7 @@ def test_a_checking_template_gets_the_nearest_rung_it_accepts():
     tok = LevelTokenizer()
     cap = effort_capability(tok)
     assert cap.validates and cap.levels == ("medium", "xhigh")
+    developer_rendering(tok)  # the roles probe renders too, once, at load
     tok.seen.clear()
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")
     chat.build_prompt(tok, req)
@@ -176,6 +178,7 @@ def test_effort_ladder_climbs_only_on_an_effort_rejection():
     # the context, say): the ladder climbs from the translated rung.
     tok = LevelTokenizer()
     effort_capability(tok)
+    developer_rendering(tok)
     tok.accepted = ("xhigh",)
     tok.seen.clear()
     req = chat.parse_chat_request({"messages": MSGS, "reasoning_effort": "low"}, "m")

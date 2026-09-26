@@ -379,6 +379,65 @@ def test_thinking_off_opens_the_answer_in_the_prompt():
         assert initial_state(tok, tokens) == ("frame", "")
 
 
+def test_thinking_off_with_tools_is_a_zero_budget():
+    """Without the opener in the prompt the block is kept out by the
+    budget: zero masks the reasoning label behind the shared opener
+    (Harmony's `analysis`, Muse's `=self`), the answer's and the tools'
+    channels stay open. Without tools the opener does the job and no
+    budget is set."""
+    for tok in (HARMONY, MUSE):
+        req = chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "enable_thinking": False,
+                "tools": TOOLS,
+            },
+            "m",
+        )
+        gen = chat.to_generation_request(tok, req)
+        assert gen.reasoning is not None and gen.reasoning.max_tokens == 0
+        tracker = ThinkingBudget(gen.reasoning)
+        # Harmony: the label after the shared marker; Muse: the opener's own
+        # last token (` to` + `=self`), so ` to=<tool>` stays free.
+        label = tuple(getattr(tok, "reasoning_label_tokens", None) or ())[:1]
+        assert tracker._block and tracker._cut == tuple(tok.think_start_tokens) + label
+        without = chat.parse_chat_request(
+            {"messages": [{"role": "user", "content": "hi"}], "enable_thinking": False},
+            "m",
+        )
+        assert chat.to_generation_request(tok, without).reasoning.max_tokens is None
+
+
+def test_developer_is_rendered_as_the_template_takes_it():
+    """gpt-oss's template names the role and renders it like system: native;
+    a template that writes any role into the frame never saw the word,
+    so the message goes in as system."""
+    from jinja2 import Environment
+
+    from mlx_beam.api import roles
+
+    assert roles.developer_rendering(HARMONY) == "native"
+
+    class Generic:
+        chat_template = (
+            "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+        )
+
+        def apply_chat_template(
+            self, messages, add_generation_prompt=True, tokenize=True, **kw
+        ):
+            text = (
+                Environment().from_string(self.chat_template).render(messages=messages)
+            )
+            return text.split("<|")[1:] if tokenize else text
+
+    generic = Generic()
+    assert roles.developer_rendering(generic) == "as system"
+    dev = [{"role": "developer", "content": "rules"}, {"role": "user", "content": "hi"}]
+    assert roles.for_template(generic, dev)[0]["role"] == "system"
+    assert roles.for_template(HARMONY, dev)[0]["role"] == "developer"
+
+
 def test_budget_forces_the_whole_close_sequence():
     """Harmony closes the analysis channel by opening the final one: six
     tokens the queue forces after the free token, all flagged."""

@@ -19,7 +19,23 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - Harmony and Muse with thinking off and tools declared: the answer's
   opener was forced into the prompt, which skips the channel or recipient
   a tool call needs, so the model could only answer in text. With tools on
-  offer the opener stays out.
+  offer the opener stays out and the reasoning budget is set to zero
+  instead, which masks the reasoning label alone: the model may call a
+  tool, not think.
+- A message role outside the format (`system`, `developer`, `user`,
+  `assistant`, `tool`) was handed to the template, which rendered it as
+  a foreign frame or failed; it is refused with 400 naming the roles.
+- `developer` was always rewritten to `system`. A template that knows the
+  role (gpt-oss) now gets it as sent; one that would only write the word
+  into its frame gets `system` - measured once at load,
+  `/health.template.roles.developer`.
+- A connection that failed while the body was read (an aborted socket)
+  raised out of the handler thread after a 500 was written into the
+  fault; it is closed quietly.
+- `HEAD`, `PUT`, `DELETE` and `PATCH` answered 405 with the error type
+  `not_found_error`; now `invalid_request_error` with the code
+  `method_not_allowed`. Responses: `background: true` (a stored response
+  polled later) is refused as unsupported instead of ignored.
 - A reasoning budget of zero (or one used up) masked Harmony's shared
   `<|channel|>` marker, which the answer's and a tool's channel need as
   much as the reasoning; the mask now cuts the reasoning label after the

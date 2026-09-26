@@ -120,7 +120,9 @@ def items_to_messages(inp: Any, instructions: str | None) -> list[dict]:
                     f"input[{i}] has an unknown role {role!r}", param="input"
                 )
             message = {
-                "role": "system" if role == "developer" else role,
+                # `developer` stays: the template decides how it renders
+                # (chat.build_prompt, roles.for_template).
+                "role": role,
                 "content": _content_parts(item.get("content"), i),
             }
             if role == "assistant" and pending_reasoning:
@@ -222,6 +224,11 @@ def parse_responses_request(
             )
     if body.get("n", 1) not in (None, 1):
         raise unsupported("n > 1", "n")
+    if body.get("background"):
+        # A background response is a stored one polled later: a service.
+        raise unsupported("background: true", "background")
+    # `store` is accepted either way and answered as `store: false` - the
+    # response object says what this server keeps, which is nothing.
     text_format = object_field(object_field(body, "text"), "format", "text").get("type")
     if text_format not in (None, "text"):
         raise missing_extra("text.format", "structured")

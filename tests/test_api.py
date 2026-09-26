@@ -154,6 +154,59 @@ def test_chat_prompt_goes_through_the_template():
     assert (EOS,) in gen.stop_sequences
 
 
+def test_roles_outside_the_format_are_400s():
+    with pytest.raises(ApiError) as e:
+        chat.parse_chat_request(
+            {"messages": [{"role": "moderator", "content": "w1"}]}, "m"
+        )
+    assert "system, developer, user, assistant, tool" in e.value.message
+    with pytest.raises(ApiError):
+        responses.parse_responses_request(
+            {"input": [{"type": "message", "role": "moderator", "content": "w1"}]},
+            "m",
+        )
+
+
+def test_developer_reaches_the_template_the_way_it_takes_it():
+    """The stub's template knows no developer role: the message renders as
+    system, for chat and for responses alike, and the store boundaries
+    see the same prompt."""
+    tok = StubTokenizer()
+    as_dev = chat.parse_chat_request(
+        {
+            "messages": [
+                {"role": "developer", "content": "w1"},
+                {"role": "user", "content": "w2"},
+            ]
+        },
+        "m",
+    )
+    as_sys = chat.parse_chat_request(
+        {
+            "messages": [
+                {"role": "system", "content": "w1"},
+                {"role": "user", "content": "w2"},
+            ]
+        },
+        "m",
+    )
+    assert as_dev.messages[0]["role"] == "developer"
+    dev, sys_ = chat.to_generation_request(tok, as_dev), chat.to_generation_request(
+        tok, as_sys
+    )
+    assert dev.tokens == sys_.tokens == [2, 5, 1, 6, 2, 7]
+    assert dev.system_end == sys_.system_end
+    body = {
+        "input": [
+            {"type": "message", "role": "developer", "content": "w1"},
+            {"type": "message", "role": "user", "content": "w2"},
+        ]
+    }
+    resp = responses.parse_responses_request(body, "m")
+    assert resp.chat.messages[0]["role"] == "developer"
+    assert responses.to_generation_request(tok, resp).tokens == dev.tokens
+
+
 def test_assembler_routes_reasoning_content_and_tool_calls():
     tok = StubTokenizer()
     asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], tools=[{"type": "function"}])

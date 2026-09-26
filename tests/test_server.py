@@ -575,6 +575,45 @@ def test_preflight_allows_the_headers_the_browser_asks_for(server):
     assert resp.getheader("Access-Control-Max-Age") == "600"
 
 
+def test_health_says_how_the_template_takes_developer(server):
+    status, _, raw = call(server, "GET", "/health")
+    assert status == 200
+    assert json.loads(raw)["template"]["roles"]["developer"] == "as system"
+
+
+def test_a_background_response_is_refused_as_a_service(server):
+    status, _, raw = call(
+        server, "POST", "/v1/responses", {"input": "w1", "background": True}
+    )
+    assert status == 400 and json.loads(raw)["error"]["param"] == "background"
+
+
+def test_a_socket_error_while_reading_the_body_closes_the_connection():
+    """A connection that fails under the body read cannot carry an answer:
+    the handler closes it and returns, no 500 written into the fault and
+    no exception out of the handler thread."""
+    import io
+    from http.client import HTTPMessage
+
+    from mlx_beam.server import Handler
+
+    class Broken:
+        def read(self, n):
+            raise ConnectionAbortedError("aborted under the read")
+
+    h = Handler.__new__(Handler)
+    h.served = None
+    h.command, h.path, h.request_version = "POST", "/v1/completions", "HTTP/1.1"
+    h.requestline = "POST /v1/completions HTTP/1.1"
+    h.client_address = ("127.0.0.1", 1)
+    h.headers = HTTPMessage()
+    h.headers["Content-Length"] = "5"
+    h.rfile, h.wfile = Broken(), io.BytesIO()
+    h.close_connection = False
+    h.do_POST()
+    assert h.close_connection and h.wfile.getvalue() == b""
+
+
 def test_bad_bodies_are_400s_and_methods_405(server):
     def raw(method, headers, body=b""):
         conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
@@ -598,7 +637,9 @@ def test_bad_bodies_are_400s_and_methods_405(server):
     assert status == 411
     assert raw("HEAD", {})[0] == 405  # no body on HEAD, by the protocol
     status, data = raw("PUT", {"Content-Length": "0"})
-    assert status == 405 and json.loads(data)["error"]["message"]
+    err = json.loads(data)["error"]
+    assert status == 405 and err["type"] == "invalid_request_error"
+    assert err["code"] == "method_not_allowed"
 
 
 def test_no_keepalive_before_the_first_token_without_worker_progress(monkeypatch):

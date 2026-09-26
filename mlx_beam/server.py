@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from mlx_beam import __version__
-from mlx_beam.api import chat, completions, messages, metrics, repair, responses
+from mlx_beam.api import chat, completions, messages, metrics, repair, responses, roles
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
@@ -179,6 +179,12 @@ class Served:
             h["vision"] = {"refused": self.vision_refused}
         else:
             h["vision"] = None
+        # How the template takes the roles the formats admit, measured
+        # once: `developer` native or rendered as system.
+        h["template"] = {
+            "source": self.chat_template_source,
+            "roles": roles.describe(self.tokenizer),
+        }
         h["api"] = {
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
@@ -306,7 +312,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         self._send_error(
-            ApiError("method not allowed", status=405, type="not_found_error")
+            ApiError(
+                "method not allowed",
+                status=405,
+                type="invalid_request_error",
+                code="method_not_allowed",
+            )
         )
 
     do_PUT = do_DELETE = do_PATCH = do_HEAD
@@ -362,6 +373,13 @@ class Handler(BaseHTTPRequestHandler):
             logger.info("client went away")
         except TimeoutError:
             logger.info("client stalled for %.0fs", SOCKET_TIMEOUT_S)
+            self.close_connection = True
+        except OSError as e:
+            # The socket itself failed (reset while the body was read, a
+            # closed pipe, an aborted connection): nothing can be answered
+            # on it, so the connection is closed rather than a 500 written
+            # into the fault and raised again from the handler thread.
+            logger.info("socket failed: %s", e)
             self.close_connection = True
         except Exception as e:  # noqa: BLE001 - reported, never swallowed
             logger.exception("request failed")
