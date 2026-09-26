@@ -224,6 +224,24 @@ label, not of the label alone; where the vocabulary merges the two
 pair and no label follows. Tests: `tests/test_families.py`
 (`test_muse_opener_tokens_follow_the_vocabulary`).
 
+`multimodal positions` - `models/mrope.py` (ours, no upstream file),
+`models/qwen3_next.py`, `models/qwen3.py`, `models/qwen3_moe.py`
+(`Attention`, the decoder layers and the models), `models/qwen3_5.py`,
+`models/qwen3_vl.py`, `models/qwen3_vl_moe.py` (the wrappers): the text
+models of Qwen's vision families rotate every token with three positions
+(time, height, width; `mrope_section` in the config, interleaved layout),
+which upstream reads for text only through the cache offset. The
+attention takes `position_ids` (3, B, L) and rotates by them
+(`mrope.apply_mrope`, the fast kernel's pairing, so text positions give
+its numbers), or `rope_offset` (B,), the per-row shift the decode
+continues with after a prompt whose images took fewer positions than
+tokens. Neither given: upstream's path. The engine hands them in from
+`GenerationRequest.positions` / `rope_delta`, which the vision frontend
+fills (`families/qwen3_vl.py`, `positions`, the reference's
+`get_rope_index` for images). Tests: `tests/test_mrope.py` (against
+transformers' `Qwen3VLTextRotaryEmbedding` when torch is installed),
+`packages/mlx-beam-vision/tests/test_qwen3_vl.py`.
+
 `granite4_vision` - `models/granite4_vision.py`, ours (no upstream file):
 the text-only view of a Granite Vision 4.1 checkpoint, after upstream's
 `qwen3_vl.py` - `language_model` is `granite` or `granitemoehybrid` by the

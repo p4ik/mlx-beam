@@ -79,6 +79,10 @@ class ChatRequest:
     # spans the frontend built for them (set by build_prompt).
     images: list[Image] = field(default_factory=list)
     spans: list = field(default_factory=list)
+    # The prompt's multimodal positions and decode delta the frontend
+    # built (GenerationRequest.positions); None and 0 for text.
+    positions: Any = None
+    rope_delta: int = 0
 
 
 def _number(body, key, default, lo=None, hi=None, kind=float):
@@ -413,6 +417,8 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             built = frontend.build(messages, req.images, {**kwargs, **extra})
             req.spans = list(built.spans)
             req.assistant_start = built.assistant_start
+            req.positions = built.positions
+            req.rope_delta = built.rope_delta
             return built.tokens
         return tokenizer.apply_chat_template(
             messages,
@@ -618,6 +624,8 @@ def to_generation_request(
         boundaries=bounds,
         system_end=system_end,
         spans=tuple(req.spans),
+        positions=req.positions,
+        rope_delta=req.rope_delta,
         top_logprobs=req.top_logprobs if req.logprobs else 0,
         min_response_tokens=min_response,
         max_prompt_tokens=req.max_prompt_tokens,

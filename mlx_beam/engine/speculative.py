@@ -228,11 +228,16 @@ class SpeculativeGenerationBatch(GenerationBatch):
     engine on a subclass (see `bound`); None decodes plainly everywhere."""
 
     speculator: Speculator | None = None
+    # The row's rope delta (GenerationRequest.rope_delta), 0 for text; the
+    # decode's positions continue where a prompt with images left them.
+    delta_of = staticmethod(lambda uid: 0)
 
     @classmethod
-    def bound(cls, speculator: Speculator) -> type:
+    def bound(cls, speculator: Speculator | None, delta_of=lambda uid: 0) -> type:
         return type(
-            "BoundSpeculativeGenerationBatch", (cls,), {"speculator": speculator}
+            "BoundSpeculativeGenerationBatch",
+            (cls,),
+            {"speculator": speculator, "delta_of": staticmethod(delta_of)},
         )
 
     def __init__(self, model, *args, **kwargs):
@@ -248,7 +253,11 @@ class SpeculativeGenerationBatch(GenerationBatch):
         """(post-norm hidden, logits): the model's two halves called one after
         the other, the head with the model's own logit post-processing
         (`trunk`, held to the model's forward at warm-up by `check_head`)."""
-        hidden = self._inner(inputs, cache=self.prompt_cache)
+        kwargs = {}
+        deltas = [self.delta_of(uid) for uid in self.uids]
+        if any(deltas):
+            kwargs["rope_offset"] = mx.array(deltas, dtype=mx.int32)
+        hidden = self._inner(inputs, cache=self.prompt_cache, **kwargs)
         return hidden, self._lm_head(hidden)
 
     def _step(self):

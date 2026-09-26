@@ -15,7 +15,7 @@ see `mlx_beam_vision/_vendor/VENDORED.md`):
 
 | Family | Models | Notes |
 |---|---|---|
-| `qwen3_vl` | Qwen3-VL, Qwen3.5, Qwen3.8 | DeepStack applied: the tower's intermediate features are added after the text model's first layers |
+| `qwen3_vl` | Qwen3-VL, Qwen3.5, Qwen3.8 | DeepStack applied: the tower's intermediate features are added after the text model's first layers; the text model's multimodal positions (MRoPE: time, height, width per image token) are built from the processor's grids and applied through prefill, cache and decoding |
 | `mistral3` | Mistral Small 3.x (Pixtral tower) | the image's rows are separate spans (`[IMG_BREAK]` between them) |
 | `gemma4` | Gemma 4 E2B, E4B | image only; audio is not served yet. The 12B (`gemma4_unified`, encoder-free, its image tokens attending bidirectionally in the text model) is refused with that reason until the text trunk takes such a mask |
 | `muse_glimmer` | Muse Glimmer | the projector's norm matches the text model's input norm |

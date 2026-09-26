@@ -25,14 +25,15 @@ def _inner_takes(inner, name: str) -> bool:
         return False
 
 
-IMAGE_NEEDS = ("input_embeddings", "layer_hook")
+IMAGE_NEEDS = ("input_embeddings", "layer_hook", "position_ids")
 
 
 def image_capabilities(model) -> dict[str, bool]:
     """What the model's text trunk takes of what an image frontend hands
     the prefill: `input_embeddings` (features in place of the placeholder
-    tokens' embeddings, every frontend) and `layer_hook` (per-layer extras
-    ahead of certain layers, DeepStack). Read from the signature, not the
+    tokens' embeddings, every frontend), `layer_hook` (per-layer extras
+    ahead of certain layers, DeepStack) and `position_ids` (the prompt's
+    multimodal positions, Qwen's MRoPE). Read from the signature, not the
     config: a text model that lacks one cannot serve that frontend, and
     the engine refuses the request before the worker sees it."""
     try:
@@ -49,11 +50,18 @@ class PrimingPromptBatch(PromptProcessingBatch):
     the request's ImageSpans by absolute prompt position."""
 
     spans_of = staticmethod(lambda uid: ())
+    # The request's positions (3, L), or None: see GenerationRequest.positions.
+    positions_of = staticmethod(lambda uid: None)
 
     @classmethod
-    def bound(cls, spans_of) -> type:
+    def bound(cls, spans_of, positions_of=lambda uid: None) -> type:
         return type(
-            "BoundPrimingPromptBatch", (cls,), {"spans_of": staticmethod(spans_of)}
+            "BoundPrimingPromptBatch",
+            (cls,),
+            {
+                "spans_of": staticmethod(spans_of),
+                "positions_of": staticmethod(positions_of),
+            },
         )
 
     def __init__(self, model, *args, **kwargs):
@@ -63,6 +71,7 @@ class PrimingPromptBatch(PromptProcessingBatch):
         self._embed = getattr(self._inner, "embed_inputs", None) or embed
         self._embeds_kw = _inner_takes(self._inner, "input_embeddings")
         self._hook_kw = _inner_takes(self._inner, "layer_hook")
+        self._positions_kw = _inner_takes(self._inner, "position_ids")
         super().__init__(model, *args, **kwargs)
 
     @property
@@ -90,6 +99,23 @@ class PrimingPromptBatch(PromptProcessingBatch):
         for i, a, b, span, off in overlaps:
             h[i, a:b, :] = span.features[off : off + (b - a)].astype(h.dtype)
         return h
+
+    def _positions(self, starts: list[int], done: int, n: int):
+        """The chunk's positions (3, B, n) when a row carries multimodal
+        positions, every other row at its indices; None when no row does."""
+        given = [self.positions_of(uid) for uid in self.uids]
+        if all(g is None for g in given):
+            return None
+        rows = []
+        for i, g in enumerate(given):
+            lo = starts[i] + done
+            if g is None:
+                rows.append(
+                    mx.tile(mx.arange(lo, lo + n, dtype=mx.int32)[None], (3, 1))
+                )
+            else:
+                rows.append(g[:, lo : lo + n].astype(mx.int32))
+        return mx.stack(rows, axis=1)
 
     def _hook(self, overlaps: list[tuple]):
         """What DeepStack adds at the image positions ahead of a layer: the
@@ -122,6 +148,11 @@ class PrimingPromptBatch(PromptProcessingBatch):
             if self._overlaps(starts, 0, max(lengths, default=0)):
                 raise ValueError(
                     "image spans in a prefill call with rows of unequal length"
+                )
+            if any(self.positions_of(uid) is not None for uid in self.uids):
+                raise ValueError(
+                    "multimodal positions in a prefill call with rows of "
+                    "unequal length"
                 )
             return super().prompt(tokens)
         for sti, ti in zip(self.tokens, tokens, strict=True):
@@ -157,6 +188,14 @@ class PrimingPromptBatch(PromptProcessingBatch):
                             "frontend's per-layer image features cannot be applied"
                         )
                     kwargs["layer_hook"] = hook
+            positions = self._positions(starts, done, n)
+            if positions is not None:
+                if not self._positions_kw:
+                    raise ValueError(
+                        f"{type(self.model).__name__} takes no position ids; the "
+                        "frontend's multimodal positions cannot be applied"
+                    )
+                kwargs["position_ids"] = positions
             hidden = self._inner(ids, cache=self.prompt_cache, **kwargs)
             mx.eval(hidden, *_cache_arrays(self.prompt_cache))
             if proposer is not None:

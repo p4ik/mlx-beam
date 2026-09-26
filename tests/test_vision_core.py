@@ -87,12 +87,19 @@ class FakeFrontend:
         return {"provider": "fake", "tower": "none"}
 
 
-def reference(model, tokens, spans, n):
+def reference(model, tokens, spans, n, positions=None):
     """Greedy tokens from a direct forward: embeddings with the spans'
-    features scattered in, the extras added after the first layers."""
+    features scattered in, the extras added after the first layers; with
+    `positions` (3, L), the prompt rotated by them and the decode
+    continuing from their largest value plus one."""
     inner, lm_head, embed = trunk(model)
     cache = make_request_cache(model, KVPolicy())
     ids = mx.array([tokens])
+    kwargs = {}
+    next_pos = None
+    if positions is not None:
+        kwargs["position_ids"] = mx.array(positions)[:, None, :]
+        next_pos = int(mx.array(positions).max().item()) + 1
     h = embed(ids)
     for s in spans:
         h[0, s.start : s.end, :] = s.features.astype(h.dtype)
@@ -106,12 +113,18 @@ def reference(model, tokens, spans, n):
                 )
         return x
 
-    out = lm_head(inner(ids, cache=cache, input_embeddings=h, layer_hook=hook))
+    out = lm_head(
+        inner(ids, cache=cache, input_embeddings=h, layer_hook=hook, **kwargs)
+    )
     result = []
     y = mx.argmax(out[0, -1])
     for _ in range(n):
         result.append(int(y.item()))
-        out = lm_head(inner(y.reshape(1, 1), cache=cache))
+        step = {}
+        if next_pos is not None:
+            step["position_ids"] = mx.full((3, 1, 1), next_pos, dtype=mx.int32)
+            next_pos += 1
+        out = lm_head(inner(y.reshape(1, 1), cache=cache, **step))
         y = mx.argmax(out[0, -1])
     return result
 
@@ -335,6 +348,7 @@ def test_a_frontend_the_text_model_cannot_serve_is_refused_at_load():
         assert engine.image_capabilities == {
             "input_embeddings": True,
             "layer_hook": False,
+            "position_ids": False,
         }
         span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32))})
         with pytest.raises(InvalidRequest, match="layer hook"):
@@ -377,6 +391,7 @@ def test_qwen3_vl_wrapper_takes_deepstack_extras():
         assert engine.image_capabilities == {
             "input_embeddings": True,
             "layer_hook": True,
+            "position_ids": True,
         }
         span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32)) * 0.1})
         out = list(
@@ -532,7 +547,11 @@ def test_a_granite_vision_checkpoint_loads_through_the_model_loader(
     loaded, cfg = load_model(tmp_path)
     assert type(loaded).__name__ == "Model" and loaded.model_type == "granite4_vision"
     assert type(loaded.language_model) is module.Model
-    assert image_capabilities(loaded) == {"input_embeddings": True, "layer_hook": True}
+    assert image_capabilities(loaded) == {
+        "input_embeddings": True,
+        "layer_hook": True,
+        "position_ids": False,
+    }
     x = mx.array([[3, 7, 11, 13]])
     assert mx.array_equal(loaded(x), inner(x))
     with Engine(loaded) as engine:

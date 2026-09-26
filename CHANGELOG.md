@@ -35,6 +35,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `SECURITY.md`: vulnerabilities through GitHub's private reporting.
 
 ### Fixed
+- Qwen3-VL, Qwen3.5 and Qwen3.8 rotated image tokens with one position per
+  token; these text models rotate with three (time, height, width - MRoPE,
+  `mrope_section` in their configs) and continue the text after an image
+  from the block's largest position, fewer than its token count. The
+  vision frontend now builds the prompt's positions as the reference's
+  `get_rope_index` does, the engine carries them through prefill chunks,
+  the prefix store, decoding and the speculative verify, and the vendored
+  text models apply them; text prompts take the fast path as before.
+  `/health.vision.positions` says `mrope`. Verified against transformers'
+  rotary embedding on image positions.
 - Muse: the reasoning went into the answer, with `to=self` leaking in
   front of it. The detokenizer drops the space a sequence starts with, so
   the frame's opener ` to=` arrived as `to=`; and the vocabulary merges

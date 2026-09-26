@@ -94,6 +94,13 @@ class GenerationRequest:
     # Images in the prompt, by position; the prefill takes their features
     # in place of the placeholder tokens' embeddings.
     spans: Sequence[ImageSpan] = ()
+    # The prompt's positions for a text model that rotates with several
+    # axes (Qwen's MRoPE): shape (3, len(tokens)), time, height and width
+    # per token. None: every token at its index, as for text. With them
+    # the tokens after the prompt continue from the largest position plus
+    # one, which `rope_delta` (that minus the token count) shifts them by.
+    positions: Any = None
+    rope_delta: int = 0
     request_id: str = field(default_factory=lambda: f"req_{uuid.uuid4().hex[:16]}")
 
     def __post_init__(self):
@@ -105,6 +112,12 @@ class GenerationRequest:
             raise ValueError("top_logprobs must not be negative")
         if self.min_response_tokens < 0:
             raise ValueError("min_response_tokens must not be negative")
+        if self.positions is not None:
+            shape = tuple(getattr(self.positions, "shape", ()))
+            if shape != (3, len(self.tokens)):
+                raise ValueError(
+                    f"positions must have shape (3, {len(self.tokens)}), got {shape}"
+                )
         for span in self.spans:
             if span.end > len(self.tokens):
                 raise ValueError("an image span reaches past the prompt")
