@@ -105,9 +105,12 @@ class VisionFrontend:
         """What the prefill must take of the text model for this tower's
         spans: the features at the placeholder positions always, the
         per-layer extras when the family adds them (DeepStack)."""
+        out = ["input_embeddings"]
         if getattr(self.tower, "per_layer", False):
-            return ("input_embeddings", "layer_hook")
-        return ("input_embeddings",)
+            out.append("layer_hook")
+        if hasattr(families.module_for(self.family), "positions"):
+            out.append("position_ids")
+        return tuple(out)
 
     def _text_kwargs(self, text: str) -> dict:
         # The rendered template already carries the BOS the tokenizer would
@@ -135,6 +138,15 @@ class VisionFrontend:
         ids = [int(t) for t in processed["input_ids"][0]]
         encoded = self._encode(images, processed)
         counts = [int(enc.features.shape[0]) for enc in encoded]
+        family = families.module_for(self.family)
+        positions, delta = None, 0
+        if hasattr(family, "positions"):
+            positions, delta = family.positions(
+                ids,
+                self.tower.image_token_id,
+                processed.get("image_grid_thw", []),
+                self.tower.config.spatial_merge_size,
+            )
         spans = []
         for runs, image, enc in zip(
             _spans_from(ids, self.tower.image_token_id, counts),
@@ -155,7 +167,13 @@ class VisionFrontend:
                     )
                 )
                 off += n
-        return Built(ids, spans, self._assistant_start(messages, kwargs, text, ids))
+        return Built(
+            ids,
+            spans,
+            self._assistant_start(messages, kwargs, text, ids),
+            positions=positions,
+            rope_delta=delta,
+        )
 
     def _assistant_start(self, messages, kwargs: dict, text, ids: list[int]) -> int:
         """Where the generation prompt begins in `ids`: the template
@@ -223,6 +241,9 @@ class VisionFrontend:
             "chat_template": (
                 "server" if self.chat_template is not None else "processor"
             ),
+            # How the text model places image tokens: three axes (Qwen's
+            # MRoPE, the frontend hands the positions in) or one per token.
+            "positions": "mrope" if "position_ids" in self.needs else "sequential",
             "feature_cache": self.cache.describe(),
             "images_encoded": self.images_encoded,
         }

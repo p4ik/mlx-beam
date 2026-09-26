@@ -19,6 +19,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .mrope import interleaved_selector, mrope_section_of, rotate
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -117,12 +118,22 @@ class Qwen3NextAttention(nn.Module):
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
+        # The interleaved MRoPE layout of the vision families (Qwen3.5/3.8),
+        # for prompts with images; VENDORED.md, multimodal positions.
+        section = mrope_section_of(args.rope_scaling)
+        self.mrope_selector = (
+            interleaved_selector(section, self.rope.dims // 2)
+            if section and isinstance(self.rope, nn.RoPE)
+            else None
+        )
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -142,13 +153,14 @@ class Qwen3NextAttention(nn.Module):
             0, 2, 1, 3
         )
 
+        queries = rotate(
+            self.rope, queries, cache, position_ids, rope_offset, self.mrope_selector
+        )
+        keys = rotate(
+            self.rope, keys, cache, position_ids, rope_offset, self.mrope_selector
+        )
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

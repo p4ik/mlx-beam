@@ -193,6 +193,9 @@ class Engine:
         self._spec_coupling: dict[int, SeededSampler | None] = {}
         # uid -> the request's image spans, read by the prefill.
         self._spans: dict[int, tuple] = {}
+        # The prompt's multimodal positions and rope delta per live row
+        # (GenerationRequest.positions); text rows have no entry.
+        self._positions: dict[int, tuple] = {}
         # What the trunk takes of an image request; checked at submit so a
         # frontend the model cannot serve is a 400, not a dead worker.
         self.image_capabilities = image_capabilities(model)
@@ -459,6 +462,14 @@ class Engine:
                     "this model has no layer hook; the frontend's per-layer "
                     "image features cannot be applied"
                 )
+        if (
+            request.positions is not None
+            and not self.image_capabilities["position_ids"]
+        ):
+            raise InvalidRequest(
+                "this model takes no position ids; the frontend's multimodal "
+                "positions cannot be applied"
+            )
         p = request.sampling
         # These raise inside the sampler, i.e. inside the worker.
         if not 0.0 <= p.xtc_probability <= 1.0 or not 0.0 <= p.xtc_threshold <= 0.5:
@@ -510,7 +521,10 @@ class Engine:
             trunk(self.model)
         except ValueError:
             return None
-        return PrimingPromptBatch.bound(lambda uid: self._spans.get(uid, ()))
+        return PrimingPromptBatch.bound(
+            lambda uid: self._spans.get(uid, ()),
+            lambda uid: self._positions.get(uid, (None, 0))[0],
+        )
 
     def _may_speculate(self, uid: int, tokens: int) -> bool:
         """Whether a cycle of `tokens` may run for the row now: the row was
@@ -620,6 +634,7 @@ class Engine:
         self._observed.clear()
         self._spec_coupling.clear()
         self._spans.clear()
+        self._positions.clear()
         while True:
             try:
                 stream = self._inbox.get_nowait()
@@ -685,6 +700,8 @@ class Engine:
             self._live[uid] = stream
         if req.spans:
             self._spans[uid] = tuple(req.spans)
+        if req.positions is not None:
+            self._positions[uid] = (mx.array(req.positions), req.rope_delta)
         # Copies of the store's own checkpoint dicts: a sidecar written into
         # a row's checkpoints must never land in the entry it came from.
         self._bookkeeping[uid] = (covered, {p: dict(c) for p, c in carried.items()})
@@ -951,6 +968,7 @@ class Engine:
     def _forget_row(self, uid: int) -> None:
         self._spec_coupling.pop(uid, None)
         self._spans.pop(uid, None)
+        self._positions.pop(uid, None)
         if self.speculator is not None:
             self.speculator.proposer.drop(uid)
 
@@ -963,10 +981,13 @@ class Engine:
                 break
         self._forget_row(uid)
         self._applied_caches = describe_caches(cache)
-        if self.speculator is not None:
+        if self.speculator is not None or self.image_capabilities["position_ids"]:
             # The trunk's head must give the model's own logits: a family
             # whose post-processing it does not compose is refused here.
+            # A positioned family decodes under the same batch class even
+            # without a proposer (its rows carry the rope delta).
             check_head(self.model, list(self.warmup_tokens))
+        if self.speculator is not None:
             # One verify cycle through the model with the configured KV
             # layout: a head or a cache layer the path cannot carry fails
             # here, not on the first client request.
@@ -1023,8 +1044,10 @@ class Engine:
 
     def _loop(self) -> None:
         batch_class = (
-            SpeculativeGenerationBatch.bound(self.speculator)
-            if self.speculator is not None
+            SpeculativeGenerationBatch.bound(
+                self.speculator, lambda uid: self._positions.get(uid, (None, 0))[1]
+            )
+            if self.speculator is not None or self.image_capabilities["position_ids"]
             else None
         )
         gen = BatchGenerator(

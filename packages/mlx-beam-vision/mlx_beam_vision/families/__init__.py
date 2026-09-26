@@ -59,9 +59,14 @@ def needs(family: str, config: dict) -> tuple[str, ...]:
     """What the family's tower asks of the prefill for this checkpoint,
     read from the config alone: the features at the placeholder positions
     always, the per-layer extras when it adds them (DeepStack)."""
-    if module_for(family).per_layer(config):
-        return ("input_embeddings", "layer_hook")
-    return ("input_embeddings",)
+    module = module_for(family)
+    out = ["input_embeddings"]
+    if module.per_layer(config):
+        out.append("layer_hook")
+    if hasattr(module, "positions"):
+        # The family's text model rotates with several position axes.
+        out.append("position_ids")
+    return tuple(out)
 
 
 ROOTS = ("model.", "")

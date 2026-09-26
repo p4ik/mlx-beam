@@ -53,6 +53,12 @@ class Built:
     tokens: list[int]
     spans: list[ImageSpan] = field(default_factory=list)
     assistant_start: int = 0
+    # For a text model rotating with several position axes (Qwen's MRoPE):
+    # the prompt's positions (3, len(tokens)) and the shift the decode
+    # continues with (GenerationRequest.positions, rope_delta); None and 0
+    # for a family whose text model reads one position per token.
+    positions: Any = None
+    rope_delta: int = 0
 
 
 class Frontend(Protocol):
