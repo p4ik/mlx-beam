@@ -121,7 +121,7 @@ class Qwen3NextAttention(nn.Module):
         # The interleaved MRoPE layout of the vision families (Qwen3.5/3.8),
         # for prompts with images; VENDORED.md, multimodal positions.
         section = mrope_section_of(args.rope_scaling)
-        self.mrope_selector = (
+        self._mrope_selector = (
             interleaved_selector(section, self.rope.dims // 2)
             if section and isinstance(self.rope, nn.RoPE)
             else None
@@ -154,10 +154,10 @@ class Qwen3NextAttention(nn.Module):
         )
 
         queries = rotate(
-            self.rope, queries, cache, position_ids, rope_offset, self.mrope_selector
+            self.rope, queries, cache, position_ids, rope_offset, self._mrope_selector
         )
         keys = rotate(
-            self.rope, keys, cache, position_ids, rope_offset, self.mrope_selector
+            self.rope, keys, cache, position_ids, rope_offset, self._mrope_selector
         )
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)

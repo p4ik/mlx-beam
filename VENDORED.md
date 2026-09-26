@@ -238,7 +238,10 @@ continues with after a prompt whose images took fewer positions than
 tokens. Neither given: upstream's path. The engine hands them in from
 `GenerationRequest.positions` / `rope_delta`, which the vision frontend
 fills (`families/qwen3_vl.py`, `positions`, the reference's
-`get_rope_index` for images). Tests: `tests/test_mrope.py` (against
+`get_rope_index` for images). The layout selector is an array on the
+attention module under a `_`-prefixed name: mlx keeps such attributes
+out of `parameters()`, so a strict `load_weights` does not miss it as a
+weight the checkpoint never had. Tests: `tests/test_mrope.py` (against
 transformers' `Qwen3VLTextRotaryEmbedding` when torch is installed),
 `packages/mlx-beam-vision/tests/test_qwen3_vl.py`.
 

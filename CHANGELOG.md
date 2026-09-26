@@ -6,6 +6,24 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Fixed
+- Qwen3, Qwen3-MoE and Qwen3-Next checkpoints with an MRoPE layout
+  (`mrope_section` in `rope_scaling`: the Qwen3-VL, Qwen3.5 and Qwen3.8
+  text models) failed to load with "Missing 16 parameters:
+  ... self_attn.mrope_selector": the layout selector was stored as a
+  module array and so counted as a weight. It is no parameter any more;
+  the checkpoints load as before.
+- The prefix store keyed a prompt on its token ids alone, so the same ids
+  handed to the engine with other MRoPE positions (the library API takes
+  them) hit an entry whose keys were rotated by the first positions, and
+  the answer went wrong from there. Every token rotated at other than
+  its index - an image's grid, the text after it, a generated answer
+  that the next turn's prompt repeats - is now keyed on its positions by
+  one rule, at storing and at lookup alike; a prefix rotated as text
+  stays shared with text prompts. Over HTTP the positions follow from
+  the tokens and the images, which the key already carries, so no
+  request there was affected.
+
 ## [0.1.0a7] - 2026-09-26
 
 ### Added

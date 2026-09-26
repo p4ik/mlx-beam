@@ -789,9 +789,11 @@ class Engine:
         cache key (image spans as digests) over the prompt positions the
         row computed - a prefill cut short by a cancel holds fewer than the
         prompt, and the entry's length is the key's - plus what was
-        generated."""
+        generated, keyed as the next turn's prompt will key it."""
         n = len(request.tokens)
-        return request.cache_key[: min(len(tokens), n)] + list(tokens[n:])
+        return request.cache_key[: min(len(tokens), n)] + [
+            request.continuation_key(t, n + k) for k, t in enumerate(tokens[n:])
+        ]
 
     def _head_checkpoint(self, uid: int, checkpoints: dict, position: int) -> None:
         """The draft head's history at the end of a row, next to the entry's

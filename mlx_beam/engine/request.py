@@ -139,7 +139,9 @@ class GenerationRequest:
         its own 31-bit hash of the whole digest and the position, so the
         span carries 31 bits of the image's identity per position - two
         images share a key only if every one of those hashes collides, not
-        when one slice of the digest does."""
+        when one slice of the digest does. Every token rotated at other
+        than its index - an image's grid, the text after it - is keyed on
+        its positions as well (`keyed`)."""
         key = list(self.tokens)
         for span in self.spans:
             digest = bytes.fromhex(span.digest) if span.digest else b""
@@ -147,7 +149,32 @@ class GenerationRequest:
                 salt = (i - span.start).to_bytes(4, "little")
                 h = hashlib.blake2b(digest, digest_size=4, salt=salt).digest()
                 key[i] = -1 - (int.from_bytes(h, "little") % (2**31))
+        if self.positions is not None:
+            for i, pos in enumerate(zip(*self.positions.tolist(), strict=True)):
+                key[i] = keyed(key[i], i, pos)
         return key
+
+    def continuation_key(self, token: int, index: int) -> int:
+        """The key of a token this row generated at prompt index `index`
+        (past its prompt), as the next turn's prompt will key it: rotated
+        at `index + rope_delta` on every axis."""
+        if self.positions is None:
+            return token
+        p = index + self.rope_delta
+        return keyed(token, index, (p, p, p))
+
+
+def keyed(base: int, index: int, pos: tuple[int, int, int]) -> int:
+    """A token's key at its positions: the id (or the image digest's
+    hash in its place) when the token sits at its index on every axis, as
+    text does; else a hash of both, so the same id rotated elsewhere -
+    the text after an image, an image's own grid, positions a library
+    caller set - has another key. One rule for the prompt, an image span
+    and a generated continuation, or the store's key and the lookup's
+    part ways. `hash` is stable within a process, where the store lives."""
+    if pos == (index, index, index):
+        return base
+    return -1 - (hash((base, *pos)) % (2**31))
 
 
 @dataclass(frozen=True)

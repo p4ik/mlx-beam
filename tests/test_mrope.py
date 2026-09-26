@@ -10,6 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.models import qwen3_5, qwen3_vl
 from mlx_beam._vendor.mlx_lm.models.mrope import (
@@ -122,11 +123,18 @@ def test_the_vision_text_models_carry_the_layout():
         tie_word_embeddings=True,
     )
     model = qwen3_vl.Model(qwen3_vl.ModelArgs("qwen3_vl", cfg))
-    attn = model.layers[0].self_attn
-    assert attn.mrope_selector.tolist() == [0, 1, 2, 0, 1, 2, 0, 1]
     hybrid = qwen3_5.Model(qwen3_5.ModelArgs.from_dict(TINY_QWEN35_WRAPPED))
+    # The layout is the model's, not a weight: a checkpoint carries none,
+    # and a strict load must not miss it (mlx keeps `_`-prefixed arrays
+    # out of the parameters).
+    for m in (model, hybrid):
+        names = [name for name, _ in tree_flatten(m.parameters())]
+        assert not any("mrope" in name for name in names), names
+        m.load_weights(tree_flatten(m.parameters()), strict=True)
+    attn = model.layers[0].self_attn
+    assert attn._mrope_selector.tolist() == [0, 1, 2, 0, 1, 2, 0, 1]
     attention_layers = [layer for layer in hybrid.layers if not layer.is_linear]
-    assert attention_layers[0].self_attn.mrope_selector is not None
+    assert attention_layers[0].self_attn._mrope_selector is not None
     # Without the layout, explicit positions are refused, not silently 1D.
     plain = qwen3_vl.Model(
         qwen3_vl.ModelArgs("qwen3_vl", {**cfg, "rope_scaling": None})
@@ -250,6 +258,104 @@ def test_the_engine_rotates_by_the_positions_and_decodes_from_the_delta():
         assert [collect(s) for s in streams] == [expected, text_expected]
     with pytest.raises(ValueError, match="shape"):
         GenerationRequest(TOKENS, positions=mx.zeros((3, 4), dtype=mx.int32))
+
+
+@pytest.mark.parametrize("first_positioned", [False, True])
+def test_the_store_keeps_positioned_and_plain_prompts_apart(first_positioned):
+    """The same token ids rotated at other positions are another prompt:
+    a store entry built with MRoPE positions must not serve a plain
+    request for the ids, nor the other way round - the entry's keys were
+    rotated by the positions, and the decode cannot re-rotate them."""
+    mx.random.seed(5)
+    model = qwen3_vl.Model(qwen3_vl.ModelArgs("qwen3_vl", VL_CONFIG))
+    mx.eval(model.parameters())
+
+    def request(positioned):
+        return GenerationRequest(
+            TOKENS,
+            max_tokens=6,
+            positions=mx.array(POSITIONS) if positioned else None,
+            rope_delta=DELTA if positioned else 0,
+        )
+
+    second = not first_positioned
+    expected, expected_lp = _reference_greedy(
+        model, TOKENS, POSITIONS if second else None, 6
+    )
+    assert request(True).cache_key != request(False).cache_key
+    # The two text tokens before the image sit at their index: shared.
+    assert request(True).cache_key[:2] == TOKENS[:2]
+    with Engine(model, prompt_cache_size=16) as engine:
+        list(engine.submit(request(first_positioned)))
+        events = list(engine.submit(request(second)))
+    assert [e.token for e in events] == expected
+    np.testing.assert_allclose([e.logprob for e in events], expected_lp, atol=1e-4)
+
+
+def test_a_generated_answer_is_reused_by_the_next_positioned_turn():
+    """The store files a row's generated tokens keyed as the next prompt
+    will key them - rotated at their index plus the decode delta - so the
+    second turn of a conversation with an image resumes from the whole
+    first answer, not from the prompt alone."""
+    from mlx_beam.engine.proposer import trunk
+    from mlx_beam.engine.request import ImageSpan
+
+    mx.random.seed(5)
+    model = qwen3_vl.Model(qwen3_vl.ModelArgs("qwen3_vl", VL_CONFIG))
+    mx.eval(model.parameters())
+    _, _, embed = trunk(model)
+    span = ImageSpan(2, 6, embed(mx.array(TOKENS[2:6])), "cd" * 32)
+    with Engine(model) as engine:
+        first = list(
+            engine.submit(
+                GenerationRequest(
+                    TOKENS,
+                    positions=mx.array(POSITIONS),
+                    rope_delta=DELTA,
+                    spans=(span,),
+                    max_tokens=6,
+                )
+            )
+        )
+        answer = [e.token for e in first]
+        prompt = TOKENS + answer + [11, 12]
+        tail = np.tile(np.arange(6, 6 + len(answer) + 2, dtype=np.int32), (3, 1))
+        positions = np.concatenate([POSITIONS, tail], axis=1)
+        expected, expected_lp = _reference_greedy(model, prompt, positions, 6)
+        stream = engine.submit(
+            GenerationRequest(
+                prompt,
+                positions=mx.array(positions),
+                rope_delta=DELTA,
+                spans=(span,),
+                max_tokens=6,
+            )
+        )
+        events = list(stream)
+    assert stream.prompt_cached == len(TOKENS) + len(answer)
+    assert [e.token for e in events] == expected
+    np.testing.assert_allclose([e.logprob for e in events], expected_lp, atol=1e-4)
+
+
+def test_an_image_span_is_keyed_on_its_positions_too():
+    """The same digest at the same placeholders with another grid (a
+    library caller's positions; over HTTP the grid follows from the
+    digest) is another key - the span's tokens are rotated by the grid."""
+    from mlx_beam.engine.request import ImageSpan
+
+    span = ImageSpan(2, 6, None, "ab" * 32)
+    swapped = POSITIONS.copy()
+    swapped[:, 2:6] = POSITIONS[[0, 2, 1], 2:6]
+
+    def request(pos):
+        return GenerationRequest(
+            TOKENS, positions=mx.array(pos), rope_delta=DELTA, spans=(span,)
+        )
+
+    same = request(POSITIONS).cache_key
+    assert same == request(POSITIONS.copy()).cache_key
+    assert same != request(swapped).cache_key
+    assert same[:2] == TOKENS[:2] and same[6:] != TOKENS[6:]
 
 
 def test_the_hybrid_trunk_takes_the_positions_too():
