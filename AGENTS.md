@@ -89,8 +89,11 @@ choice["message"]["content"] = text if text else None
   workflow refuses a tag whose section is missing. The measure is always
   the last tag: `Fixed` is what that tag had wrong; a correction to
   something added since it goes into that thing's `Added` entry, because
-  no one ever installed the broken version. One heading per kind; when
-  two branches meet, their sections are merged, not stacked.
+  no one ever installed the broken version - so before writing a `Fixed`
+  line, name the tag that had the defect; none means no `Fixed` line.
+  Headings in the order Added, Changed, Fixed, one per kind; when two
+  branches meet, their sections are merged, not stacked. A first release
+  has only `Added`.
 - Vendored parts are updated in their own commit (`vendor: <part> <old> -> <new>`).
 
 ## AI usage
