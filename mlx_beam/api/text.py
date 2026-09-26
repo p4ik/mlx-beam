@@ -427,6 +427,10 @@ class TextAssembler:
         self._route = route_thinking
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
+        self._think_markers = {self._think_start, self._think_end} | set(
+            getattr(tokenizer, "think_openers", None) or ()
+        )
+        self._think_markers.discard("")
         self._label_end = getattr(tokenizer, "think_label_end", None) or ""
         # The opener's label so far, until its line end shows up, and how
         # many tokens it took (they count as reasoning only if it opens one).
@@ -472,7 +476,6 @@ class TextAssembler:
         self._stop_words = sorted(stop_words or [], key=len, reverse=True)
         self._tail = ""
         self._pieces: list = []
-        self._buffered = ""
         self.reasoning_tokens = 0
         # From the engine's last event: which limit cut what.
         self.thinking_truncated = False
@@ -672,15 +675,15 @@ class TextAssembler:
         # A marker token releases no text; the stop token none either -
         # what its arrival flushed belongs to the tokens held before it.
         # The verdicts follow the text's: what came out before a marker
-        # was the old state's, what came after it the new one's.
+        # was the old state's, written by earlier tokens (held by the
+        # automaton or the detokenizer, or booked already), what came
+        # after it the new one's. The marker's own token is content when
+        # the marker went back into the content - then the held tokens
+        # that spelled it (a textual marker) are too.
         if markers:
-            held = self._shown(self._prev, before)
-            # The event's own text before the marker: what `before` holds
-            # beyond the automaton's buffer, which earlier tokens wrote.
-            own_before = before[len(self._buffered) :]
-            own_text = self._shown(current, after) or self._shown(
-                self._prev, own_before
-            )
+            shown = self._markers_shown(markers)
+            held = self._shown(self._prev, before) or (shown and not before)
+            own_text = self._shown(current, after) or shown
         else:
             held = own_text = self._shown(current, clean)
         self._book(
@@ -717,11 +720,21 @@ class TextAssembler:
 
     def _shown(self, state: str | None, text: str) -> bool:
         """Text released in `state` went to the content: the answer's
-        always, a block's when the reasoning is not routed apart; a tool
-        call's and a label's never."""
+        always, a block's and its label when the reasoning is not routed
+        apart (the client gets the block as written); a tool call's never."""
         return bool(text) and (
-            state == "normal" or (not self._route and state == "reasoning")
+            state == "normal" or (not self._route and state in ("reasoning", "label"))
         )
+
+    def _markers_shown(self, markers: list[str]) -> bool:
+        """The segment's markers went back into the content: every one on
+        the raw endpoint, the think block's when the reasoning is not
+        routed apart; a stop word is cut everywhere, a tool call's marker
+        stays with the call."""
+        kept = [m for m in markers if m not in self._stop_words]
+        if self._raw:
+            return bool(kept)
+        return not self._route and any(m in self._think_markers for m in kept)
 
     def _book(
         self,
@@ -757,7 +770,6 @@ class TextAssembler:
         segment began in (held back before a marker), `after` the rest;
         `markers` the control sequences cut on the way. The pieces are kept
         for the raw endpoint, which gives structural markers back."""
-        self._buffered = self._state[3] if self._state is not None else ""
         self._state, pieces, current = TextStateMachine.step_pieces(
             self._state, segment
         )

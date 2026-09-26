@@ -20,6 +20,7 @@ from tests.stub_tokenizer import (
     TOOL_END,
     TOOL_START,
     ChannelStubTokenizer,
+    StubDetokenizer,
     StubTokenizer,
 )
 
@@ -1758,6 +1759,70 @@ def test_logprobs_follow_the_routing_of_the_text(stream):
     # the opener that releases it is no content for that.
     tok._words[16] = "Look <"
     assert run([16, TOOL_START, 14, 15, TOOL_END]) == ("Look <", ["Look <"])
+    # A lone space the detokenizer holds back until the next token (BPE
+    # waits with it) is released by the opener: the space's, not the opener's.
+    tok = _HoldingTokenizer()
+    tok._words[13] = "Look"
+    tok._words[14] = "good "
+    tok._words[15] = "x"
+    tok._words[17] = " "
+    assert run([13, 17, TOOL_START, 14, 15, TOOL_END]) == ("Look ", ["Look", " "])
+
+
+class _HoldingDetokenizer(StubDetokenizer):
+    """A segment that is a lone space is held until the next token."""
+
+    def __init__(self, words):
+        super().__init__(words)
+        self._pending = ""
+
+    @property
+    def last_segment(self) -> str:
+        segment = self._pending + super().last_segment
+        if segment == " ":
+            self._pending = segment
+            return ""
+        self._pending = ""
+        return segment
+
+
+class _HoldingTokenizer(StubTokenizer):
+    @property
+    def detokenizer(self):
+        return _HoldingDetokenizer(self._words)
+
+
+def test_logprobs_with_routing_off_cover_the_block_the_client_sees():
+    """With `--reasoning-field none` the block goes out as written - its
+    markers, its label, its text; their tokens are then content, with
+    their logprobs, and only the eos is left out."""
+    tok = ChannelStubTokenizer()
+    tok._words[10] = "private "
+    tok._words[12] = "answer"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    events = [
+        TokenEvent(t, -0.1)
+        for t in (CHANNEL_OPEN, LABEL, NEWLINE, 10, CHANNEL_CLOSE, 12)
+    ]
+    events.append(TokenEvent(EOS, -0.9, "stop"))
+    responder = chat.ChatResponder(tok, req, [1], reasoning_field="none")
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "<|channel>thought\nprivate <channel|>answer"
+    assert [e["token"] for e in choice["logprobs"]["content"]] == [
+        "<|channel>",
+        "thought",
+        "\n",
+        "private ",
+        "<channel|>",
+        "answer",
+    ]
+    # Routed, none of the block is content.
+    responder = chat.ChatResponder(tok, req, [1])
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "answer"
+    assert [e["token"] for e in choice["logprobs"]["content"]] == ["answer"]
 
 
 def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():
