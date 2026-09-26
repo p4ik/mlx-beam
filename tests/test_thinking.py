@@ -538,6 +538,35 @@ def test_a_label_variant_the_api_routes_as_reasoning_is_counted_and_cut(limit):
         assert not any(steps.forced)
 
 
+def test_a_longer_label_in_a_later_block_is_judged_against_the_rest():
+    """The forced close at a label's end is decided against what the budget
+    has left, not against the whole of it: a second block whose header
+    takes the rest exactly gets its close at once."""
+    A, SP, F, MSG = 40, 38, 41, 42
+    reasoning = ((A,), (A, SP))
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=8,
+        labels=((A,),),
+        label_end=(MSG,),
+        label_means_reasoning=lambda ids: ids in reasoning,
+    )
+    body = list(range(10, 30))
+    # First block: header 3 and one token, closed by the model - 4 spent.
+    first = [START, A, MSG, 10, END]
+    for label, expected in (((A,), 8), ((A, SP), 8)):
+        tracker = ThinkingBudget(limits)
+        steps = Steps(tracker, first + [START, *label, MSG, *body])
+        out = steps.run(24)
+        second = out.index(START, 1)
+        assert tracker.reasoning_tokens == expected, label
+        # Header 3 leaves one free token; header 4 none.
+        assert out.index(END, second) == second + 2 + len(label) + (len(label) == 1)
+        assert tracker.thinking_truncated
+
+
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     """Harmony and Muse open the answer and a tool call with the same
     marker as the reasoning block, followed by a label. The budget waits

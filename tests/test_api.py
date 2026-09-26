@@ -1712,6 +1712,54 @@ def test_logprobs_book_a_held_prefix_with_the_token_that_releases_it():
     assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs_follow_the_routing_of_the_text(stream):
+    """`logprobs.content` describes the content's tokens: what a block's
+    end marker released belongs to the block, the marker to nobody, and
+    text held back before a tool call's opener to the answer - the same
+    verdicts the text got, not the state the step ended in."""
+    tok = StubTokenizer()
+    tok._words[10] = "private "
+    tok._words[11] = "<"
+    tok._words[12] = "answer"
+    tok._words[13] = "Look"
+    tok._words[14] = "good "
+    tok._words[15] = "x"
+    tools = [{"type": "function", "function": {"name": "good"}}]
+    body = {
+        "messages": [{"role": "user", "content": "w1"}],
+        "logprobs": True,
+        "stream": stream,
+        "tools": tools,
+    }
+    req = chat.parse_chat_request(body, "m")
+
+    def run(ids):
+        events = [TokenEvent(t, -0.1 * (i + 1)) for i, t in enumerate(ids)]
+        events.append(TokenEvent(EOS, -0.9, "stop"))
+        responder = chat.ChatResponder(tok, req, [1])
+        if stream:
+            choices = [c["choices"][0] for c in responder.stream(iter(events), 0)]
+            content = "".join(c["delta"].get("content", "") for c in choices)
+            entries = [e for c in choices for e in c["logprobs"]["content"]]
+        else:
+            choice = responder.complete(iter(events), 0)["choices"][0]
+            content = choice["message"]["content"]
+            entries = choice["logprobs"]["content"]
+        return content, [e["token"] for e in entries]
+
+    # A fragment held back inside the block, released by the end marker.
+    assert run([THINK_START, 10, 11, THINK_END, 12]) == ("answer", ["answer"])
+    # Nothing held: the marker alone is no content either.
+    assert run([THINK_START, 10, THINK_END, 12]) == ("answer", ["answer"])
+    # Held back before a tool opener as a possible marker: the answer's.
+    assert run([13, 11, TOOL_START, 14, 15, TOOL_END]) == ("Look<", ["Look", "<"])
+    # The fragment held from a token already booked for its released part:
+    # the opener that releases it is no content for that.
+    tok._words[16] = "Look <"
+    assert run([16, TOOL_START, 14, 15, TOOL_END]) == ("Look <", ["Look <"])
+
+
 def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():
     # The raw prompt already carries `<think>`; the completion is what the
     # model wrote after it, not the opener again.

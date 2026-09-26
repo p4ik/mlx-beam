@@ -122,8 +122,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   text. The budget asks the routing's verdict for the label the model
   wrote, the mask that keeps a block from forming cuts the label in both
   forms the vocabulary has, and a header longer than the canonical one
-  has its close forced in the step the label ends, so the budget holds
-  to the token.
+  has its close forced in the step the label ends - judged against what
+  the budget has left - so the budget holds to the token.
+- `logprobs.content` listed the tokens a think block's end marker
+  released (a held space, the start of a marker that was not one) and
+  the marker itself as the answer's; the booking now follows the text's
+  routing, so the entries describe the content's tokens and nothing else.
 - `temperature nan` and `repetition_penalty 0` were accepted as server
   defaults (flag or `generation_config.json`) and every request that left
   the field failed with 400; a default is checked as a request is.

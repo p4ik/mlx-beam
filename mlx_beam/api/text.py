@@ -472,6 +472,7 @@ class TextAssembler:
         self._stop_words = sorted(stop_words or [], key=len, reverse=True)
         self._tail = ""
         self._pieces: list = []
+        self._buffered = ""
         self.reasoning_tokens = 0
         # From the engine's last event: which limit cut what.
         self.thinking_truncated = False
@@ -670,10 +671,23 @@ class TextAssembler:
             delta.content = head + body
         # A marker token releases no text; the stop token none either -
         # what its arrival flushed belongs to the tokens held before it.
+        # The verdicts follow the text's: what came out before a marker
+        # was the old state's, what came after it the new one's.
+        if markers:
+            held = self._shown(self._prev, before)
+            # The event's own text before the marker: what `before` holds
+            # beyond the automaton's buffer, which earlier tokens wrote.
+            own_before = before[len(self._buffered) :]
+            own_text = self._shown(current, after) or self._shown(
+                self._prev, own_before
+            )
+        else:
+            held = own_text = self._shown(current, clean)
         self._book(
             event,
             segment,
-            bool(clean) and (current == "normal" or not self._route),
+            own_text,
+            held=held,
             released=bool(clean),
             own=False if event.finish_reason == "stop" else None,
         )
@@ -701,11 +715,20 @@ class TextAssembler:
         if unparsed:
             delta.content += "".join(unparsed)
 
+    def _shown(self, state: str | None, text: str) -> bool:
+        """Text released in `state` went to the content: the answer's
+        always, a block's when the reasoning is not routed apart; a tool
+        call's and a label's never."""
+        return bool(text) and (
+            state == "normal" or (not self._route and state == "reasoning")
+        )
+
     def _book(
         self,
         event: TokenEvent,
         segment: str,
         content: bool,
+        held: bool | None = None,
         released: bool = True,
         own: bool | None = None,
     ) -> None:
@@ -714,16 +737,17 @@ class TextAssembler:
         (a cut UTF-8 sequence, a lone space it waits with) or by the
         automaton (the start of what may be a marker or a stop word) - is
         not decided yet: it is booked with the token that releases the
-        text, under that one's verdict. A marker releases its segment and
-        the automaton swallows it: decided at once, not content. `own`
+        text, under `held` (the verdict for what was released before a
+        marker, the state it was written in). A marker releases its segment
+        and the automaton swallows it: decided at once, not content. `own`
         overrides the verdict for the event itself (the stop token: never
         content, whatever it released)."""
         buffered = bool(self._state[3]) if self._state is not None else False
         if event.finish_reason is None and (not segment or (not released and buffered)):
             self._held.append(event)
             return
-        for held in self._held:
-            self.pending_events.append((held, content))
+        for event_held in self._held:
+            self.pending_events.append((event_held, content if held is None else held))
         self._held = []
         self.pending_events.append((event, content if own is None else own))
 
@@ -733,6 +757,7 @@ class TextAssembler:
         segment began in (held back before a marker), `after` the rest;
         `markers` the control sequences cut on the way. The pieces are kept
         for the raw endpoint, which gives structural markers back."""
+        self._buffered = self._state[3] if self._state is not None else ""
         self._state, pieces, current = TextStateMachine.step_pieces(
             self._state, segment
         )

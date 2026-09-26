@@ -347,7 +347,8 @@ class ThinkingBudget:
 
     def _header_overruns(self) -> bool:
         """The label so far, were it to end now, means reasoning and costs
-        more than the gate planned for: no free token fits after it."""
+        more than the gate planned for: no free token fits after it in
+        what the budget has left (earlier blocks spent their share)."""
         limit = self.limits.max_tokens
         if limit is None:
             return False
@@ -355,7 +356,7 @@ class ThinkingBudget:
         if not so_far or not self._means_reasoning(so_far):
             return False
         cost = 1 + len(so_far) + len(self.limits.label_end)
-        return cost > limit - 1 - self._close_counted
+        return self.reasoning_tokens + cost > limit - 1 - self._close_counted
 
     def _means_reasoning(self, label: tuple[int, ...]) -> bool:
         verdict = self.limits.label_means_reasoning
