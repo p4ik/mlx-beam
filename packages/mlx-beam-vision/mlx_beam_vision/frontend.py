@@ -231,6 +231,15 @@ class VisionFrontend:
 def load_processor(model_path: Path, trust_remote_code: bool = False):
     from transformers import AutoProcessor
 
-    return AutoProcessor.from_pretrained(
+    processor = AutoProcessor.from_pretrained(
         str(model_path), trust_remote_code=trust_remote_code
     )
+    # A checkpoint without preprocessor_config.json gets a bare tokenizer
+    # back from AutoProcessor: that is no image path, and saying so here
+    # beats a KeyError on the first image.
+    if getattr(processor, "image_processor", None) is None:
+        raise ValueError(
+            f"{type(processor).__name__} has no image processor; the checkpoint "
+            "ships no preprocessor_config.json, so images cannot be prepared"
+        )
+    return processor

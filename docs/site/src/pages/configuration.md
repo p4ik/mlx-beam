@@ -21,10 +21,18 @@ Flags take mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`
 | `--reasoning-field` | `reasoning` / `reasoning_content` / `both` / `none` | `reasoning` | where a chat completion carries the model's thinking: the field name(s), or none to leave the think markers in the content |
 | `--host` | text | `127.0.0.1` | address to listen on |
 | `--port` | integer ≥ 1 | `8000` | TCP port to listen on |
-| `--allowed-origins` | `ORIGIN` (one or more) | `*` | origins CORS admits (default: any) |
+| `--allowed-origins` | `ORIGIN` (one or more) | — | origins CORS admits, so a page in a browser may call the server; by default none |
 | `--max-queued` | integer ≥ 1 | — | requests allowed to wait for a batch slot; one more is a 503 with Retry-After (default: unlimited) |
 | `--trust-remote-code` | switch | — | run a model_file shipped inside the checkpoint |
 | `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | how much the server log says |
+
+### Access
+
+| Flag | Value | Default | What it does |
+|---|---|---|---|
+| `--api-key` | `KEY` | — | the key every request must carry (Authorization: Bearer or x-api-key); required off loopback unless --skip-api-key |
+| `--skip-api-key` | switch | — | serve without a key on a non-loopback --host, on purpose |
+| `--allowed-hosts` | `HOST` (one or more) | — | Host header values accepted next to localhost and --host, e.g. the machine's name or LAN address behind a wildcard bind; other hosts get 403 |
 
 ### Chat template
 
@@ -97,7 +105,7 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 
 ## Request: fields a call may send
 
-Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`); `/v1/messages` takes Anthropic's (`system`, content blocks, `tools` with `input_schema`, `stop_sequences`, `thinking.budget_tokens`, `top_k`) and answers in Anthropic's blocks, events and error envelope, `/v1/messages/count_tokens` counts the rendered prompt. A `cache_control` marker maps onto the prompt cache's checkpoints when it sits on a message's last block and is refused otherwise. A field left out falls back to the server's default for it.
+Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completions` takes the sampling, penalty and stop fields plus `prompt`, `echo` and an integer `logprobs` (0-20); `/v1/responses` takes them with its own shape (`input`, `instructions`, `max_output_tokens`, `reasoning`); `/v1/messages` takes Anthropic's (`system`, content blocks, `tools` with `input_schema`, `stop_sequences`, `thinking.budget_tokens`, `top_k`) and answers in Anthropic's blocks, events and error envelope, `/v1/messages/count_tokens` counts the rendered prompt. A `cache_control` marker is accepted on any block: the prompt cache checkpoints every message boundary by itself, and `usage.cache_read_input_tokens` reports the hit. A message's `role` must be one of `system`, `developer`, `user`, `assistant`, `tool` (Messages: `user`, `assistant`); `developer` reaches a template that knows it as is, and one that does not as `system` - measured at load, `/health.template.roles`. A field left out falls back to the server's default for it.
 
 | Field | Values | What it does |
 |---|---|---|
@@ -106,7 +114,7 @@ Chat completions (`/v1/chat/completions`) take the fields below; `/v1/completion
 | `max_reasoning_tokens`, `thinking_token_budget`, `reasoning.max_tokens` | integer ≥ 0 | Reasoning tokens the think block may take; at the budget the block is closed by force and the answer keeps `min_response_tokens`. The first name wins when several are sent. |
 | `min_response_tokens` | integer ≥ 0 | Tokens kept for the answer after the think block. |
 | `reasoning_effort`, `reasoning.effort` | `none` / `off` / `false`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` / `ultra` | `none` turns thinking off. Otherwise the word reaches the template the way the template takes it, measured at load (`/health.reasoning.effort`): a template that checks the word gets it when it is in its set, else the nearest rung it accepts (up first, then down); a template that takes the word unchecked gets it as sent; a template without the kwarg gets nothing. A word the template still rejects at request time is retried through its neighbours. |
-| `enable_thinking` | boolean, or the words `true` / `false` | Thinking on or off for this call; handed to the template. |
+| `enable_thinking` | boolean, or the words `true` / `false` | Thinking on or off for this call; handed to the template. For a family whose template has no switch (Harmony, Muse) the answer is opened in the prompt instead; with tools declared the opener would skip the channel or recipient a call needs, so there the block is kept out by a reasoning budget of zero instead - the model may call a tool, not think. |
 | `chat_template_kwargs` | object | Extra variables for the template render, on top of `--chat-template-args` and the aliases above. |
 | `temperature`, `top_p`, `top_k`, `min_p` | 0-2, 0-1, integer (0 or -1 = off), 0-1 | Sampling; `temperature` 0 is greedy. |
 | `min_tokens_to_keep` | integer ≥ 1 | Tokens `min_p` may never filter away. |

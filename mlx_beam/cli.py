@@ -86,9 +86,31 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--allowed-origins",
         nargs="+",
-        default=["*"],
+        default=[],
         metavar="ORIGIN",
-        help="origins CORS admits (default: any)",
+        help="origins CORS admits, so a page in a browser may call the "
+        "server; by default none",
+    )
+    access = p.add_argument_group("access")
+    access.add_argument(
+        "--api-key",
+        metavar="KEY",
+        help="the key every request must carry (Authorization: Bearer or "
+        "x-api-key); required off loopback unless --skip-api-key",
+    )
+    access.add_argument(
+        "--skip-api-key",
+        action="store_true",
+        help="serve without a key on a non-loopback --host, on purpose",
+    )
+    access.add_argument(
+        "--allowed-hosts",
+        nargs="+",
+        default=[],
+        metavar="HOST",
+        help="Host header values accepted next to localhost and --host, e.g. "
+        "the machine's name or LAN address behind a wildcard bind; other "
+        "hosts get 403",
     )
     template = p.add_argument_group("chat template")
     template.add_argument(
@@ -549,6 +571,7 @@ def serve(args) -> int:
 
     from mlx_beam import modalities
     from mlx_beam._vendor.mlx_lm.utils import hf_repo_to_path, load
+    from mlx_beam.api.access import Access
     from mlx_beam.api.defaults import RequestDefaults
     from mlx_beam.engine import Engine, EngineDead
     from mlx_beam.server import Served
@@ -566,10 +589,25 @@ def serve(args) -> int:
         template = chat_template_from_args(args)
         check_draft_flags(args)
         RequestDefaults.resolve(None, flags=default_flags(args))
+        access = Access.resolve(
+            args.host, args.api_key, args.skip_api_key, args.allowed_hosts
+        )
         probe_port(args.host, args.port)
     except (StartupError, ValueError, OSError) as e:
         log.error("%s", e)
         return 3
+    if access.mode != "loopback":
+        log.warning(
+            "listening on %s, reachable from other machines: access %s, hosts %s",
+            args.host,
+            "by key" if access.mode == "key" else "open (--skip-api-key)",
+            ", ".join(access.hosts),
+        )
+        if access.wildcard and not args.allowed_hosts:
+            log.warning(
+                "a wildcard bind answers only to localhost and the bind address "
+                "in the Host header; name the machine with --allowed-hosts"
+            )
     log.info("loading %s", args.model)
     # Handed to the tokenizer at load: the tool markers are inferred from
     # the template that will actually render (the think markers come from
@@ -651,6 +689,7 @@ def serve(args) -> int:
         reasoning_field=args.reasoning_field,
         defaults=defaults,
         allowed_origins=args.allowed_origins,
+        access=access,
         chat_template_source=template_source,
         frontend=frontend,
         vision_refused=vision_refused,

@@ -63,6 +63,28 @@ def _text_blocks(content: Any, where: str) -> str:
     return "".join(out)
 
 
+def _result_content(content: Any, where: str):
+    """A tool result's content as the chat path takes it: text folded to a
+    string, or the parts when an image is among them (a screenshot tool's
+    result), which the frontend then renders in the tool's turn."""
+    if content is None or isinstance(content, str):
+        return content or ""
+    if not isinstance(content, list):
+        raise ApiError(f"{where} must be a string or a list of blocks", param=where)
+    parts: list[dict] = []
+    with_image = False
+    for j, block in enumerate(content):
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind == "text":
+            parts.append({"type": "text", "text": str(block.get("text", ""))})
+        elif kind == "image":
+            parts.append(_image_part(block, f"{where}[{j}]"))
+            with_image = True
+        else:
+            raise ApiError(f"{where}[{j}] has an unsupported block type {kind!r}")
+    return parts if with_image else "".join(p["text"] for p in parts)
+
+
 def _image_part(block: dict, where: str) -> dict:
     """An Anthropic image block as the part the chat path decodes: a
     base64 source becomes a `data:` URL; nothing is fetched, so a URL
@@ -157,7 +179,7 @@ def _convert_message(m: Any, i: int) -> list[dict]:
                 {
                     "role": "tool",
                     "tool_call_id": str(block.get("tool_use_id", "")),
-                    "content": _text_blocks(block.get("content"), f"{here}.content"),
+                    "content": _result_content(block.get("content"), f"{here}.content"),
                 }
             )
         elif kind == "image":

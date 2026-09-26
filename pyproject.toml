@@ -9,7 +9,7 @@ description = "Light and modular inference engine, built on MLX."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "the mlx-beam contributors" }]
 keywords = ["mlx", "apple-silicon", "llm", "inference", "moe"]
 classifiers = [
@@ -25,7 +25,7 @@ classifiers = [
 dependencies = [
   "mlx>=0.32; sys_platform == 'darwin'",
   # Carried by the vendored mlx-lm (tokenizers, chat templates, tool parsers).
-  "transformers>=5.7",
+  "transformers>=5.7,<6",
   "huggingface_hub",
   "jinja2",
   "numpy",

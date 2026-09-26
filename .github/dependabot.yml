@@ -1,0 +1,20 @@
+# Actions and the two Python packages, weekly. Python dependencies carry a
+# major cap in pyproject (`transformers>=5.7,<6`); with `widen` a pull
+# request comes only when a release falls outside such a range, and it
+# widens the range rather than pinning a version.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    versioning-strategy: widen
+  - package-ecosystem: pip
+    directory: /packages/mlx-beam-vision
+    schedule:
+      interval: weekly
+    versioning-strategy: widen

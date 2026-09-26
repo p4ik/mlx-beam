@@ -472,9 +472,20 @@ class TokenizerWrapper:
         self._frame_start = family.get("frame")
         label = family.get("reasoning_label")
         label_end = THINK_LABEL_END.get(self._think_start) if self._think_start else None
-        self._reasoning_label_tokens = (
-            tuple(tokenizer.encode(label, add_special_tokens=False)) if label else ()
-        )
+        self._reasoning_label_tokens = ()
+        if label:
+            # The label as the model writes it after the opener. A vocabulary
+            # may merge the opener's tail into it (Muse: ` to=self` is
+            # ` to`, `=self`); then the opener's token form is the pair, and
+            # there is no label to read on the token side.
+            joined = tuple(
+                tokenizer.encode(self._think_start + label, add_special_tokens=False)
+            )
+            plain = tuple(self._think_start_tokens or ())
+            if plain and joined[: len(plain)] == plain:
+                self._reasoning_label_tokens = joined[len(plain) :]
+            else:
+                self._think_start_tokens = joined
         self._think_label_end_tokens = (
             tuple(tokenizer.encode(label_end, add_special_tokens=False))
             if label and label_end

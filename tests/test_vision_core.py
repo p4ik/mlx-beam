@@ -453,6 +453,18 @@ def test_the_request_still_rejects_bad_limits(field, value):
         GenerationRequest([1, 2, 3], **{field: value})
 
 
+def test_an_image_span_cannot_end_the_prompt():
+    """The first generation step feeds the last prompt token without
+    image features; a span reaching it would read the placeholder's
+    embedding. Refused before admission, past the end as before."""
+    span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64)
+    GenerationRequest([1, 62, 62, 2], spans=[span])
+    with pytest.raises(ValueError, match="last prompt token"):
+        GenerationRequest([1, 62, 62], spans=[span])
+    with pytest.raises(ValueError, match="past the prompt"):
+        GenerationRequest([1, 62], spans=[span])
+
+
 GRANITE_TEXT = dict(
     model_type="granite",
     hidden_size=32,
@@ -577,6 +589,101 @@ def test_responses_take_images_through_the_same_frontend():
     tok = StubTokenizer()
     gen = responses.to_generation_request(tok, req, frontend=FakeFrontend(tok))
     assert len(gen.spans) == 1
+
+
+def test_images_in_tool_results_reach_the_frontend():
+    """A tool that returns an image (a screenshot) hands it back inside
+    the tool's result: Responses as parts in `function_call_output.output`,
+    Messages as an image block in `tool_result.content`. Both go through
+    the same image path as a user's message - not serialized to text, not
+    refused - and the tool turn keeps its id."""
+    from mlx_beam.api import messages, responses
+
+    data = __import__("base64").b64encode(png(4).data).decode()
+    url = f"data:image/png;base64,{data}"
+    body = {
+        "input": [
+            {"role": "user", "content": "Inspect the screenshot."},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shot",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "taken"},
+                    {"type": "input_image", "image_url": url},
+                ],
+            },
+        ]
+    }
+    req = responses.parse_responses_request(body, "m", vision=True)
+    assert len(req.chat.images) == 1 and req.chat.images[0].digest == png(4).digest
+    tool_turn = req.chat.messages[-1]
+    assert tool_turn["role"] == "tool" and tool_turn["tool_call_id"] == "call_1"
+    assert tool_turn["content"] == [
+        {"type": "text", "text": "taken"},
+        {"type": "image"},
+    ]
+    # Text-only results still fold to a string; other values stay JSON.
+    body["input"][2]["output"] = [{"type": "input_text", "text": "plain"}]
+    assert (
+        responses.parse_responses_request(body, "m").chat.messages[-1]["content"]
+        == "plain"
+    )
+    body["input"][2]["output"] = {"ok": True}
+    assert (
+        responses.parse_responses_request(body, "m").chat.messages[-1]["content"]
+        == '{"ok": true}'
+    )
+
+    body = {
+        "max_tokens": 4,
+        "messages": [
+            {"role": "user", "content": "Inspect the screenshot."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "shot", "input": {}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {"type": "text", "text": "taken"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": data,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    req = messages.parse_messages_request(body, "m", vision=True)
+    assert len(req.chat.images) == 1 and req.chat.images[0].digest == png(4).digest
+    tool_turn = req.chat.messages[-1]
+    assert tool_turn["role"] == "tool" and tool_turn["tool_call_id"] == "t1"
+    assert tool_turn["content"] == [
+        {"type": "text", "text": "taken"},
+        {"type": "image"},
+    ]
+    # Without the vision extra the image is refused as everywhere else.
+    with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request(body, "m")
+    assert exc.value.code == "extra_not_installed"
 
 
 def test_an_image_path_climbs_the_effort_ladder_and_reports_the_processor():

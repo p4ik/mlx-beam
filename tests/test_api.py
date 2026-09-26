@@ -20,6 +20,7 @@ from tests.stub_tokenizer import (
     TOOL_END,
     TOOL_START,
     ChannelStubTokenizer,
+    StubDetokenizer,
     StubTokenizer,
 )
 
@@ -152,6 +153,59 @@ def test_chat_prompt_goes_through_the_template():
     gen = chat.to_generation_request(tok, req)
     assert gen.tokens == [2, 5, 1, 6, 2, 3, 7]
     assert (EOS,) in gen.stop_sequences
+
+
+def test_roles_outside_the_format_are_400s():
+    with pytest.raises(ApiError) as e:
+        chat.parse_chat_request(
+            {"messages": [{"role": "moderator", "content": "w1"}]}, "m"
+        )
+    assert "system, developer, user, assistant, tool" in e.value.message
+    with pytest.raises(ApiError):
+        responses.parse_responses_request(
+            {"input": [{"type": "message", "role": "moderator", "content": "w1"}]},
+            "m",
+        )
+
+
+def test_developer_reaches_the_template_the_way_it_takes_it():
+    """The stub's template knows no developer role: the message renders as
+    system, for chat and for responses alike, and the store boundaries
+    see the same prompt."""
+    tok = StubTokenizer()
+    as_dev = chat.parse_chat_request(
+        {
+            "messages": [
+                {"role": "developer", "content": "w1"},
+                {"role": "user", "content": "w2"},
+            ]
+        },
+        "m",
+    )
+    as_sys = chat.parse_chat_request(
+        {
+            "messages": [
+                {"role": "system", "content": "w1"},
+                {"role": "user", "content": "w2"},
+            ]
+        },
+        "m",
+    )
+    assert as_dev.messages[0]["role"] == "developer"
+    dev, sys_ = chat.to_generation_request(tok, as_dev), chat.to_generation_request(
+        tok, as_sys
+    )
+    assert dev.tokens == sys_.tokens == [2, 5, 1, 6, 2, 7]
+    assert dev.system_end == sys_.system_end
+    body = {
+        "input": [
+            {"type": "message", "role": "developer", "content": "w1"},
+            {"type": "message", "role": "user", "content": "w2"},
+        ]
+    }
+    resp = responses.parse_responses_request(body, "m")
+    assert resp.chat.messages[0]["role"] == "developer"
+    assert responses.to_generation_request(tok, resp).tokens == dev.tokens
 
 
 def test_assembler_routes_reasoning_content_and_tool_calls():
@@ -705,6 +759,17 @@ def test_request_defaults_precedence(tmp_path):
         RequestDefaults.resolve(tmp_path)
     with pytest.raises(ValueError, match="top_p from flag"):
         RequestDefaults.resolve(tmp_path / "missing", flags={"top_p": 1.5})
+    # What a request may not ask for is no default either: a number that
+    # is not one, and a penalty the request parser calls not positive.
+    with pytest.raises(ValueError, match="temperature from flag"):
+        RequestDefaults.resolve(
+            tmp_path / "missing", flags={"temperature": float("nan")}
+        )
+    with pytest.raises(ValueError, match="repetition_penalty from flag"):
+        RequestDefaults.resolve(tmp_path / "missing", flags={"repetition_penalty": 0.0})
+    (tmp_path / "generation_config.json").write_text('{"repetition_penalty": 0}')
+    with pytest.raises(ValueError, match="repetition_penalty from generation_config"):
+        RequestDefaults.resolve(tmp_path)
 
 
 def test_logit_bias_values_are_bounded_numbers():
@@ -902,6 +967,176 @@ def test_a_tool_call_that_does_not_parse_comes_back_as_text():
     assert choice["finish_reason"] == "stop"
     assert "tool_calls" not in choice["message"]
     assert choice["message"]["content"] == "<tool_call>bad w11 </tool_call>"
+
+
+@pytest.mark.parametrize("fragment", ["<", "</", "</thi"])
+def test_a_marker_prefix_held_back_before_the_close_stays_in_the_block(fragment):
+    """Text that could have begun the end marker is held back; when the
+    real marker arrives it is released with it - and belongs to the block
+    it was written in, not to the answer that follows the marker."""
+    tok = StubTokenizer()
+    tok._words[10] = "private "
+    tok._words[11] = fragment
+    tok._words[12] = "answer"
+    asm = TextAssembler(tok, prompt_tokens=[])
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, 11, THINK_END, 12)
+    ]
+    assert "".join(d.reasoning for d in deltas) == "private " + fragment
+    assert "".join(d.content for d in deltas) == "answer"
+    # With routing off the block goes back verbatim, the fragment before
+    # its marker.
+    asm = TextAssembler(tok, prompt_tokens=[], route_thinking=False)
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, 11, THINK_END, 12)
+    ]
+    assert "".join(d.content for d in deltas) == (
+        "<think>private " + fragment + "</think>answer"
+    )
+
+
+def test_text_around_a_marker_in_one_segment_goes_to_both_sides():
+    """One decoded segment can carry text, a marker and more text: the
+    text before the marker is the old state's, the text after it the
+    new state's - for the opener, the close and a tool call alike."""
+    tok = StubTokenizer()
+    tok._words[10] = "a<think>b"
+    tok._words[11] = "c</think>d"
+    tok._words[12] = "e<tool_call>f "
+    tok._words[13] = "g</tool_call>h"
+    asm = TextAssembler(tok, prompt_tokens=[], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (10, 11, 12, 13)]
+    assert [d.content for d in deltas] == ["a", "d", "e", "h"]
+    assert [d.reasoning for d in deltas] == ["b", "c", "", ""]
+    call = deltas[-1].tool_calls[0]["function"]
+    assert call["name"] == "f" and json.loads(call["arguments"]) == {"words": "g"}
+
+
+def test_the_raw_endpoint_keeps_structural_markers():
+    """/v1/completions returns what the model wrote: a frame marker the
+    automaton tracks is put back where it was cut."""
+    tok = StubTokenizer()
+    tok.structural_markers = ("<frame>",)
+    tok._words[10] = "<frame>"
+    tok._words[11] = "assistant"
+    asm = TextAssembler(
+        tok,
+        prompt_tokens=[],
+        tools_enabled=False,
+        route_thinking=False,
+        lead=False,
+        raw=True,
+    )
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 11 else None)) for t in (10, 11)
+    ]
+    assert "".join(d.content for d in deltas) == "<frame>assistant"
+    # Chat keeps cutting it.
+    asm = TextAssembler(tok, prompt_tokens=[], route_thinking=False)
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 11 else None)) for t in (10, 11)
+    ]
+    assert "".join(d.content for d in deltas) == "assistant"
+
+
+def test_the_stream_sends_what_the_tool_opener_released():
+    """Text the automaton held back before a tool opener (a `<` that could
+    have begun a marker, or the rest of the segment the opener sits in)
+    comes out with the opener - after which the assembler is inside the
+    call. The stream must send that delta like the whole answer keeps it;
+    the call's own text stays held until it parsed."""
+    for words, expected in (
+        ({10: "Look <tool_call>good ", 11: "x</tool_call>"}, "Look "),
+        ({10: "Look <", 11: "<tool_call>good ", 12: "x</tool_call>"}, "Look <"),
+    ):
+        tok = StubTokenizer()
+        for t, w in words.items():
+            tok._words[t] = w
+        ids = sorted(words)
+        for stream in (False, True):
+            req, prompt = _chat(tok, stream=stream)
+            events = [TokenEvent(t, -0.1) for t in ids] + [
+                TokenEvent(EOS, -0.1, "stop")
+            ]
+            responder = chat.ChatResponder(tok, req, prompt)
+            if stream:
+                chunks = list(responder.stream(iter(events), 0))
+                deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+                content = "".join(d.get("content", "") for d in deltas)
+                calls = [c for d in deltas for c in d.get("tool_calls", [])]
+            else:
+                out = responder.complete(iter(events), 0)
+                content = out["choices"][0]["message"]["content"]
+                calls = out["choices"][0]["message"]["tool_calls"]
+            assert content == expected, (words, stream)
+            assert [c["function"]["name"] for c in calls] == ["good"], (words, stream)
+
+
+def test_a_marker_prefix_held_back_before_a_tool_call_stays_in_the_block():
+    """The think block may end in a tool call (the automaton knows the
+    transition): what the block held back before the opener is the
+    block's reasoning, not the answer's text."""
+    tok = StubTokenizer()
+    tok._words[10] = "private <"
+    tok._words[11] = "search x"
+    tok._words[12] = "done"
+    asm = TextAssembler(tok, prompt_tokens=[], tools=[])
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, TOOL_START, 11, TOOL_END, 12)
+    ]
+    assert "".join(d.reasoning for d in deltas) == "private <"
+    assert "".join(d.content for d in deltas) == "done"
+    call = [c for d in deltas for c in d.tool_calls][0]["function"]
+    assert call["name"] == "search" and json.loads(call["arguments"]) == {"words": "x"}
+
+
+@pytest.mark.parametrize("text", ["<frame><", "<frame>x<", "<frame></thi"])
+@pytest.mark.parametrize("finish", ["length", "stop"])
+def test_the_raw_endpoint_keeps_what_the_end_flushed_after_a_marker(text, finish):
+    """A marker's possible start held back at the end of the stream is the
+    model's text and is flushed - also when the last segment carried a
+    structural marker, which the raw endpoint puts back from the pieces."""
+    tok = StubTokenizer()
+    tok.structural_markers = ("<frame>",)
+    tok._words[10] = text
+    asm = TextAssembler(
+        tok,
+        prompt_tokens=[],
+        tools_enabled=False,
+        route_thinking=False,
+        lead=False,
+        raw=True,
+    )
+    # A stop that is a stop word's last token (not an eos) goes through
+    # the detokenizer like a length cut; the token here is no eos.
+    d = asm.feed(TokenEvent(10, -0.1, finish))
+    assert d.content == text
+
+
+def test_a_stop_word_inside_a_tool_call_keeps_the_text_before_it():
+    """The call is cut at the stop word and goes back as text; what stood
+    between the last segment and the word is part of it, not lost."""
+    tok = StubTokenizer()
+    tok._words[10] = "search "
+    tok._words[11] = "beforeSTOPafter"
+    asm = TextAssembler(tok, prompt_tokens=[], stop_words=["STOP"], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (TOOL_START, 10, 11)]
+    # The stub's parser reads any text as a call, so the cut block becomes
+    # one; its arguments carry the text up to the stop word.
+    calls = [c for d in deltas for c in d.tool_calls]
+    assert deltas[-1].finish_reason == "tool_calls"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"words": "before"}
+    # With a parser that refuses the cut block, the same text goes back
+    # as content.
+    picky = PickyTokenizer()
+    picky._words[10] = "bad "
+    picky._words[11] = "beforeSTOPafter"
+    asm = TextAssembler(picky, prompt_tokens=[], stop_words=["STOP"], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (TOOL_START, 10, 11)]
+    assert "".join(d.content for d in deltas) == "<tool_call>bad before"
 
 
 def test_valid_calls_survive_next_to_an_invalid_one():
@@ -1476,6 +1711,178 @@ def test_logprobs_book_a_held_prefix_with_the_token_that_releases_it():
     choice = responder.complete(iter(ev), 0)["choices"][0]
     assert choice["message"]["content"] == "w10 "
     assert [e["logprob"] for e in choice["logprobs"]["content"]] == [-0.1]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs_follow_the_routing_of_the_text(stream):
+    """`logprobs.content` describes the content's tokens: what a block's
+    end marker released belongs to the block, the marker to nobody, and
+    text held back before a tool call's opener to the answer - the same
+    verdicts the text got, not the state the step ended in."""
+    tok = StubTokenizer()
+    tok._words[10] = "private "
+    tok._words[11] = "<"
+    tok._words[12] = "answer"
+    tok._words[13] = "Look"
+    tok._words[14] = "good "
+    tok._words[15] = "x"
+    tools = [{"type": "function", "function": {"name": "good"}}]
+    body = {
+        "messages": [{"role": "user", "content": "w1"}],
+        "logprobs": True,
+        "stream": stream,
+        "tools": tools,
+    }
+    req = chat.parse_chat_request(body, "m")
+
+    def run(ids):
+        events = [TokenEvent(t, -0.1 * (i + 1)) for i, t in enumerate(ids)]
+        events.append(TokenEvent(EOS, -0.9, "stop"))
+        responder = chat.ChatResponder(tok, req, [1])
+        if stream:
+            choices = [c["choices"][0] for c in responder.stream(iter(events), 0)]
+            content = "".join(c["delta"].get("content", "") for c in choices)
+            entries = [e for c in choices for e in c["logprobs"]["content"]]
+        else:
+            choice = responder.complete(iter(events), 0)["choices"][0]
+            content = choice["message"]["content"]
+            entries = choice["logprobs"]["content"]
+        return content, [e["token"] for e in entries]
+
+    # A fragment held back inside the block, released by the end marker.
+    assert run([THINK_START, 10, 11, THINK_END, 12]) == ("answer", ["answer"])
+    # Nothing held: the marker alone is no content either.
+    assert run([THINK_START, 10, THINK_END, 12]) == ("answer", ["answer"])
+    # Held back before a tool opener as a possible marker: the answer's.
+    assert run([13, 11, TOOL_START, 14, 15, TOOL_END]) == ("Look<", ["Look", "<"])
+    # The fragment held from a token already booked for its released part:
+    # the opener that releases it is no content for that.
+    tok._words[16] = "Look <"
+    assert run([16, TOOL_START, 14, 15, TOOL_END]) == ("Look <", ["Look <"])
+    # A lone space the detokenizer holds back until the next token (BPE
+    # waits with it) is released by the opener: the space's, not the opener's.
+    tok = _HoldingTokenizer()
+    tok._words[13] = "Look"
+    tok._words[14] = "good "
+    tok._words[15] = "x"
+    tok._words[17] = " "
+    assert run([13, 17, TOOL_START, 14, 15, TOOL_END]) == ("Look ", ["Look", " "])
+
+
+class _HoldingDetokenizer(StubDetokenizer):
+    """A segment that is a lone space is held until the next token."""
+
+    def __init__(self, words):
+        super().__init__(words)
+        self._pending = ""
+
+    @property
+    def last_segment(self) -> str:
+        segment = self._pending + super().last_segment
+        if segment == " ":
+            self._pending = segment
+            return ""
+        self._pending = ""
+        return segment
+
+
+class _HoldingTokenizer(StubTokenizer):
+    @property
+    def detokenizer(self):
+        return _HoldingDetokenizer(self._words)
+
+
+def test_logprobs_with_routing_off_cover_the_block_the_client_sees():
+    """With `--reasoning-field none` the block goes out as written - its
+    markers, its label, its text; their tokens are then content, with
+    their logprobs, and only the eos is left out."""
+    tok = ChannelStubTokenizer()
+    tok._words[10] = "private "
+    tok._words[12] = "answer"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    events = [
+        TokenEvent(t, -0.1)
+        for t in (CHANNEL_OPEN, LABEL, NEWLINE, 10, CHANNEL_CLOSE, 12)
+    ]
+    events.append(TokenEvent(EOS, -0.9, "stop"))
+    responder = chat.ChatResponder(tok, req, [1], reasoning_field="none")
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "<|channel>thought\nprivate <channel|>answer"
+    assert [e["token"] for e in choice["logprobs"]["content"]] == [
+        "<|channel>",
+        "thought",
+        "\n",
+        "private ",
+        "<channel|>",
+        "answer",
+    ]
+    # Routed, none of the block is content.
+    responder = chat.ChatResponder(tok, req, [1])
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "answer"
+    assert [e["token"] for e in choice["logprobs"]["content"]] == ["answer"]
+
+
+class _SharedEndTokenizer(ChannelStubTokenizer):
+    """Harmony's shape: the block's end marker also ends every message,
+    and a label names the channel - `analysis` reasons, `thought` answers."""
+
+    think_family = "harmony"
+    structural_markers = ("<channel|>",)
+
+    def __init__(self):
+        super().__init__()
+        self._words[18] = "analysis"
+
+
+def test_logprobs_tell_a_block_end_from_a_message_end():
+    """The same marker closes the block (put back into the content with
+    routing off) and the message (cut in every mode): judged by the
+    transition. A label's end is read from the text: the header is the
+    label's, never the answer's."""
+    tok = _SharedEndTokenizer()
+    tok._words[10] = "private "
+    tok._words[12] = "answer"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    ids = (
+        CHANNEL_OPEN,
+        18,
+        NEWLINE,
+        10,
+        CHANNEL_CLOSE,
+        CHANNEL_OPEN,
+        LABEL,
+        NEWLINE,
+        12,
+    )
+    events = [TokenEvent(t, -0.1) for t in ids] + [
+        TokenEvent(CHANNEL_CLOSE, -0.2),
+        TokenEvent(EOS, -0.9, "stop"),
+    ]
+    responder = chat.ChatResponder(tok, req, [1], reasoning_field="none")
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    content = "<|channel>analysis\nprivate <channel|><|channel>thought\nanswer"
+    assert choice["message"]["content"] == content
+    assert [e["token"] for e in choice["logprobs"]["content"]] == [
+        "<|channel>",
+        "analysis",
+        "\n",
+        "private ",
+        "<channel|>",
+        "<|channel>",
+        "thought",
+        "\n",
+        "answer",
+    ]
+    responder = chat.ChatResponder(tok, req, [1])
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "answer"
+    assert choice["message"]["reasoning"] == "private "
+    assert [e["token"] for e in choice["logprobs"]["content"]] == ["answer"]
 
 
 def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():

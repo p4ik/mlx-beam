@@ -41,6 +41,13 @@ but never its draft head (`mtp/weights.safetensors`) or a tower sidecar
 (`optiq/…`), and `--draft-model bundled` fails on a fresh machine. Tests:
 `tests/test_cli.py`.
 
+`top-p floor` - `sample_utils.py`, `apply_top_p`: the probabilities are
+summed in float32 and the most likely token is always kept. Upstream sums in
+the logits' width and keeps what passes `cumulative > 1 - top_p`: in
+bfloat16 `1 - 0.001` is already 1.0, the sum reaches 1.0, nothing passes
+and the draw falls on token 0 (in float32 the same from top_p 1e-8 on).
+Test: `test_top_p_always_keeps_the_most_likely_token`.
+
 `mask` - `models/cache.py`, `ArraysCache.make_mask`: `lengths` decides before
 `left_padding`. A right-padded prefill sets `lengths`, but `merge()` of fresh
 caches leaves `left_padding = [0] * B` behind, and upstream checks that first:
@@ -179,6 +186,43 @@ drops the tower under either layout (`vision_tower.*` and
 `model.vision_tower.*`). Tests: `tests/test_vision_core.py` (the engine
 path against a direct forward per text model); the towers themselves in
 `packages/mlx-beam-vision/tests`.
+
+`emptied batch` - `generate.py`, `GenerationBatch.filter`: an emptied
+batch drops its current tokens and logprobs; upstream keeps them, and
+`extend()` concatenates every later batch onto them (a verify cycle takes
+the next tokens and never replaces the current ones), which held the
+arrays of every emptied batch alive. Tests: `tests/test_vendor_mlx_lm.py`
+(`test_an_emptied_batch_keeps_no_current_tokens`).
+
+`text pieces` - `generate.py`, `TextStateMachine.step_pieces`: `step` released
+the text before a marker and the text after it as one string with only the
+end state, so a `<` held back inside a think block came out with the block's
+close and was read as the answer's, and the raw endpoint had no way to give
+a structural marker back. `step_pieces` returns the released text as
+(text, kind, state) pieces - text by the state it was released in, markers
+as their own pieces - and `step` is `step_pieces` joined, unchanged for
+upstream's callers. Tests: `tests/test_api.py`
+(`test_a_marker_prefix_held_back_before_the_close_stays_in_the_block`,
+`test_text_around_a_marker_in_one_segment_goes_to_both_sides`,
+`test_the_raw_endpoint_keeps_structural_markers`).
+
+`quantized HF names` - `models/granitemoehybrid.py`, `sanitize`: a dense
+checkpoint quantized under the HF names (mlx-vlm's conversions, the
+Granite Vision 8-bit packs) carries `shared_mlp.input_linear.{scales,biases}`
+and a quantized `lm_head` beside the weights; upstream renames the weight
+alone and the load fails with "parameters not in model". All three
+tensors of a projection are split and renamed, and the head's three are
+dropped under tied embeddings. Upstream's own conversions save under the
+renamed keys already, which is why it never sees this. Tests:
+`tests/test_model_classes.py`
+(`test_a_dense_granite_quantized_under_hf_names_loads`).
+
+`opener token forms` - `tokenizer_utils.py`, `TokenizerWrapper`: the
+reasoning label's token form is read from the encoding of opener plus
+label, not of the label alone; where the vocabulary merges the two
+(Muse: ` to=self` is ` to`, `=self`) the opener's token form becomes the
+pair and no label follows. Tests: `tests/test_families.py`
+(`test_muse_opener_tokens_follow_the_vocabulary`).
 
 `granite4_vision` - `models/granite4_vision.py`, ours (no upstream file):
 the text-only view of a Granite Vision 4.1 checkpoint, after upstream's
@@ -319,6 +363,12 @@ vendored mlx-lm commit and are wired in explicitly - `models/base.py` calls
 the tiled attention, and the engine builds the quantized per-request caches
 itself and hands them to `BatchGenerator.insert`.
 
+For these two files the upstream is, in effect, cut off: optiq publishes no
+source repository, the wheel changes are read release by release (the dates
+above), and the ports have moved onto another cache API. They are carried
+here as our own code from now on - a later optiq release is a source of
+ideas to compare against, not something these files get re-vendored from.
+
 ### Local changes
 
 `kv_batch.py` - `BatchQuantizedKVCache`, `MergeableQuantizedKVCache`: imports
@@ -354,8 +404,11 @@ tiles - fp16 stops resolving the sum past a few thousand tokens. Tests:
 
 ## mlx-vlm
 
-Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, the PyPI wheel
-0.7.1 (`tools/vendor.toml`, part `mlx-vlm`). Two files only,
+Upstream: [mlx-vlm](https://github.com/Blaizzy/mlx-vlm), MIT, at commit
+`1ecf1ecd` - the commit tagged `v0.7.1`, the same files the PyPI wheel 0.7.1
+carries (`tools/vendor.toml`, parts `mlx-vlm` and `mlx-vlm-vision`). A
+commit pin rather than the wheel so the vendor clock can say how far
+upstream moved on exactly these files. Two files only,
 `mlx_beam/_vendor/mlx_vlm/`:
 
 - `quantized_verifier.py` (`models/quantized_verifier.py` upstream): Metal

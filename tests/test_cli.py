@@ -172,7 +172,12 @@ def test_serve_flags_carry_mlx_lm_names_and_units():
     assert args.max_completion_tokens == 64 and args.decode_concurrency == 4
     assert args.allowed_origins == ["http://a", "http://b"]
     assert args.chat_template_args == {"enable_thinking": False}
-    assert serve_args().allowed_origins == ["*"] and serve_args().temp is None
+    assert serve_args().allowed_origins == [] and serve_args().temp is None
+    assert serve_args().api_key is None and not serve_args().skip_api_key
+    assert serve_args("--allowed-hosts", "mac.lan", "10.0.0.5").allowed_hosts == [
+        "mac.lan",
+        "10.0.0.5",
+    ]
     with pytest.raises(SystemExit):
         serve_args("--chat-template-args", "[1]")
     with pytest.raises(SystemExit):

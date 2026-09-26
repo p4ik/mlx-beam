@@ -221,7 +221,11 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         token selected based on the top-p criterion.
     """
     # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L527-L539
-    probs = mx.exp(logprobs)
+    # The sum runs in float32 whatever the logits' width: in bfloat16 the
+    # threshold `1 - top_p` is already 1.0 from top_p 0.001 on, the sum
+    # reaches 1.0 and nothing passes `>`. And the most likely token is kept
+    # whatever the threshold does, so the draw always has a candidate.
+    probs = mx.exp(logprobs.astype(mx.float32))
     # sort in ascending order
     sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
@@ -230,6 +234,8 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
 
     # Scatter the keep mask back into vocabulary order.
     sorted_keep = cumulative_probs > 1 - top_p
+    last = mx.arange(sorted_keep.shape[-1]) == sorted_keep.shape[-1] - 1
+    sorted_keep = sorted_keep | last
     keep = mx.put_along_axis(
         mx.zeros_like(sorted_keep), sorted_indices, sorted_keep, axis=-1
     )

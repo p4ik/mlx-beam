@@ -1,7 +1,9 @@
 """Samplers: shared by setting, keyed when seeded, alternatives on request."""
 
 import mlx.core as mx
+import pytest
 
+from mlx_beam._vendor.mlx_lm.sample_utils import apply_top_p
 from mlx_beam.engine import Engine, GenerationRequest
 from mlx_beam.engine.request import SamplingParams
 from mlx_beam.engine.sampling import (
@@ -150,6 +152,28 @@ def test_ruled_out_tokens_are_no_alternatives():
     out = top_logprobs(lp, 3)
     assert out == ((0, 0.0), (3, -1.5))
     json.dumps(out, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "dtype,top_p",
+    [
+        (mx.float32, 0.1),
+        (mx.float32, 1e-8),
+        (mx.float16, 1e-4),
+        (mx.bfloat16, 1e-3),
+    ],
+)
+def test_top_p_always_keeps_the_most_likely_token(dtype, top_p):
+    """A tiny top_p, or bfloat16 where `1 - top_p` rounds to 1.0, must not
+    empty the candidate set: the most likely token stays, and a seeded
+    draw picks it rather than falling back on token 0."""
+    logits = mx.array([[0.0, 1.0, 4.0, 2.0]], dtype=dtype)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    filtered = apply_top_p(logprobs, top_p)
+    assert mx.isfinite(filtered[0, 2]).item()
+    assert not mx.isfinite(filtered[0, 0]).item()
+    draw = SeededSampler(SamplingParams(temperature=1.0, top_p=top_p, seed=7))
+    assert draw(logprobs).item() == 2
 
 
 def test_a_vanishing_temperature_is_greedy_not_random():

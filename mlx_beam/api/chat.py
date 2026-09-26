@@ -33,11 +33,13 @@ from mlx_beam.api.reasoning import (
     renderer_reasoning_keys,
     translate_effort,
 )
+from mlx_beam.api.roles import check_role, for_template
 from mlx_beam.api.text import (
     TextAssembler,
     TextDelta,
     initial_state,
     logprob_entry,
+    route_label,
     stop_sequence_ids,
     xtc_special_ids,
 )
@@ -216,9 +218,9 @@ def _normalise_messages(messages: Any, images: list[Image] | None = None) -> lis
         if not isinstance(m, dict) or "role" not in m:
             raise ApiError(f"messages[{i}] needs a role", param="messages")
         m = dict(m)
-        if m["role"] == "developer":
-            # OpenAI's newer name for the system role; templates know one.
-            m["role"] = "system"
+        # A role outside the format is refused here; how the template takes
+        # `developer` is decided where the prompt is rendered (roles.py).
+        check_role(m["role"], f"messages[{i}]")
         content = m.get("content")
         if isinstance(content, list):
             parts: list[dict] = []
@@ -404,14 +406,16 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             kwargs[effort_kwarg] = value
             req.template_kwargs[effort_kwarg] = value
 
+    messages = for_template(tokenizer, req.messages)
+
     def render(add_generation_prompt=True, **extra):
         if req.images:
-            built = frontend.build(req.messages, req.images, {**kwargs, **extra})
+            built = frontend.build(messages, req.images, {**kwargs, **extra})
             req.spans = list(built.spans)
             req.assistant_start = built.assistant_start
             return built.tokens
         return tokenizer.apply_chat_template(
-            req.messages,
+            messages,
             add_generation_prompt=add_generation_prompt,
             tokenize=True,
             **{**kwargs, **extra},
@@ -459,9 +463,12 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     if not req.images:
         req.assistant_start = _assistant_start(render, tokens, settled)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
-    if opener and kwargs.get("enable_thinking") is False:
+    if opener and kwargs.get("enable_thinking") is False and not req.tools:
         # A family whose template has no switch (Harmony, Muse): the answer
         # is opened in the prompt, so the model writes it without a block.
+        # Not with tools on offer: a call needs the channel or recipient
+        # the opener would skip past (Harmony's `commentary`, Muse's
+        # ` to=<tool>`), so there the model keeps the choice.
         tokens += list(opener)
     return tokens
 
@@ -500,7 +507,7 @@ def boundaries_and_system_end(
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools
-    messages = req.messages
+    messages = for_template(tokenizer, req.messages)
     ends: set[int] = set()
 
     def render(msgs, generation_prompt):
@@ -565,6 +572,18 @@ def to_generation_request(
         reasoning_cap = max(0, reasoning_cap - close_tail(markers))
     bounded = [v for v in (max_reasoning, reasoning_cap) if v is not None]
     limit = min(bounded) if bounded else None
+    if (
+        req.tools
+        and req.template_kwargs.get("enable_thinking") is False
+        and getattr(tokenizer, "answer_opener_tokens", None)
+    ):
+        # A family without a template switch (Harmony, Muse), thinking off
+        # with tools on offer: the answer's opener stays out of the prompt
+        # (build_prompt - a call needs the channel it would skip past), so
+        # the block is kept out by the budget instead. Zero masks the
+        # reasoning label behind the shared opener and leaves the answer's
+        # and the tools' channels open: the model may call, not think.
+        limit = 0
     if limit == 0 and getattr(tokenizer, "has_thinking", False):
         # No room to think: ask the template to leave the block out, which
         # a Qwen template does; then check whether it did.
@@ -626,14 +645,31 @@ def reasoning_limits(
         )
     label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
     label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
+    labels: tuple[tuple[int, ...], ...] = ()
+    verdict = None
+    if label and label_end:
+        # The mask cuts the label as the vocabulary writes it, with and
+        # without the space a word token carries; what the model writes
+        # instead is judged by its text, as the assembler judges it.
+        spaced = tuple(
+            tokenizer.encode(
+                " " + tokenizer.decode(list(label)), add_special_tokens=False
+            )
+        )
+        labels = (label,) + ((spaced,) if spaced and spaced != label else ())
+
+        def verdict(ids: tuple[int, ...]) -> bool:
+            return route_label(tokenizer, tokenizer.decode(list(ids))) == "reasoning"
+
     return ReasoningLimits(
         start=start,
         end=end,
         close=close,
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
-        labels=(label,) if label and label_end else (),
+        labels=labels,
         label_end=label_end if label else (),
+        label_means_reasoning=verdict,
     )
 
 
@@ -754,10 +790,12 @@ class ChatResponder:
         }
 
     def stream(self, events, cached: int) -> Iterator[dict]:
-        """Chunks as the tokens arrive; tool-call text is held until complete."""
+        """Chunks as the tokens arrive; the assembler holds a tool call's
+        text until it parsed, so a delta inside one is empty - except the
+        text the opener released, which goes out like the whole answer keeps it."""
         for event in events:
             d = self.assembler.feed(event)
-            if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
+            if d.finish_reason is None and d.empty():
                 continue
             yield self.chunk(d)
             if d.finish_reason is not None:

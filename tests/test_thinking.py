@@ -1,5 +1,7 @@
 """The reasoning budget: admission arithmetic, the forced close, the flags."""
 
+from dataclasses import replace
+
 import mlx.core as mx
 import pytest
 
@@ -463,6 +465,108 @@ def test_budget_holds_while_another_prompt_prefills():
         )
 
 
+@pytest.mark.parametrize("limit", range(9))
+def test_a_labelled_block_never_exceeds_a_small_budget(limit):
+    """A labelled opener costs three counted tokens before the first free
+    one (opener, label, label end); the gate that keeps a block from
+    opening must count them, or budgets of two and three overshoot to four."""
+    A, MSG = 40, 42
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, 41, MSG),
+        max_tokens=limit,
+        labels=((A,),),
+        label_end=(MSG,),
+    )
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, A, MSG] + list(range(10, 25))).run(18)
+    assert tracker.reasoning_tokens <= limit
+    if limit < 4:
+        # Header (3) plus one free token do not fit: no block at all.
+        assert A not in out and tracker.reasoning_tokens == 0
+    else:
+        assert tracker.reasoning_tokens == limit and END in out
+
+
+@pytest.mark.parametrize("limit", [0, 4])
+def test_a_label_variant_the_api_routes_as_reasoning_is_counted_and_cut(limit):
+    """The API routes a label by its text (` analysis` and `analysis ` are
+    the reasoning channel like `analysis`); the budget must count what the
+    API shows as reasoning, or a variant runs unbounded. The API's verdict
+    is asked for the label the model wrote; the mask that keeps a block
+    from forming cuts every label form it was given - a form it does not
+    know (the label and a space) begins with one it does. A header longer
+    than the canonical one leaves no room for the free token the arming
+    counts on: the close is forced in the same step the label ends, decided
+    in the graph, so the budget holds exactly - unless the header alone
+    exceeds it. A label that goes on into a tool's name forces nothing."""
+    A, A_SPACED, SP, T, F, MSG = 40, 39, 38, 37, 41, 42
+    reasoning = ((A,), (A_SPACED,), (A, SP), (A, SP, SP))
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=limit,
+        labels=((A,), (A_SPACED,)),
+        label_end=(MSG,),
+        label_means_reasoning=lambda ids: ids in reasoning,
+    )
+    body = list(range(10, 26))
+    for label in ((A,), (A_SPACED,), (A, SP), (A, SP, SP)):
+        tracker = ThinkingBudget(limits)
+        steps = Steps(tracker, [START, *label, MSG, *body])
+        out = steps.run(20)
+        header = 2 + len(label)
+        if limit == 0:
+            assert label[0] not in out and tracker.reasoning_tokens == 0, label
+        else:
+            assert END in out and tracker.thinking_truncated, label
+            assert tracker.reasoning_tokens == max(limit, header), label
+            # The close sits right where the budget is up: after the free
+            # token, or right after the label's end when the header used
+            # that token up.
+            assert out.index(END) == header + (limit > header), label
+            assert steps.forced[out.index(END)]
+    # A label the API routes elsewhere opens nothing - the answer's channel,
+    # and a tool's name that began like the reasoning label.
+    for label in ((F,), (A, SP, T)):
+        tracker = ThinkingBudget(limits)
+        steps = Steps(tracker, [START, *label, MSG, *body])
+        out = steps.run(20)
+        assert END not in out and tracker.reasoning_tokens == 0, label
+        assert not any(steps.forced)
+
+
+def test_a_longer_label_in_a_later_block_is_judged_against_the_rest():
+    """The forced close at a label's end is decided against what the budget
+    has left, not against the whole of it: a second block whose header
+    takes the rest exactly gets its close at once."""
+    A, SP, F, MSG = 40, 38, 41, 42
+    reasoning = ((A,), (A, SP))
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=8,
+        labels=((A,),),
+        label_end=(MSG,),
+        label_means_reasoning=lambda ids: ids in reasoning,
+    )
+    body = list(range(10, 30))
+    # First block: header 3 and one token, closed by the model - 4 spent.
+    first = [START, A, MSG, 10, END]
+    for label, expected in (((A,), 8), ((A, SP), 8)):
+        tracker = ThinkingBudget(limits)
+        steps = Steps(tracker, first + [START, *label, MSG, *body])
+        out = steps.run(24)
+        second = out.index(START, 1)
+        assert tracker.reasoning_tokens == expected, label
+        # Header 3 leaves one free token; header 4 none.
+        assert out.index(END, second) == second + 2 + len(label) + (len(label) == 1)
+        assert tracker.thinking_truncated
+
+
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     """Harmony and Muse open the answer and a tool call with the same
     marker as the reasoning block, followed by a label. The budget waits
@@ -498,3 +602,12 @@ def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     out = Steps(tracker, [START, A, MSG, 10, 11, 12, 13, 14, 15, 16]).run(10)
     assert END in out and tracker.thinking_truncated
     assert out.index(END) <= 6
+    # Budget zero: the shared opener stays open for the answer's channel
+    # and a tool's; only the reasoning label after it is cut.
+    tracker = ThinkingBudget(replace(limits, max_tokens=0))
+    out = Steps(tracker, [START, A, MSG, 10, START, F, MSG, 11]).run(8)
+    assert out[0] == START and out[1] != A and START in out[1:]
+    assert tracker.reasoning_tokens == 0
+    tracker = ThinkingBudget(replace(limits, max_tokens=0))
+    out = Steps(tracker, [START, F, MSG, 10, 11]).run(5)
+    assert out == [START, F, MSG, 10, 11] and not tracker.in_reasoning

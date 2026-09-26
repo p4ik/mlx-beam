@@ -29,6 +29,8 @@ Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bit
 
 `--draft-model bundled` turns on speculative decoding with the draft head the checkpoint ships (Qwen3.5/3.8 packs carry one): a request decoding alone gets up to `--max-draft-tokens` + 1 tokens per model call (the drafts and the token the model samples after them; a regulator picks the depth per cycle from measured acceptance and cost, and parks the head when it loses), each one the model's own - its argmax over the verify forward for a greedy request, its own draw for a sampled one (the draw is keyed by position, so a seeded request gives the same tokens with and without the draft head). Logit bias, penalties and the thinking budget apply per verify position as in plain decoding. The head is primed over the prompt in the prefill and keeps its history across turns through the prefix cache. The output equals plain decoding up to kernel rounding at another width (bit-identical in bf16 in every measured case); `--exact-verify` closes that gap. Several requests at once decode plainly; `/health.speculative` shows cycles, drafted and accepted tokens.
 
+Access follows the bind. On a loopback address (`127.0.0.1`, `::1`, `localhost` - the default) the server asks for nothing. Any other `--host` refuses to start without `--api-key <key>` (sent as `Authorization: Bearer <key>` or `x-api-key`; `/health` and `/metrics` sit behind it too) or `--skip-api-key`, an open server on purpose, said so at start. The `Host` header must name the machine as the server knows it - `localhost`, the bind address, or what `--allowed-hosts` adds - or the request gets 403, which is what keeps a page in a browser from reaching the server through a rebound name. CORS admits no origin until `--allowed-origins` names it. `/health.api.auth` says which mode is on.
+
 Requests may use the names other servers taught clients: `max_tokens`, `thinking_token_budget`, `reasoning: {effort, max_tokens}`, `enable_thinking`, `reasoning_effort`. The model's thinking is returned in `reasoning` (`--reasoning-field` switches to `reasoning_content`, both, or none), counted in `usage.completion_tokens_details.reasoning_tokens`, and flagged there when a limit cut it (`thinking_truncated`, `response_truncated`). A tool call the model wrote badly goes through a repair ladder - mended JSON, values coerced to the declared schema - with every step reported in the call's `repair_actions`, and comes back as text when no step makes it valid.
 
 ## What sets it apart
@@ -39,7 +41,7 @@ Requests may use the names other servers taught clients: `max_tokens`, `thinking
 - **Multi-token prediction** — The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned.
 - **Thinking budget** — A hard cap on the reasoning trace, per request.
 - **Responses and Messages APIs** — Next to chat completions, stateless: OpenAI's Responses shape and Anthropic's Messages shape on the same token path.
-- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned.
+- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned. Nothing in the core talks to the network on its own.
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 
@@ -53,14 +55,16 @@ Existing MLX servers either stop at the basics or grow things that have no place
 |---|---|
 | CLI, packaging, CI | done |
 | Vendored mlx-lm base (pinned; the local changes are listed in `VENDORED.md`) | done |
-| OpenAI-compatible server, continuous batching, quantized KV cache | done, text only |
+| OpenAI-compatible server, continuous batching, quantized KV cache | done |
 | Prefix cache with recurrent-state checkpoints | done, RAM tier |
 | Reasoning budget, request defaults, sampling controls | done |
-| Multi-token prediction | done for one request at a time (greedy); in the batch and under sampling planned |
-| Vision, structured output | planned, as extras |
+| Multi-token prediction | done, greedy or sampled, one request at a time; in the batch planned |
+| Vision | done as the package `mlx-beam-vision`: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite Vision towers |
+| Responses and Messages APIs, `/metrics`, tool-call repair | done |
+| Structured output, GGUF | planned, as extras with a guard |
 | Expert streaming from SSD | planned |
 
-Measured numbers are published as they are measured, with machine, model and date.
+Measured numbers are published as they are measured, with machine, model and date. Mac mini M4 Pro 64 GB, Qwen3.8-27B 5-bit with 8-bit KV, one request, 2026-09-26 (`0.1.0a6`): decode 11.4 tok/s at 12 000 generated tokens; prefill 115 tok/s over a 16 588-token prompt; a short request answered in 2.4 s while that prefill ran; 45 minutes under a steady stream, 5 057 requests, none failed. Speculative acceptance and batch numbers follow when they are measured the same way.
 
 ## Contributing
 

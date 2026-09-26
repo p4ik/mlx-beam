@@ -1,0 +1,52 @@
+name: Vendor clock
+
+# Once a week: how far each git upstream moved since its pin. Past 30 days
+# or 20 commits on the vendored files it opens (or extends) one issue, so a
+# sighting gets scheduled instead of forgotten.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  clock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Diff the pins and read the clock
+        id: clock
+        run: |
+          set +e
+          python3 tools/vendor_diff.py --clock --max-days 30 --max-commits 20 | tee clock.txt
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: Open or extend the sighting issue
+        if: steps.clock.outputs.rc == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh label create vendor-clock --color 1d76db --description "a vendored part moved past its clock" --force
+          {
+            echo "The vendored parts moved past the clock (30 days or 20 upstream commits on the vendored files). Time for a sighting: diff the files against upstream, take what is worth taking, record the result in VENDORED.md - also when nothing is taken."
+            echo
+            echo '```'
+            grep -v '^[-+ @]' clock.txt
+            echo '```'
+          } > body.md
+          n=$(gh issue list --label vendor-clock --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body-file body.md
+          else
+            gh issue create --title "Vendor clock: an upstream moved past its pin" --label vendor-clock --body-file body.md
+          fi
+      - name: A vendored file differs from its pin
+        if: steps.clock.outputs.rc == '1'
+        run: exit 1
