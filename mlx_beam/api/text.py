@@ -411,8 +411,12 @@ class TextAssembler:
         route_thinking: bool = True,
         tools_enabled: bool = True,
         lead: bool = True,
+        raw: bool = False,
     ):
         self._tokenizer = tokenizer
+        # The raw endpoint: every marker the automaton cuts goes back into
+        # the text where it was, structural ones included.
+        self._raw = raw
         self._detok = tokenizer.detokenizer
         # The automaton always runs, so reasoning is counted in every mode;
         # routing off puts the markers back into the text where they were cut.
@@ -467,6 +471,7 @@ class TextAssembler:
         self.stopped_word: str | None = None
         self._stop_words = sorted(stop_words or [], key=len, reverse=True)
         self._tail = ""
+        self._pieces: list = []
         self.reasoning_tokens = 0
         # From the engine's last event: which limit cut what.
         self.thinking_truncated = False
@@ -493,10 +498,14 @@ class TextAssembler:
             self._detok.finalize()
             segment = self._detok.last_segment
             self._tail = self._tail[-self._tail_len() :] + segment
-            self._state, clean, current = TextStateMachine.step(self._state, segment)
+            clean, before, after, markers, current = self._step(segment)
             if current is not None:
                 self._state, flushed, current = TextStateMachine.flush(self._state)
                 clean += flushed
+                if after or markers:
+                    after += flushed
+                else:
+                    before += flushed
         else:
             if event.forced and not self._fragment_checked:
                 # The budget may cut a byte-level tokenizer mid-character:
@@ -509,15 +518,20 @@ class TextAssembler:
                 self._detok.finalize()
             segment = self._detok.last_segment
             self._tail = self._tail[-self._tail_len() :] + segment
-            self._state, clean, current = TextStateMachine.step(self._state, segment)
+            clean, before, after, markers, current = self._step(segment)
             if event.forced and self._fragment:
                 clean = clean.replace("\ufffd", "", 1)
+                before = before.replace("\ufffd", "", 1)
                 self._fragment = False
             if event.finish_reason == "length" and current is not None:
                 # A stop word already matched leaves its tail in the buffer;
                 # that tail is not output.
                 self._state, flushed, current = TextStateMachine.flush(self._state)
                 clean += flushed
+                if after or markers:
+                    after += flushed
+                else:
+                    before += flushed
 
         if current is None:
             # A stop word matched in the text: what came before it is the
@@ -529,18 +543,31 @@ class TextAssembler:
             self.stopped_word = next(
                 (w for w in self._stop_words if w in self._tail), None
             )
+            # A transition before the stop word in the same segment: the
+            # text before it is the previous state's, the rest the state
+            # the stop word was matched in (a block that closed, then text).
+            head, tail = (before, after) if markers[:-1] else (clean, "")
             if self._prev == "reasoning" and self._route:
-                delta.reasoning = clean
+                delta.reasoning = head
             elif self._prev == "label" and self._route:
                 # The segment may hold the label's end and reasoning text
                 # before the stop word; only the label is dropped.
-                delta.reasoning = self._after_label(clean) or ""
+                delta.reasoning = self._after_label(head) or ""
             elif self._prev != "tool":
-                delta.content = self._take_lead() + clean
+                delta.content = self._take_lead() + head
             else:
                 # The call's last text before the stop word: it belongs to
                 # the cut-off block, which goes back as text unrepaired.
-                self._tool_text += clean
+                self._tool_text += head
+            if tail:
+                if self._prev == "tool":
+                    self._pending_tools.append(
+                        (self._tool_text, True, self._tool_opener)
+                    )
+                    self._tool_text = ""
+                elif self._prev in ("reasoning", "label") and not self._route:
+                    tail = self._take_lead() + self._think_end + tail
+                delta.content += tail
             self.stopped = True
             self._book(event, "", bool(delta.content), own=False)
             self._prev = "normal"
@@ -601,29 +628,51 @@ class TextAssembler:
                         delta.content += rest
         elif current == "reasoning":
             self.reasoning_tokens += 1
+            entered = self._prev not in ("reasoning", "label")
+            head = before if entered and markers else ""
+            body = after if entered and markers else clean
             if self._route:
-                delta.reasoning = clean
+                delta.content = head
+                delta.reasoning = body
             else:
                 opened = self._think_start if self._prev != "reasoning" else ""
-                delta.content = (self._take_lead() or opened) + clean
+                delta.content = head + (self._take_lead() or opened) + body
         elif current == "tool":
-            self._tool_text += clean
+            if self._prev != "tool" and markers:
+                delta.content = before
+                self._tool_text += after
+            else:
+                self._tool_text += clean
         else:
+            head, body = (before, after) if markers else ("", clean)
             if self._prev == "tool":
                 # The end marker may sit inside a text segment (ATEM's is
                 # plain text): what the automaton released with it is the
-                # call's last text, not the answer's.
+                # call's last text, not the answer's - and what follows the
+                # marker is the answer's, not the call's.
                 self._pending_tools.append(
-                    (self._tool_text + clean, True, self._tool_opener)
+                    (self._tool_text + head, True, self._tool_opener)
                 )
                 self._tool_text = ""
-                clean = ""
-            closed = ""
-            if self._prev in ("reasoning", "label") and not self._route:
-                # A block the prompt opened may close on the first token.
-                closed = self._take_lead() + self._think_end
+                head = ""
+            elif self._prev in ("reasoning", "label"):
+                # Text held back before the end marker (a `<` that could
+                # have begun it) is the block's, released with the marker.
+                if self._route:
+                    delta.reasoning = (
+                        self._after_label(head) or "" if self._prev == "label" else head
+                    )
+                    head = ""
+                else:
+                    # A block the prompt opened may close on the first token.
+                    head = head + self._take_lead() + self._think_end
+            elif self._raw and markers:
+                # The raw endpoint: a structural marker (the frame's, a
+                # message's) is what the model wrote and goes back where it
+                # was cut - the automaton only tracked it.
+                head, body = "", self._verbatim()
             self._label = ""
-            delta.content = closed + clean
+            delta.content = head + body
         # A marker token releases no text; the stop token none either -
         # what its arrival flushed belongs to the tokens held before it.
         self._book(
@@ -682,6 +731,31 @@ class TextAssembler:
             self.pending_events.append((held, content))
         self._held = []
         self.pending_events.append((event, content if own is None else own))
+
+    def _step(self, segment: str):
+        """The automaton's step, with the released text kept apart: `clean`
+        is all of it, `before` what came out while still in the state the
+        segment began in (held back before a marker), `after` the rest;
+        `markers` the control sequences cut on the way. The pieces are kept
+        for the raw endpoint, which gives structural markers back."""
+        self._state, pieces, current = TextStateMachine.step_pieces(
+            self._state, segment
+        )
+        self._pieces = pieces
+        before, after, markers = [], [], []
+        for text, kind, _ in pieces:
+            if kind == "marker":
+                markers.append(text)
+            elif markers:
+                after.append(text)
+            else:
+                before.append(text)
+        clean = "".join(before) + "".join(after)
+        return clean, "".join(before), "".join(after), markers, current
+
+    def _verbatim(self) -> str:
+        """The segment as the model wrote it: text and markers in order."""
+        return "".join(text for text, _, _ in self._pieces)
 
     def _tail_len(self) -> int:
         return max((len(w) for w in self._stop_words), default=0)

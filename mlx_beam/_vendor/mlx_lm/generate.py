@@ -971,12 +971,34 @@ class TextStateMachine:
         emittable_text is the text safe to show (control sequences stripped,
         possible partial matches held back in the buffer).
         """
+        state, pieces, s = TextStateMachine.step_pieces(state, text)
+        return state, "".join(t for t, kind, _ in pieces if kind == "text"), s
+
+    @staticmethod
+    def step_pieces(state, text):
+        """Like step, but keeps the released text apart by the state it was
+        released in. Returns (new_state, pieces, current_state_name) with
+        pieces a list of (text, kind, state_name): kind "text" is text safe
+        to show, released while in state_name; kind "marker" is a control
+        sequence that matched while in state_name and switched away from
+        it. A consumer can tell text held back before a marker (the
+        previous state's) from text after it, and give a marker back where
+        it was cut. (Local: the assembler routes by piece.)
+        """
         s, n, states, buf = state
         buf += text
         trie = states[s][0]
-        emittable = ""
+        pieces = []
         # buf[:consumed] has been emitted or discarded; buf[consumed:] pending.
         consumed = 0
+
+        def release(text, kind, state_name):
+            if not text:
+                return
+            if kind == "text" and pieces and pieces[-1][1:] == ("text", state_name):
+                pieces[-1] = (pieces[-1][0] + text, "text", state_name)
+            else:
+                pieces.append((text, kind, state_name))
 
         for i in range(len(buf)):
             ch = buf[i]
@@ -988,19 +1010,20 @@ class TextStateMachine:
             match = n.get("__match__")
             if match is not None:
                 match_start = i + 1 - len(match[0])
-                emittable += buf[consumed:match_start]
+                release(buf[consumed:match_start], "text", s)
+                release("".join(match[0]), "marker", s)
                 consumed = i + 1
                 s = states[s][1][match[1]]
                 if s is None:
-                    return (s, None, states, buf[consumed:]), emittable, s
+                    return (s, None, states, buf[consumed:]), pieces, s
                 trie = states[s][0]
                 n = trie
             elif n is trie:
                 # At the root: no partial match in progress, everything is safe.
-                emittable += buf[consumed : i + 1]
+                release(buf[consumed : i + 1], "text", s)
                 consumed = i + 1
 
-        return (s, n, states, buf[consumed:]), emittable, s
+        return (s, n, states, buf[consumed:]), pieces, s
 
     @staticmethod
     def flush(state):

@@ -79,6 +79,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `top_p` could remove every candidate - in bfloat16 from `top_p 0.001`
   on, in float32 from `1e-8` - and the draw fell on token 0. The vendored
   filter sums in float32 and always keeps the most likely token.
+- Text held back inside a think block because it could have begun the
+  end marker (`<`, `</`, `</thi`) was released with the real marker and
+  read as the answer's; and text on either side of a marker within one
+  decoded segment all went to the state after it. The text automaton now
+  reports what it released by the state it was released in, and the
+  assembler routes each part to its own side - reasoning, answer or tool
+  call.
+- `/v1/completions` cut the structural markers of a message frame
+  (`<|start|>assistant`) out of the raw text; the raw endpoint puts every
+  marker back where it was.
 - A reasoning budget of zero (or one used up) masked Harmony's shared
   `<|channel|>` marker, which the answer's and a tool's channel need as
   much as the reasoning; the mask now cuts the reasoning label after the

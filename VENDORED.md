@@ -194,6 +194,18 @@ the next tokens and never replaces the current ones), which held the
 arrays of every emptied batch alive. Tests: `tests/test_vendor_mlx_lm.py`
 (`test_an_emptied_batch_keeps_no_current_tokens`).
 
+`text pieces` - `generate.py`, `TextStateMachine.step_pieces`: `step` released
+the text before a marker and the text after it as one string with only the
+end state, so a `<` held back inside a think block came out with the block's
+close and was read as the answer's, and the raw endpoint had no way to give
+a structural marker back. `step_pieces` returns the released text as
+(text, kind, state) pieces - text by the state it was released in, markers
+as their own pieces - and `step` is `step_pieces` joined, unchanged for
+upstream's callers. Tests: `tests/test_api.py`
+(`test_a_marker_prefix_held_back_before_the_close_stays_in_the_block`,
+`test_text_around_a_marker_in_one_segment_goes_to_both_sides`,
+`test_the_raw_endpoint_keeps_structural_markers`).
+
 `quantized HF names` - `models/granitemoehybrid.py`, `sanitize`: a dense
 checkpoint quantized under the HF names (mlx-vlm's conversions, the
 Granite Vision 8-bit packs) carries `shared_mlp.input_linear.{scales,biases}`

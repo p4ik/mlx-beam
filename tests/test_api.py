@@ -957,6 +957,78 @@ def test_a_tool_call_that_does_not_parse_comes_back_as_text():
     assert choice["message"]["content"] == "<tool_call>bad w11 </tool_call>"
 
 
+@pytest.mark.parametrize("fragment", ["<", "</", "</thi"])
+def test_a_marker_prefix_held_back_before_the_close_stays_in_the_block(fragment):
+    """Text that could have begun the end marker is held back; when the
+    real marker arrives it is released with it - and belongs to the block
+    it was written in, not to the answer that follows the marker."""
+    tok = StubTokenizer()
+    tok._words[10] = "private "
+    tok._words[11] = fragment
+    tok._words[12] = "answer"
+    asm = TextAssembler(tok, prompt_tokens=[])
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, 11, THINK_END, 12)
+    ]
+    assert "".join(d.reasoning for d in deltas) == "private " + fragment
+    assert "".join(d.content for d in deltas) == "answer"
+    # With routing off the block goes back verbatim, the fragment before
+    # its marker.
+    asm = TextAssembler(tok, prompt_tokens=[], route_thinking=False)
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, 11, THINK_END, 12)
+    ]
+    assert "".join(d.content for d in deltas) == (
+        "<think>private " + fragment + "</think>answer"
+    )
+
+
+def test_text_around_a_marker_in_one_segment_goes_to_both_sides():
+    """One decoded segment can carry text, a marker and more text: the
+    text before the marker is the old state's, the text after it the
+    new state's - for the opener, the close and a tool call alike."""
+    tok = StubTokenizer()
+    tok._words[10] = "a<think>b"
+    tok._words[11] = "c</think>d"
+    tok._words[12] = "e<tool_call>f "
+    tok._words[13] = "g</tool_call>h"
+    asm = TextAssembler(tok, prompt_tokens=[], tools=[])
+    deltas = [asm.feed(TokenEvent(t, -0.1)) for t in (10, 11, 12, 13)]
+    assert [d.content for d in deltas] == ["a", "d", "e", "h"]
+    assert [d.reasoning for d in deltas] == ["b", "c", "", ""]
+    call = deltas[-1].tool_calls[0]["function"]
+    assert call["name"] == "f" and json.loads(call["arguments"]) == {"words": "g"}
+
+
+def test_the_raw_endpoint_keeps_structural_markers():
+    """/v1/completions returns what the model wrote: a frame marker the
+    automaton tracks is put back where it was cut."""
+    tok = StubTokenizer()
+    tok.structural_markers = ("<frame>",)
+    tok._words[10] = "<frame>"
+    tok._words[11] = "assistant"
+    asm = TextAssembler(
+        tok,
+        prompt_tokens=[],
+        tools_enabled=False,
+        route_thinking=False,
+        lead=False,
+        raw=True,
+    )
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 11 else None)) for t in (10, 11)
+    ]
+    assert "".join(d.content for d in deltas) == "<frame>assistant"
+    # Chat keeps cutting it.
+    asm = TextAssembler(tok, prompt_tokens=[], route_thinking=False)
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 11 else None)) for t in (10, 11)
+    ]
+    assert "".join(d.content for d in deltas) == "assistant"
+
+
 def test_a_stop_word_inside_a_tool_call_keeps_the_text_before_it():
     """The call is cut at the stop word and goes back as text; what stood
     between the last segment and the word is part of it, not lost."""
