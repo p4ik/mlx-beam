@@ -6,6 +6,20 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Added
+- Access control that follows the bind: on loopback nothing is asked; on
+  any other `--host` the server starts only with `--api-key <key>`
+  (`Authorization: Bearer` or `x-api-key`, `/health` and `/metrics`
+  included, 401 otherwise) or `--skip-api-key`, and warns at start that it
+  is reachable. The `Host` header must be `localhost`, the bind address or
+  one of `--allowed-hosts`, else 403 - a browser's DNS rebinding sends
+  another. `/health.api.auth` reports the mode and the hosts.
+
+### Changed
+- CORS admits no origin by default; `--allowed-origins` names the pages
+  that may call the server (was `*`, any page in a browser could read the
+  answers of a server on loopback).
+
 ### Fixed
 - Muse: the reasoning went into the answer, with `to=self` leaking in
   front of it. The detokenizer drops the space a sequence starts with, so

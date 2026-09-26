@@ -403,13 +403,19 @@ def test_cors_echoes_only_listed_origins():
         engine.stop()
 
 
-def test_cors_default_admits_everyone(server):
+def test_cors_default_admits_no_origin(server):
+    """Nothing is listed by default: a page in a browser cannot read the
+    answers of a server it was not told about (the operator names origins)."""
     conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
     conn.request("OPTIONS", "/v1/models", headers={"Origin": "http://any.test"})
     resp = conn.getresponse()
     resp.read()
     conn.close()
-    assert resp.getheader("Access-Control-Allow-Origin") == "*"
+    assert resp.status == 204
+    assert resp.getheader("Access-Control-Allow-Origin") is None
+    status, _, raw = call(server, "GET", "/health")
+    auth = json.loads(raw)["api"]["auth"]
+    assert auth["mode"] == "loopback" and "localhost" in auth["allowed_hosts"]
 
 
 def test_queue_full_is_a_503_with_retry_after():
@@ -554,7 +560,11 @@ def test_a_failed_stream_write_is_not_retried(server, monkeypatch):
     assert len(writes) == 2 or writes[1] != writes[2]
 
 
-def test_preflight_allows_the_headers_the_browser_asks_for(server):
+def test_preflight_allows_the_headers_the_browser_asks_for():
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://app"])
+    server = BeamServer(served, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
     conn.request(
         "OPTIONS",
@@ -573,6 +583,8 @@ def test_preflight_allows_the_headers_the_browser_asks_for(server):
         resp.getheader("Access-Control-Allow-Headers") == "x-stainless-os, content-type"
     )
     assert resp.getheader("Access-Control-Max-Age") == "600"
+    server.shutdown()
+    engine.stop()
 
 
 def test_health_says_how_the_template_takes_developer(server):
@@ -601,8 +613,12 @@ def test_a_socket_error_while_reading_the_body_closes_the_connection():
         def read(self, n):
             raise ConnectionAbortedError("aborted under the read")
 
+    from types import SimpleNamespace
+
+    from mlx_beam.api.access import Access
+
     h = Handler.__new__(Handler)
-    h.served = None
+    h.served = SimpleNamespace(access=Access.local())
     h.command, h.path, h.request_version = "POST", "/v1/completions", "HTTP/1.1"
     h.requestline = "POST /v1/completions HTTP/1.1"
     h.client_address = ("127.0.0.1", 1)

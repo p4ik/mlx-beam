@@ -22,6 +22,7 @@ from typing import Any
 
 from mlx_beam import __version__
 from mlx_beam.api import chat, completions, messages, metrics, repair, responses, roles
+from mlx_beam.api.access import Access
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
@@ -61,7 +62,8 @@ class Served:
         model_name: str,
         reasoning_field: str = "reasoning",
         defaults: RequestDefaults | None = None,
-        allowed_origins: Sequence[str] = ("*",),
+        allowed_origins: Sequence[str] = (),
+        access: Access | None = None,
         chat_template_source: str = "model",
         frontend=None,
         vision_refused: str | None = None,
@@ -74,6 +76,8 @@ class Served:
         self.reasoning_field = reasoning_field
         self.defaults = defaults or RequestDefaults()
         self.allowed_origins = tuple(allowed_origins)
+        # Who may call: the key policy and the Host names, from the bind.
+        self.access = access or Access.local()
         # "model", "flag" or "default": where the chat template came from.
         self.chat_template_source = chat_template_source
         # The modality frontend a separate package loaded for this
@@ -189,6 +193,7 @@ class Served:
             "reasoning_field": self.reasoning_field,
             "defaults": self.defaults.describe(),
             "allowed_origins": list(self.allowed_origins),
+            "auth": self.access.describe(),
             "chat_template": self.chat_template_source,
             # Which message keys the template reads earlier reasoning from.
             "reasoning_keys_read": list(renderer_reasoning_keys(self.tokenizer)),
@@ -308,9 +313,47 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             raise ApiError(f"invalid JSON: {e.msg}") from None
 
+    # -- admission --------------------------------------------------------
+
+    def _admitted(self) -> bool:
+        """The Host must be one the server was told about (a browser's DNS
+        rebinding sends another), and outside loopback the key must match;
+        a preflight carries no credentials by the browser's rules and is
+        let through to its CORS answer."""
+        access = self.served.access
+        if not access.host_allowed(self.headers.get("Host")):
+            self._send_error(
+                ApiError(
+                    "the Host header is not one this server answers to; "
+                    "start it with --allowed-hosts to add it",
+                    status=403,
+                    type="permission_error",
+                    code="host_not_allowed",
+                )
+            )
+            return False
+        if self.command != "OPTIONS" and not access.authorized(self.headers):
+            self._send_json(
+                401,
+                self._error_body(
+                    ApiError(
+                        "a valid API key is required: Authorization: Bearer "
+                        "<key> or x-api-key",
+                        status=401,
+                        type="invalid_request_error",
+                        code="invalid_api_key",
+                    )
+                ),
+                {"WWW-Authenticate": "Bearer"},
+            )
+            return False
+        return True
+
     # -- routes -----------------------------------------------------------
 
     def do_HEAD(self):
+        if not self._admitted():
+            return
         self._send_error(
             ApiError(
                 "method not allowed",
@@ -323,11 +366,15 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_HEAD
 
     def do_OPTIONS(self):
+        if not self._admitted():
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        if not self._admitted():
+            return
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/health":
             h = self.served.health()
@@ -341,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error(ApiError("not found", status=404, type="not_found_error"))
 
     def do_POST(self):
+        if not self._admitted():
+            return
         path = self.path.split("?", 1)[0].rstrip("/")
         routes: dict[str, Callable[[dict], None]] = {
             "/v1/chat/completions": self._chat,

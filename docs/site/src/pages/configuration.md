@@ -21,10 +21,18 @@ Flags take mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`
 | `--reasoning-field` | `reasoning` / `reasoning_content` / `both` / `none` | `reasoning` | where a chat completion carries the model's thinking: the field name(s), or none to leave the think markers in the content |
 | `--host` | text | `127.0.0.1` | address to listen on |
 | `--port` | integer ≥ 1 | `8000` | TCP port to listen on |
-| `--allowed-origins` | `ORIGIN` (one or more) | `*` | origins CORS admits (default: any) |
+| `--allowed-origins` | `ORIGIN` (one or more) | — | origins CORS admits, so a page in a browser may call the server; by default none |
 | `--max-queued` | integer ≥ 1 | — | requests allowed to wait for a batch slot; one more is a 503 with Retry-After (default: unlimited) |
 | `--trust-remote-code` | switch | — | run a model_file shipped inside the checkpoint |
 | `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | how much the server log says |
+
+### Access
+
+| Flag | Value | Default | What it does |
+|---|---|---|---|
+| `--api-key` | `KEY` | — | the key every request must carry (Authorization: Bearer or x-api-key); required off loopback unless --skip-api-key |
+| `--skip-api-key` | switch | — | serve without a key on a non-loopback --host, on purpose |
+| `--allowed-hosts` | `HOST` (one or more) | — | Host header values accepted next to localhost and --host, e.g. the machine's name or LAN address behind a wildcard bind; other hosts get 403 |
 
 ### Chat template
 
