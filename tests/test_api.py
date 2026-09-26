@@ -758,6 +758,17 @@ def test_request_defaults_precedence(tmp_path):
         RequestDefaults.resolve(tmp_path)
     with pytest.raises(ValueError, match="top_p from flag"):
         RequestDefaults.resolve(tmp_path / "missing", flags={"top_p": 1.5})
+    # What a request may not ask for is no default either: a number that
+    # is not one, and a penalty the request parser calls not positive.
+    with pytest.raises(ValueError, match="temperature from flag"):
+        RequestDefaults.resolve(
+            tmp_path / "missing", flags={"temperature": float("nan")}
+        )
+    with pytest.raises(ValueError, match="repetition_penalty from flag"):
+        RequestDefaults.resolve(tmp_path / "missing", flags={"repetition_penalty": 0.0})
+    (tmp_path / "generation_config.json").write_text('{"repetition_penalty": 0}')
+    with pytest.raises(ValueError, match="repetition_penalty from generation_config"):
+        RequestDefaults.resolve(tmp_path)
 
 
 def test_logit_bias_values_are_bounded_numbers():
@@ -1027,6 +1038,81 @@ def test_the_raw_endpoint_keeps_structural_markers():
         asm.feed(TokenEvent(t, -0.1, "length" if t == 11 else None)) for t in (10, 11)
     ]
     assert "".join(d.content for d in deltas) == "assistant"
+
+
+def test_the_stream_sends_what_the_tool_opener_released():
+    """Text the automaton held back before a tool opener (a `<` that could
+    have begun a marker, or the rest of the segment the opener sits in)
+    comes out with the opener - after which the assembler is inside the
+    call. The stream must send that delta like the whole answer keeps it;
+    the call's own text stays held until it parsed."""
+    for words, expected in (
+        ({10: "Look <tool_call>good ", 11: "x</tool_call>"}, "Look "),
+        ({10: "Look <", 11: "<tool_call>good ", 12: "x</tool_call>"}, "Look <"),
+    ):
+        tok = StubTokenizer()
+        for t, w in words.items():
+            tok._words[t] = w
+        ids = sorted(words)
+        for stream in (False, True):
+            req, prompt = _chat(tok, stream=stream)
+            events = [TokenEvent(t, -0.1) for t in ids] + [
+                TokenEvent(EOS, -0.1, "stop")
+            ]
+            responder = chat.ChatResponder(tok, req, prompt)
+            if stream:
+                chunks = list(responder.stream(iter(events), 0))
+                deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+                content = "".join(d.get("content", "") for d in deltas)
+                calls = [c for d in deltas for c in d.get("tool_calls", [])]
+            else:
+                out = responder.complete(iter(events), 0)
+                content = out["choices"][0]["message"]["content"]
+                calls = out["choices"][0]["message"]["tool_calls"]
+            assert content == expected, (words, stream)
+            assert [c["function"]["name"] for c in calls] == ["good"], (words, stream)
+
+
+def test_a_marker_prefix_held_back_before_a_tool_call_stays_in_the_block():
+    """The think block may end in a tool call (the automaton knows the
+    transition): what the block held back before the opener is the
+    block's reasoning, not the answer's text."""
+    tok = StubTokenizer()
+    tok._words[10] = "private <"
+    tok._words[11] = "search x"
+    tok._words[12] = "done"
+    asm = TextAssembler(tok, prompt_tokens=[], tools=[])
+    deltas = [
+        asm.feed(TokenEvent(t, -0.1, "length" if t == 12 else None))
+        for t in (THINK_START, 10, TOOL_START, 11, TOOL_END, 12)
+    ]
+    assert "".join(d.reasoning for d in deltas) == "private <"
+    assert "".join(d.content for d in deltas) == "done"
+    call = [c for d in deltas for c in d.tool_calls][0]["function"]
+    assert call["name"] == "search" and json.loads(call["arguments"]) == {"words": "x"}
+
+
+@pytest.mark.parametrize("text", ["<frame><", "<frame>x<", "<frame></thi"])
+@pytest.mark.parametrize("finish", ["length", "stop"])
+def test_the_raw_endpoint_keeps_what_the_end_flushed_after_a_marker(text, finish):
+    """A marker's possible start held back at the end of the stream is the
+    model's text and is flushed - also when the last segment carried a
+    structural marker, which the raw endpoint puts back from the pieces."""
+    tok = StubTokenizer()
+    tok.structural_markers = ("<frame>",)
+    tok._words[10] = text
+    asm = TextAssembler(
+        tok,
+        prompt_tokens=[],
+        tools_enabled=False,
+        route_thinking=False,
+        lead=False,
+        raw=True,
+    )
+    # A stop that is a stop word's last token (not an eos) goes through
+    # the detokenizer like a length cut; the token here is no eos.
+    d = asm.feed(TokenEvent(10, -0.1, finish))
+    assert d.content == text
 
 
 def test_a_stop_word_inside_a_tool_call_keeps_the_text_before_it():

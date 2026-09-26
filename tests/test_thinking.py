@@ -489,6 +489,43 @@ def test_a_labelled_block_never_exceeds_a_small_budget(limit):
         assert tracker.reasoning_tokens == limit and END in out
 
 
+@pytest.mark.parametrize("limit", [0, 4])
+def test_a_label_variant_the_api_routes_as_reasoning_is_counted_and_cut(limit):
+    """The API routes a label by its text (` analysis` and `analysis ` are
+    the reasoning channel like `analysis`); the budget must count what the
+    API shows as reasoning, or a variant runs unbounded. The API's verdict
+    is asked for the label the model wrote; the mask that keeps a block
+    from forming cuts every label form it was given - a form it does not
+    know (the label and a space) begins with one it does. A header longer
+    than the canonical one overshoots by its extra tokens: the token after
+    the label's end is sampled before the arming reaches the logits."""
+    A, A_SPACED, SP, F, MSG = 40, 39, 38, 41, 42
+    reasoning = ((A,), (A_SPACED,), (A, SP))
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=limit,
+        labels=((A,), (A_SPACED,)),
+        label_end=(MSG,),
+        label_means_reasoning=lambda ids: ids in reasoning,
+    )
+    body = list(range(10, 26))
+    for label in ((A,), (A_SPACED,), (A, SP)):
+        tracker = ThinkingBudget(limits)
+        out = Steps(tracker, [START, *label, MSG, *body]).run(20)
+        if limit == 0:
+            assert label[0] not in out and tracker.reasoning_tokens == 0, label
+        else:
+            extra = len(label) - 1
+            assert END in out and tracker.reasoning_tokens == limit + extra, label
+            assert tracker.thinking_truncated
+    # A label the API routes elsewhere (the answer's channel) opens nothing.
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, F, MSG, *body]).run(20)
+    assert END not in out and tracker.reasoning_tokens == 0
+
+
 def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     """Harmony and Muse open the answer and a tool call with the same
     marker as the reasoning block, followed by a label. The budget waits

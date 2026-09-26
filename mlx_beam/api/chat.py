@@ -39,6 +39,7 @@ from mlx_beam.api.text import (
     TextDelta,
     initial_state,
     logprob_entry,
+    route_label,
     stop_sequence_ids,
     xtc_special_ids,
 )
@@ -644,14 +645,31 @@ def reasoning_limits(
         )
     label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
     label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
+    labels: tuple[tuple[int, ...], ...] = ()
+    verdict = None
+    if label and label_end:
+        # The mask cuts the label as the vocabulary writes it, with and
+        # without the space a word token carries; what the model writes
+        # instead is judged by its text, as the assembler judges it.
+        spaced = tuple(
+            tokenizer.encode(
+                " " + tokenizer.decode(list(label)), add_special_tokens=False
+            )
+        )
+        labels = (label,) + ((spaced,) if spaced and spaced != label else ())
+
+        def verdict(ids: tuple[int, ...]) -> bool:
+            return route_label(tokenizer, tokenizer.decode(list(ids))) == "reasoning"
+
     return ReasoningLimits(
         start=start,
         end=end,
         close=close,
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
-        labels=(label,) if label and label_end else (),
+        labels=labels,
         label_end=label_end if label else (),
+        label_means_reasoning=verdict,
     )
 
 
@@ -772,10 +790,12 @@ class ChatResponder:
         }
 
     def stream(self, events, cached: int) -> Iterator[dict]:
-        """Chunks as the tokens arrive; tool-call text is held until complete."""
+        """Chunks as the tokens arrive; the assembler holds a tool call's
+        text until it parsed, so a delta inside one is empty - except the
+        text the opener released, which goes out like the whole answer keeps it."""
         for event in events:
             d = self.assembler.feed(event)
-            if d.finish_reason is None and (d.empty() or self.assembler.in_tool_call):
+            if d.finish_reason is None and d.empty():
                 continue
             yield self.chunk(d)
             if d.finish_reason is not None:

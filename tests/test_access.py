@@ -54,6 +54,10 @@ def test_the_key_is_read_from_either_header_and_compared_whole():
     assert not a.authorized({"Authorization": "Bearer s3cre"})
     assert not a.authorized({"Authorization": "Basic s3cret"})
     assert not a.authorized({})
+    # A header value outside ASCII (http.server decodes Latin-1) is a wrong
+    # key, not an exception that drops the connection.
+    assert not a.authorized({"x-api-key": "s3cr\u00e9t"})
+    assert not a.authorized({"Authorization": "Bearer s3cr\u00e9t"})
     assert Access.local().authorized({})
     assert Access.resolve("0.0.0.0", skip_api_key=True).authorized({})
 
@@ -99,6 +103,8 @@ def test_routes_want_the_key_and_say_so(keyed):
     }
     resp, raw = request(keyed, "GET", "/metrics", {"x-api-key": "s3cret"})
     assert resp.status == 200
+    resp, raw = request(keyed, "GET", "/health", {"x-api-key": "w\u00e4rong"})
+    assert resp.status == 401
     resp, raw = request(
         keyed,
         "POST",

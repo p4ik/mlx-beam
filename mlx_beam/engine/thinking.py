@@ -9,7 +9,7 @@ against a block the model closed by itself in between.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -32,11 +32,16 @@ class ReasoningLimits:
     # Reasoning tokens allowed, markers and close included; None: no budget.
     max_tokens: int | None = None
     # Families whose opener is followed by a label (Harmony's channel,
-    # Muse's recipient): the label sequences that mean reasoning, and the
-    # tokens that end a label. An opener whose label is another (the
-    # answer's channel, a tool's name) does not open a block.
+    # Muse's recipient): the reasoning label in the forms the vocabulary
+    # writes it (these the opener mask cuts; the first is the canonical
+    # one), and the tokens that end a label. An opener whose label is
+    # another (the answer's channel, a tool's name) does not open a block.
     labels: tuple[tuple[int, ...], ...] = ()
     label_end: tuple[int, ...] = ()
+    # Whether a label the model wrote means reasoning - the API's routing,
+    # so the budget counts exactly what the API shows as reasoning (a label
+    # with stray whitespace too); without it, only `labels` do.
+    label_means_reasoning: Callable[[tuple[int, ...]], bool] | None = None
 
 
 def budget(
@@ -179,6 +184,11 @@ class ThinkingBudget:
             cut += tuple(limits.labels[0][:1])
         self._cut = cut
         self._cut_prefix = mx.array(cut[:-1], dtype=mx.int32)
+        # The token cut, in every form the label takes (` analysis` is one
+        # token next to `analysis`; masking one would hand the model the other).
+        self._cut_last = tuple(
+            sorted({label[0] for label in limits.labels if label} or {cut[-1]})
+        )
         # While set, the opener cannot complete: no block fits any more.
         self._block = False
         # Tokens of the close's tail still to come after the end marker.
@@ -223,17 +233,27 @@ class ThinkingBudget:
             hot = self._one_hot[token] = mx.arange(vocab) == token
         return hot
 
+    def _hot_any(self, tokens: tuple[int, ...], vocab: int) -> mx.array:
+        hot = self._one_hot.get(tokens)
+        if hot is None:
+            hot = self._hot(tokens[0], vocab)
+            for token in tokens[1:]:
+                hot = hot | self._hot(token, vocab)
+            self._one_hot[tokens] = hot
+        return hot
+
     def _mask_opener(self, context: mx.array, logits: mx.array, vocab: int):
         cut = self._cut
+        last = self._hot_any(self._cut_last, vocab)
         if len(cut) == 1:
-            return mx.where(self._hot(cut[0], vocab), -mx.inf, logits)
+            return mx.where(last, -mx.inf, logits)
         # A longer opener is cut at its last token, once the ones before it
         # are in place; the fragment before stays ordinary text.
         n = len(cut) - 1
         if context.shape[-1] < n:
             return logits
         prefix = mx.all(context[-n:] == self._cut_prefix)
-        return mx.where(prefix & self._hot(cut[-1], vocab), -mx.inf, logits)
+        return mx.where(prefix & last, -mx.inf, logits)
 
     # -- the engine's side --------------------------------------------------
 
@@ -275,7 +295,7 @@ class ThinkingBudget:
             self._label.append(token)
             if self._label_end.feed(token):
                 label = tuple(self._label[: -len(self.limits.label_end)])
-                if label in self.limits.labels:
+                if self._means_reasoning(label):
                     self._state = "reasoning"
                     self.reasoning_tokens += 1 + len(self._label)
                     self._gate_opener()
@@ -294,6 +314,12 @@ class ThinkingBudget:
                 self._maybe_arm()
         if finish_reason == "length" and self._state == "reasoning":
             self.thinking_truncated = True
+
+    def _means_reasoning(self, label: tuple[int, ...]) -> bool:
+        verdict = self.limits.label_means_reasoning
+        if verdict is not None:
+            return verdict(label)
+        return label in self.limits.labels
 
     @property
     def in_reasoning(self) -> bool:

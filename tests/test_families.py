@@ -347,6 +347,27 @@ def test_parsers_refuse_what_is_not_a_call():
     assert out == {"name": "f", "arguments": {"v": {"a": 1}, "t": True}}
 
 
+def test_the_budget_asks_the_router_which_labels_are_reasoning():
+    """One verdict for a label: the assembler's `route_label`, which the
+    limits carry into the engine - so a label the API shows as reasoning
+    is one the budget counts. The mask gets the label as the vocabulary
+    writes it, with and without the leading space."""
+    t = wrapper(HARMONY_SPECIALS, "gpt-oss-20b.jinja")
+    hf = t._tokenizer
+    hf._vocab[" analysis"] = len(hf._vocab) + 1
+    limits = chat.reasoning_limits(t, [], 4)
+    canonical = tuple(hf.encode("analysis"))
+    spaced = (hf._vocab[" analysis"],)
+    assert limits.labels == (canonical, spaced)
+    verdict = limits.label_means_reasoning
+    assert verdict(canonical) and verdict(spaced)
+    assert verdict(tuple(hf.encode("analysis ")))
+    assert not verdict(tuple(hf.encode("final")))
+    assert not verdict(tuple(hf.encode("commentary to=functions.get_weather")))
+    # A family whose label folds into the opener (Muse) carries none.
+    assert chat.reasoning_limits(MUSE, [], 4).labels == ()
+
+
 def test_thinking_off_opens_the_answer_in_the_prompt():
     for tok, opener in (
         (HARMONY, "<|channel|>final<|message|>"),

@@ -500,12 +500,7 @@ class TextAssembler:
             self._tail = self._tail[-self._tail_len() :] + segment
             clean, before, after, markers, current = self._step(segment)
             if current is not None:
-                self._state, flushed, current = TextStateMachine.flush(self._state)
-                clean += flushed
-                if after or markers:
-                    after += flushed
-                else:
-                    before += flushed
+                clean, before, after = self._flush(clean, before, after, markers)
         else:
             if event.forced and not self._fragment_checked:
                 # The budget may cut a byte-level tokenizer mid-character:
@@ -526,12 +521,7 @@ class TextAssembler:
             if event.finish_reason == "length" and current is not None:
                 # A stop word already matched leaves its tail in the buffer;
                 # that tail is not output.
-                self._state, flushed, current = TextStateMachine.flush(self._state)
-                clean += flushed
-                if after or markers:
-                    after += flushed
-                else:
-                    before += flushed
+                clean, before, after = self._flush(clean, before, after, markers)
 
         if current is None:
             # A stop word matched in the text: what came before it is the
@@ -639,7 +629,12 @@ class TextAssembler:
                 delta.content = head + (self._take_lead() or opened) + body
         elif current == "tool":
             if self._prev != "tool" and markers:
-                delta.content = before
+                # What the opener released was written before it: the
+                # block's when a think block ended in the call.
+                if self._prev == "reasoning" and self._route:
+                    delta.reasoning = before
+                else:
+                    delta.content = before
                 self._tool_text += after
             else:
                 self._tool_text += clean
@@ -753,6 +748,21 @@ class TextAssembler:
         clean = "".join(before) + "".join(after)
         return clean, "".join(before), "".join(after), markers, current
 
+    def _flush(self, clean: str, before: str, after: str, markers: list):
+        """The automaton's buffer when the stream ends is text the model
+        wrote (a marker that never completed): released in the state the
+        segment ended in - after its marker when it carried one - and kept
+        with the pieces, which the raw endpoint gives back whole."""
+        self._state, flushed, current = TextStateMachine.flush(self._state)
+        if flushed:
+            self._pieces.append((flushed, "text", current))
+            clean += flushed
+            if after or markers:
+                after += flushed
+            else:
+                before += flushed
+        return clean, before, after
+
     def _verbatim(self) -> str:
         """The segment as the model wrote it: text and markers in order."""
         return "".join(text for text, _, _ in self._pieces)
@@ -780,7 +790,3 @@ class TextAssembler:
         is scanned again from there on the next step."""
         _, _, states, buf = self._state
         return (state, states[state][0], states, buf)
-
-    @property
-    def in_tool_call(self) -> bool:
-        return self._prev == "tool"

@@ -85,10 +85,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   decoded segment all went to the state after it. The text automaton now
   reports what it released by the state it was released in, and the
   assembler routes each part to its own side - reasoning, answer or tool
-  call.
+  call, a call the block ended in included.
 - `/v1/completions` cut the structural markers of a message frame
   (`<|start|>assistant`) out of the raw text; the raw endpoint puts every
-  marker back where it was.
+  marker back where it was, what the end of the stream flushed included.
 - A reasoning budget of zero (or one used up) masked Harmony's shared
   `<|channel|>` marker, which the answer's and a tool's channel need as
   much as the reasoning; the mask now cuts the reasoning label after the
@@ -113,6 +113,20 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   admission: that token is fed by the first generation step, which knows
   no image features, so the image would have been read as its
   placeholder's embedding.
+- A streamed chat answer dropped the text released with a tool call's
+  opener (a `<` held back as a possible marker, the rest of the segment
+  the opener sat in), which the whole answer kept; the stream sends it.
+- Harmony's reasoning label with stray whitespace (` analysis`,
+  `analysis `) was shown as reasoning but not counted against the
+  reasoning budget - the budget matched one token form, the routing the
+  text. The budget asks the routing's verdict for the label the model
+  wrote, and the mask that keeps a block from forming cuts the label in
+  both forms the vocabulary has.
+- `temperature nan` and `repetition_penalty 0` were accepted as server
+  defaults (flag or `generation_config.json`) and every request that left
+  the field failed with 400; a default is checked as a request is.
+- An API key offered with a non-ASCII character dropped the connection
+  (an exception in the comparison) instead of answering 401.
 
 ## [0.1.0a6] - 2026-09-25
 

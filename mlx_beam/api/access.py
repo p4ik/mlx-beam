@@ -99,7 +99,12 @@ class Access:
         auth = headers.get("Authorization") or ""
         if not offered and auth[:7].lower() == "bearer ":
             offered = auth[7:].strip()
-        return bool(offered) and hmac.compare_digest(offered, self.key or "")
+        # Compared as bytes: the header may carry any Latin-1 character
+        # (http.server decodes it so), and compare_digest takes str only
+        # in ASCII - a wrong key is a 401, not a dropped connection.
+        return bool(offered) and hmac.compare_digest(
+            offered.encode("utf-8"), (self.key or "").encode("utf-8")
+        )
 
     def describe(self) -> dict:
         return {"mode": self.mode, "allowed_hosts": list(self.hosts)}
