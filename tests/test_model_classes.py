@@ -353,3 +353,59 @@ def test_a_dense_granite_quantized_under_hf_names_loads():
     fresh.load_weights(list(fresh.sanitize(hf).items()), strict=True)
     mx.eval(fresh.parameters())
     assert mx.array_equal(fresh(x), expected)
+    # Mixed layouts: one projection quantized, the other at full precision
+    # - each is renamed on its own, whichever tensors it carries.
+    for quantized in ("input_linear", "output_linear"):
+        mixed = granitemoehybrid.Model(granitemoehybrid.ModelArgs.from_dict(cfg))
+        nn.quantize(
+            mixed,
+            group_size=32,
+            bits=8,
+            class_predicate=lambda p, m, q=quantized: hasattr(m, "to_quantized")
+            and (
+                (
+                    ("gate_proj" in p or "up_proj" in p)
+                    if q == "input_linear"
+                    else "down_proj" in p
+                )
+                or ".mlp." not in p
+            ),
+        )
+        mx.eval(mixed.parameters())
+        flat = dict(tree_flatten(mixed.parameters()))
+        hf = {k: v for k, v in flat.items() if ".mlp." not in k}
+        for layer in range(cfg["num_hidden_layers"]):
+            p = f"model.layers.{layer}.mlp"
+            for suffix in ("weight", "scales", "biases"):
+                if f"{p}.gate_proj.{suffix}" in flat:
+                    hf[f"model.layers.{layer}.shared_mlp.input_linear.{suffix}"] = (
+                        mx.concatenate(
+                            [
+                                flat[f"{p}.gate_proj.{suffix}"],
+                                flat[f"{p}.up_proj.{suffix}"],
+                            ],
+                            axis=0,
+                        )
+                    )
+                if f"{p}.down_proj.{suffix}" in flat:
+                    hf[f"model.layers.{layer}.shared_mlp.output_linear.{suffix}"] = (
+                        flat[f"{p}.down_proj.{suffix}"]
+                    )
+        again = granitemoehybrid.Model(granitemoehybrid.ModelArgs.from_dict(cfg))
+        nn.quantize(
+            again,
+            group_size=32,
+            bits=8,
+            class_predicate=lambda p, m, q=quantized: hasattr(m, "to_quantized")
+            and (
+                (
+                    ("gate_proj" in p or "up_proj" in p)
+                    if q == "input_linear"
+                    else "down_proj" in p
+                )
+                or ".mlp." not in p
+            ),
+        )
+        again.load_weights(list(again.sanitize(hf).items()), strict=True)
+        mx.eval(again.parameters())
+        assert mx.array_equal(again(x), mixed(x))

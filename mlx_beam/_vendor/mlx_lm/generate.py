@@ -1467,6 +1467,13 @@ class GenerationBatch:
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
+        if not keep:
+            # An empty batch keeps nothing of the step before: extend()
+            # would otherwise concatenate onto the stale current tokens of
+            # every batch that was emptied (verify cycles, which take the
+            # next tokens, never replace them) and hold their arrays alive.
+            self._current_tokens = None
+            self._current_logprobs = []
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
         self._matchers = [self._matchers[idx] for idx in keep]

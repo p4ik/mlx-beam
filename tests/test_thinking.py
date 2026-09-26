@@ -1,5 +1,7 @@
 """The reasoning budget: admission arithmetic, the forced close, the flags."""
 
+from dataclasses import replace
+
 import mlx.core as mx
 import pytest
 
@@ -498,3 +500,12 @@ def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     out = Steps(tracker, [START, A, MSG, 10, 11, 12, 13, 14, 15, 16]).run(10)
     assert END in out and tracker.thinking_truncated
     assert out.index(END) <= 6
+    # Budget zero: the shared opener stays open for the answer's channel
+    # and a tool's; only the reasoning label after it is cut.
+    tracker = ThinkingBudget(replace(limits, max_tokens=0))
+    out = Steps(tracker, [START, A, MSG, 10, START, F, MSG, 11]).run(8)
+    assert out[0] == START and out[1] != A and START in out[1:]
+    assert tracker.reasoning_tokens == 0
+    tracker = ThinkingBudget(replace(limits, max_tokens=0))
+    out = Steps(tracker, [START, F, MSG, 10, 11]).run(5)
+    assert out == [START, F, MSG, 10, 11] and not tracker.in_reasoning

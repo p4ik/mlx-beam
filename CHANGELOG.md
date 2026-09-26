@@ -20,6 +20,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   opener was forced into the prompt, which skips the channel or recipient
   a tool call needs, so the model could only answer in text. With tools on
   offer the opener stays out.
+- A reasoning budget of zero (or one used up) masked Harmony's shared
+  `<|channel|>` marker, which the answer's and a tool's channel need as
+  much as the reasoning; the mask now cuts the reasoning label after the
+  marker, so `final` and `commentary` stay open.
 - `mlx-beam-vision` claimed vision for a checkpoint without
   `preprocessor_config.json` (AutoProcessor hands a bare tokenizer back)
   and every image request failed with a KeyError; such a checkpoint is
@@ -27,7 +31,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - A dense Granite checkpoint quantized under the HF names (mlx-vlm's
   conversions, the Granite Vision 8-bit packs) failed to load: only the
   weights of `shared_mlp` and `lm_head` were renamed or dropped, their
-  scales and biases stayed behind as "parameters not in model".
+  scales and biases stayed behind as "parameters not in model". The two
+  projections are renamed independently, so a checkpoint that quantizes
+  one of them loads too.
+- An emptied generation batch kept the current tokens of its last step,
+  and every batch extended onto it concatenated its own: cleared when the
+  batch empties.
 - Images inside tool results reach the vision frontend: parts in a
   Responses `function_call_output.output` were serialized to JSON text,
   image blocks in a Messages `tool_result.content` were refused with 400.

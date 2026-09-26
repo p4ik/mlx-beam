@@ -180,6 +180,13 @@ drops the tower under either layout (`vision_tower.*` and
 path against a direct forward per text model); the towers themselves in
 `packages/mlx-beam-vision/tests`.
 
+`emptied batch` - `generate.py`, `GenerationBatch.filter`: an emptied
+batch drops its current tokens and logprobs; upstream keeps them, and
+`extend()` concatenates every later batch onto them (a verify cycle takes
+the next tokens and never replaces the current ones), which held the
+arrays of every emptied batch alive. Tests: `tests/test_vendor_mlx_lm.py`
+(`test_an_emptied_batch_keeps_no_current_tokens`).
+
 `quantized HF names` - `models/granitemoehybrid.py`, `sanitize`: a dense
 checkpoint quantized under the HF names (mlx-vlm's conversions, the
 Granite Vision 8-bit packs) carries `shared_mlp.input_linear.{scales,biases}`

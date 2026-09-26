@@ -164,7 +164,15 @@ class ThinkingBudget:
         self._closed = None
         self._close_counted = close_counted(limits)
         self._one_hot: dict[int, mx.array] = {}
-        self._start_prefix = mx.array(limits.start[:-1], dtype=mx.int32)
+        # What the mask cuts to keep a block from forming: the opener's last
+        # token - or, for a family whose opener is shared by every channel
+        # (Harmony's <|channel|>), the reasoning label's first token after
+        # it, so the answer's and a tool's channel stay open.
+        cut = tuple(limits.start)
+        if limits.labels:
+            cut += tuple(limits.labels[0][:1])
+        self._cut = cut
+        self._cut_prefix = mx.array(cut[:-1], dtype=mx.int32)
         # While set, the opener cannot complete: no block fits any more.
         self._block = False
         # Tokens of the close's tail still to come after the end marker.
@@ -210,16 +218,16 @@ class ThinkingBudget:
         return hot
 
     def _mask_opener(self, context: mx.array, logits: mx.array, vocab: int):
-        start = self.limits.start
-        if len(start) == 1:
-            return mx.where(self._hot(start[0], vocab), -mx.inf, logits)
+        cut = self._cut
+        if len(cut) == 1:
+            return mx.where(self._hot(cut[0], vocab), -mx.inf, logits)
         # A longer opener is cut at its last token, once the ones before it
         # are in place; the fragment before stays ordinary text.
-        n = len(start) - 1
+        n = len(cut) - 1
         if context.shape[-1] < n:
             return logits
-        prefix = mx.all(context[-n:] == self._start_prefix)
-        return mx.where(prefix & self._hot(start[-1], vocab), -mx.inf, logits)
+        prefix = mx.all(context[-n:] == self._cut_prefix)
+        return mx.where(prefix & self._hot(cut[-1], vocab), -mx.inf, logits)
 
     # -- the engine's side --------------------------------------------------
 
