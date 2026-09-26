@@ -594,123 +594,57 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [0.1.0a1] - 2026-09-18
 
-The first release; everything below is new.
+The first release.
 
 ### Added
-- Engine: one worker thread, continuous batching, KV policy per layer,
-  `/health` with the cache layout that was actually built. Batch sizes are
-  `--decode-concurrency` / `--prompt-concurrency` (mlx-lm's server names).
-  The worker evaluates every lazy array of the model at load, not only its
-  parameters (Gemma 4's and Llama 3's rope tables are lazy).
+- Engine: one worker thread, continuous batching, a KV policy per layer;
+  `/health` reports the cache layout that was actually built.
+  `--decode-concurrency` / `--prompt-concurrency` set the batch sizes.
 - OpenAI-compatible server: `/v1/chat/completions`, `/v1/completions`,
   `/v1/responses` (stateless, function tools), `/v1/models`; `beam serve`.
-  The model's thinking goes to the `reasoning` field; `--reasoning-field`
-  switches to `reasoning_content`, both, or none (markers stay in the text;
-  reasoning tokens are counted in every mode, and a think block the prompt
-  opened is shown). `/v1/completions` returns what the model wrote: think
-  markers and tool-call blocks stay in the text. Chat parses a tool-call
-  block only when the request offered tools. Chat `logprobs.content` covers
-  the message content only, not the think block, the markers or the stop
-  token; completions streaming puts `usage` on a last chunk without
-  choices, as at OpenAI.
+- Reasoning: the model's thinking goes to the `reasoning` field;
+  `--reasoning-field` switches to `reasoning_content`, both, or none
+  (markers stay in the text). `/v1/completions` returns the raw text,
+  markers included.
+- Reasoning budget: `--max-reasoning-tokens` and `--min-response-tokens`
+  (per request `max_reasoning_tokens` / `min_response_tokens`); at the
+  budget the think block is closed by force and the answer keeps its
+  reserve; `usage.completion_tokens_details` reports `thinking_truncated`
+  / `response_truncated`.
+- Tool calls: parsers for the Qwen, Mistral and JSON dialects; a call the
+  parser cannot read comes back as text, markers and all, with the real
+  `finish_reason`. Arguments reach the chat template as a mapping.
 - Prefix store with recurrent-state checkpoints: hybrid models resume from
-  the last system or user boundary instead of re-prefilling everything.
-  The system block is its own entry (evicted last, system entries capped
-  at a quarter of the store), a checkpoint every 2048 prefill tokens, a
-  cancelled prefill keeps its part; an entry cut from a longer one owns
-  only its own tokens.
+  the last system or user boundary instead of re-prefilling everything;
+  the system block is its own entry, a checkpoint every 2048 prefill
+  tokens.
 - Quantized KV cache for the batch path and a tiled quantized attention,
-  ported from mlx-optiq; the rotating-cache merge guard (see
-  `VENDORED.md`). Models whose layers share a cache (Gemma 4) and models
-  that call MLX's attention directly (PLaMo-2) are served; a KV group size
-  the model's head dim cannot carry is refused with a message that names
-  the policy and the sizes that fit.
-- Scheduler: the prefill width is the shortest row's segment (nobody is
-  padded); a long prefill cannot be starved by a trickle of short prompts
-  - after two calls in which newcomers held a row with a whole slice to go
-  under a quarter slice, the next call admits nobody and that row gets its
-  full width (`/health` counts `prefill_starved_calls`). A decode burst
-  under a shared prefill ends when a row finishes, so its extracted cache
-  is evaluated before the next step.
-- Vendored mlx-lm (inference subset, pinned commit) with four local
-  changes: package-relative imports, prefill mask for hybrids, per-step
-  cache eval, and a scheduler that neither pads nor stalls (see
-  `VENDORED.md`). The vendored Qwen and Mistral tool parsers carry
-  upstream's fixes for a parameter name without `>` and for the JSON list
-  form.
+  ported from mlx-optiq (see `VENDORED.md`).
+- Scheduler: prefill and decode share the worker without padding or
+  stalls; a long prefill cannot be starved by short prompts
+  (`/health` counts `prefill_starved_calls`).
+- Sampling: `seed` per request, `xtc_probability`, `xtc_threshold`,
+  `min_tokens_to_keep`, `presence_context_size`, `frequency_context_size`;
+  `logprobs` / `top_logprobs` on chat, the legacy integer `logprobs` on
+  completions.
 - Request defaults with provenance: `--max-completion-tokens`, `--temp`,
   `--top-p`, `--top-k`, `--min-p` beat the model's `generation_config.json`,
   which beats mlx-lm's defaults; `/health` and the start banner say which.
-  A server default a request could not ask for (`generation_config.json`
-  with `temperature: 3.0`, a flag out of range) fails at start instead of
-  on every request.
-- Reasoning budget: `--max-reasoning-tokens` and `--min-response-tokens`
-  (a request's `max_reasoning_tokens` / `min_response_tokens` override);
-  at the budget the think block is closed by force - a multi-token end
-  marker the model began on its own is completed, a marker whose prefix
-  repeats is matched -, the answer keeps its reserve, and
-  `usage.completion_tokens_details` reports `thinking_truncated` /
-  `response_truncated`. A small client limit is served as sent; only a
-  context that cannot hold the reserve is a 400, and with the block open
-  and no room to think, the close costs its whole length - a
-  `min_response_tokens` that then cannot be kept is a 400, not a shorter
-  answer.
 - Request aliases: `max_tokens`, `thinking_token_budget`,
-  `reasoning: {effort, max_tokens}`, top-level `enable_thinking`.
-  `reasoning_effort` is mapped onto the levels the template accepts, with
-  a ladder of aliases when it rejects one by name. Earlier turns'
-  reasoning is copied into the message key the template reads.
-- Sampling: `seed` per request (own random key per row), `xtc_probability`,
-  `xtc_threshold`, `min_tokens_to_keep`, `presence_context_size`,
-  `frequency_context_size`; `logprobs` / `top_logprobs` on chat and the
-  legacy integer `logprobs` on completions. Rows with equal settings share
-  one sampler, so the batch samples in a single call. A temperature below
-  1e-4 is greedy (`1/temp` overflows float32).
-- Tool calls: a call the parser cannot read is returned as text, markers
-  and all, and `finish_reason` says what really happened (`stop` /
-  `length`), never `tool_calls` with no call. Calls before a cut-off one
-  are kept by parsing the longest prefix that parses, so a `[TOOL_CALLS]`
-  quoted inside a JSON argument never becomes a call of its own. Qwen
-  tool-call parameters end at their last `</parameter>`, so a single
-  literal end tag in a value survives; a parameter name seen twice, one a
-  schema with `additionalProperties: false` rules out, or text left between
-  two parameters is an error the caller sees. Tool-call arguments in the
-  conversation reach the chat template as a mapping (the wire carries a
-  JSON string; `""` means no arguments), a `null` content is `""` there,
-  and an argument string that is not a JSON object is a 400.
-- Responses API: every output item has its own id and text when text and
-  tool calls interleave; `output_text.*` carry `logprobs`,
-  `function_call_arguments.done` carries `name`, a cut-off message item is
-  `incomplete` from its done event on, `instructions` and `tool_choice`
-  are echoed, and a `reasoning` input item reaches the template as the
-  reasoning of the turn it preceded (a badly shaped one is a 400).
-- Text at the end of a stream: what the detokenizer or the marker
-  automaton still held when the stop token came is delivered; a real
-  U+FFFD the model wrote before a forced close is kept, only a byte
-  fragment the cut left is dropped - and only when the detokenizer shows
-  its bytes (BPE, SPM).
-- `--chat-template` (text or `.jinja` path), `--use-default-chat-template`,
-  `--chat-template-args`, `--allowed-origins`, `--max-prompt-tokens`
-  (a request's `max_prompt_tokens` may only lower it), `--max-queued`
-  (a 503 with `Retry-After` beyond it), `--model-alias`,
-  `--prompt-cache-bytes`. Flags are checked before the model loads
-  (`--kv-config`, `--log-level`, `--decode-share` within 0..1); a
-  `--max-context` above the model's own window is capped to it with a
-  warning.
+  `reasoning: {effort, max_tokens}`, top-level `enable_thinking`;
+  `reasoning_effort` is mapped onto the levels the template accepts.
+- Flags: `--chat-template` (text or `.jinja` path),
+  `--use-default-chat-template`, `--chat-template-args`,
+  `--allowed-origins`, `--max-prompt-tokens`, `--max-queued` (a 503 with
+  `Retry-After` beyond it), `--model-alias`, `--prompt-cache-bytes`,
+  `--max-context`; flags are checked before the model loads.
 - Server: 30 s socket timeout with the request cancelled on a stalled
-  client, `Connection: close` on errors, chunks that are ready together go
-  out in one write; a failed stream write is not retried, so a dead client
-  releases its batch slot after one timeout. A stream sends an SSE comment
-  whenever nothing went out for five seconds while the worker made
-  progress (a tool call is collected until it closes); a worker that
-  stopped stepping gets no comment, so a watchdog in front of the server
-  still sees the hang. The CORS preflight allows the headers the browser
-  asked for. Wrongly shaped request fields are 400s (`logit_bias` values
-  finite and within -100..100, `suffix` refused as unsupported); a
-  negative `Content-Length`, a body that is not UTF-8 and a chunked body
-  are 400/411; HEAD, PUT, DELETE and PATCH are 405 with a JSON body;
-  `Retry-After` only on `queue_full`. Cancelling a request before its own
-  prefill began is safe for the other rows.
+  client, SSE keep-alive comments while the worker makes progress, CORS
+  preflight, JSON errors with the right status for malformed requests.
+- Vendored mlx-lm (inference subset, pinned commit) with four local
+  changes: package-relative imports, prefill mask for hybrids, per-step
+  cache eval, and a scheduler that neither pads nor stalls (see
+  `VENDORED.md`).
 - Project skeleton: `beam --version`, `beam doctor`, packaging with
   hatch-vcs, pre-commit (black, isort, ruff), CI on Apple silicon,
   contribution rules.
