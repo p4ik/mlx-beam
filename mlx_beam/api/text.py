@@ -427,10 +427,6 @@ class TextAssembler:
         self._route = route_thinking
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
-        self._think_markers = {self._think_start, self._think_end} | set(
-            getattr(tokenizer, "think_openers", None) or ()
-        )
-        self._think_markers.discard("")
         self._label_end = getattr(tokenizer, "think_label_end", None) or ""
         # The opener's label so far, until its line end shows up, and how
         # many tokens it took (they count as reasoning only if it opens one).
@@ -527,6 +523,12 @@ class TextAssembler:
                 # that tail is not output.
                 clean, before, after = self._flush(clean, before, after, markers)
 
+        # What the automaton said, and the parts of this event's text with
+        # the state each was written in - for the logprobs' verdict; the
+        # label branch splits its text by hand (the label's end is no
+        # marker of the automaton's, it is read from the text).
+        automaton = current
+        parts: list[tuple[str | None, str]] | None = None
         if current is None:
             # A stop word matched in the text: what came before it is the
             # last of the output, whatever state we were in - except a
@@ -595,6 +597,7 @@ class TextAssembler:
             self._label_tokens += 1
             label = self._label
             rest = self._after_label(clean)
+            parts = [("label", clean)]
             if rest is not None:
                 # The label's end may arrive in one segment with the label,
                 # or with the first text behind it: that text goes where
@@ -606,6 +609,7 @@ class TextAssembler:
                     target = "normal"  # tools off: the model's text as is
                 self._state = self._enter(target)
                 current = target
+                parts = [("label", clean[: len(clean) - len(rest)]), (target, rest)]
                 if target == "reasoning":
                     if self._route:
                         delta.reasoning = rest
@@ -681,11 +685,13 @@ class TextAssembler:
         # the marker went back into the content - then the held tokens
         # that spelled it (a textual marker) are too.
         if markers:
-            shown = self._markers_shown(markers)
+            shown = self._markers_shown(markers, automaton)
             held = self._shown(self._prev, before) or (shown and not before)
-            own_text = self._shown(current, after) or shown
+            own = parts if parts is not None else [(current, after)]
+            own_text = shown or any(self._shown(st, tx) for st, tx in own)
         else:
-            held = own_text = self._shown(current, clean)
+            own = parts if parts is not None else [(current, clean)]
+            held = own_text = any(self._shown(st, tx) for st, tx in own)
         self._book(
             event,
             segment,
@@ -726,15 +732,22 @@ class TextAssembler:
             state == "normal" or (not self._route and state in ("reasoning", "label"))
         )
 
-    def _markers_shown(self, markers: list[str]) -> bool:
+    def _markers_shown(self, markers: list[str], current: str | None) -> bool:
         """The segment's markers went back into the content: every one on
-        the raw endpoint, the think block's when the reasoning is not
-        routed apart; a stop word is cut everywhere, a tool call's marker
-        stays with the call."""
+        the raw endpoint; with the reasoning not routed apart, the block's
+        opener on the way in and its end on the way out - judged by the
+        transition, not the text: Harmony's `<|end|>` also ends a message,
+        and there it is cut. A stop word is cut everywhere, a tool call's
+        marker stays with the call."""
         kept = [m for m in markers if m not in self._stop_words]
         if self._raw:
             return bool(kept)
-        return not self._route and any(m in self._think_markers for m in kept)
+        if self._route or not kept:
+            return False
+        block = ("reasoning", "label")
+        entering = current in block and self._prev not in block
+        leaving = current == "normal" and self._prev in block
+        return entering or leaving
 
     def _book(
         self,

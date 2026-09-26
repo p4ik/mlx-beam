@@ -129,7 +129,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   the marker itself as the answer's; the booking now follows the text's
   routing, so the entries describe the content's tokens and nothing else
   - and with `--reasoning-field none`, or on `/v1/completions`, the
-  block's markers and label the client sees are among them.
+  block's markers and label the client sees are among them, a marker
+  that ends a message (Harmony's `<|end|>` after the answer) or a
+  channel's header (`<|message|>`) is not.
 - `temperature nan` and `repetition_penalty 0` were accepted as server
   defaults (flag or `generation_config.json`) and every request that left
   the field failed with 400; a default is checked as a request is.

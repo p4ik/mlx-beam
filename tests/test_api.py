@@ -1825,6 +1825,66 @@ def test_logprobs_with_routing_off_cover_the_block_the_client_sees():
     assert [e["token"] for e in choice["logprobs"]["content"]] == ["answer"]
 
 
+class _SharedEndTokenizer(ChannelStubTokenizer):
+    """Harmony's shape: the block's end marker also ends every message,
+    and a label names the channel - `analysis` reasons, `thought` answers."""
+
+    think_family = "harmony"
+    structural_markers = ("<channel|>",)
+
+    def __init__(self):
+        super().__init__()
+        self._words[18] = "analysis"
+
+
+def test_logprobs_tell_a_block_end_from_a_message_end():
+    """The same marker closes the block (put back into the content with
+    routing off) and the message (cut in every mode): judged by the
+    transition. A label's end is read from the text: the header is the
+    label's, never the answer's."""
+    tok = _SharedEndTokenizer()
+    tok._words[10] = "private "
+    tok._words[12] = "answer"
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "logprobs": True}, "m"
+    )
+    ids = (
+        CHANNEL_OPEN,
+        18,
+        NEWLINE,
+        10,
+        CHANNEL_CLOSE,
+        CHANNEL_OPEN,
+        LABEL,
+        NEWLINE,
+        12,
+    )
+    events = [TokenEvent(t, -0.1) for t in ids] + [
+        TokenEvent(CHANNEL_CLOSE, -0.2),
+        TokenEvent(EOS, -0.9, "stop"),
+    ]
+    responder = chat.ChatResponder(tok, req, [1], reasoning_field="none")
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    content = "<|channel>analysis\nprivate <channel|><|channel>thought\nanswer"
+    assert choice["message"]["content"] == content
+    assert [e["token"] for e in choice["logprobs"]["content"]] == [
+        "<|channel>",
+        "analysis",
+        "\n",
+        "private ",
+        "<channel|>",
+        "<|channel>",
+        "thought",
+        "\n",
+        "answer",
+    ]
+    responder = chat.ChatResponder(tok, req, [1])
+    choice = responder.complete(iter(events), 0)["choices"][0]
+    assert choice["message"]["content"] == "answer"
+    assert choice["message"]["reasoning"] == "private "
+    assert [e["token"] for e in choice["logprobs"]["content"]] == ["answer"]
+
+
 def test_completions_do_not_repeat_the_opener_the_prompt_ends_with():
     # The raw prompt already carries `<think>`; the completion is what the
     # model wrote after it, not the opener again.
