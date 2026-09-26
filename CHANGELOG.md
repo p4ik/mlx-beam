@@ -6,6 +6,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a7] - 2026-09-26
+
 ### Added
 - Access control that follows the bind: on loopback nothing is asked; on
   any other `--host` the server starts only with `--api-key <key>`
@@ -145,8 +147,6 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - `temperature nan` and `repetition_penalty 0` were accepted as server
   defaults (flag or `generation_config.json`) and every request that left
   the field failed with 400; a default is checked as a request is.
-- An API key offered with a non-ASCII character dropped the connection
-  (an exception in the comparison) instead of answering 401.
 
 ## [0.1.0a6] - 2026-09-25
 
