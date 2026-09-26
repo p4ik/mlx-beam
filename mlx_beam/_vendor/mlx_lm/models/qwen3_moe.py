@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .mrope import interleaved_selector, mrope_section_of, rotate
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -63,12 +64,20 @@ class Attention(nn.Module):
             traditional=False,
             base=args.rope_theta,
         )
+        # The interleaved MRoPE layout of Qwen3-VL-MoE's text model, for
+        # prompts with images; VENDORED.md, multimodal positions.
+        section = mrope_section_of(args.rope_scaling)
+        self.mrope_selector = (
+            interleaved_selector(section, self.rope.dims // 2) if section else None
+        )
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -83,13 +92,14 @@ class Attention(nn.Module):
         )
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
+        queries = rotate(
+            self.rope, queries, cache, position_ids, rope_offset, self.mrope_selector
+        )
+        keys = rotate(
+            self.rope, keys, cache, position_ids, rope_offset, self.mrope_selector
+        )
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -174,8 +184,16 @@ class Qwen3MoeDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask,
+            cache,
+            position_ids=position_ids,
+            rope_offset=rope_offset,
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -202,10 +220,14 @@ class Qwen3MoeModel(PipelineMixin, nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         layer_hook=None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
         # layer_hook(index, hidden) before each layer: what a vision frontend
         # adds at the image positions ahead of certain layers (DeepStack);
-        # VENDORED.md, layer hook.
+        # VENDORED.md, layer hook. position_ids (3, B, L) and rope_offset
+        # (B,): a prompt's multimodal positions and the shift they leave for
+        # the tokens after it; VENDORED.md, multimodal positions.
         if input_embeddings is not None:
             h = input_embeddings
         else:
@@ -226,7 +248,7 @@ class Qwen3MoeModel(PipelineMixin, nn.Module):
         for i, (layer, c) in enumerate(zip(self.pipeline_layers, cache)):
             if layer_hook is not None:
                 h = layer_hook(self.start_idx + i, h)
-            h = layer(h, mask, c)
+            h = layer(h, mask, c, position_ids=position_ids, rope_offset=rope_offset)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -255,8 +277,16 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(
+            inputs,
+            cache,
+            input_embeddings,
+            position_ids=position_ids,
+            rope_offset=rope_offset,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

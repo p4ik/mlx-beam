@@ -249,11 +249,19 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
         if self.is_linear:
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask,
+                cache,
+                position_ids=position_ids,
+                rope_offset=rope_offset,
+            )
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
@@ -288,10 +296,15 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         layer_hook=None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
         # layer_hook(index, hidden) before each layer: what a vision frontend
         # adds at the image positions ahead of certain layers (DeepStack);
-        # VENDORED.md, layer hook.
+        # VENDORED.md, layer hook. position_ids (3, B, L) and rope_offset
+        # (B,): the multimodal positions of a prompt with images, and the
+        # shift they leave for the tokens after it; VENDORED.md,
+        # multimodal positions.
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -318,7 +331,13 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
             mask = ssm_mask if layer.is_linear else fa_mask
             if layer_hook is not None:
                 hidden_states = layer_hook(self.start_idx + i, hidden_states)
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                rope_offset=rope_offset,
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -354,8 +373,16 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model(
+            inputs,
+            cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
+            rope_offset=rope_offset,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -439,9 +466,15 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
+            rope_offset=rope_offset,
         )
 
     @property

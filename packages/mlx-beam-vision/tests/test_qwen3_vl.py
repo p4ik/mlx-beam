@@ -171,6 +171,72 @@ def test_tower_encodes_per_image_with_deepstack():
     assert d["family"] == "qwen3_vl" and d["deepstack_layers"] == 1
 
 
+def test_frontend_builds_the_mrope_positions_and_the_decode_delta():
+    """Text before an image at one running position; the image's tokens at
+    the block's start plus (frame, row, column) of the merged grid; the
+    text after it from the block's largest position plus one - and the
+    delta the decode continues with is that minus the token count."""
+    front = VisionFrontend(FakeProcessor([(1, 4, 4)]), tower(), "qwen3_vl")
+    assert front.needs == ("input_embeddings", "layer_hook", "position_ids")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "w1"},
+                {"type": "image"},
+                {"type": "text", "text": "w3"},
+            ],
+        }
+    ]
+    built = front.build(messages, [png(1)], {})
+    n = len(built.tokens)
+    start, end = built.spans[0].start, built.spans[0].end
+    assert (end - start) == 4  # a 4 x 4 grid merged by 2
+    pos = built.positions
+    assert pos.shape == (3, n)
+    # Text before the image: its index on every axis.
+    assert pos[:, :start].tolist() == [list(range(start))] * 3
+    # The image: frame 0, rows 0 and 1, columns 0 and 1, from `start`.
+    assert pos[0, start:end].tolist() == [start] * 4
+    assert pos[1, start:end].tolist() == [start, start, start + 1, start + 1]
+    assert pos[2, start:end].tolist() == [start, start + 1, start, start + 1]
+    # After it: from the block's largest position plus one.
+    after = list(range(start + 2, start + 2 + (n - end)))
+    assert pos[:, end:].tolist() == [after] * 3
+    assert built.rope_delta == after[-1] + 1 - n == -2
+    # A text-only prompt: every token at its index, no delta.
+    plain = front.build([{"role": "user", "content": "w1"}], [], {})
+    assert plain.positions.tolist() == [list(range(len(plain.tokens)))] * 3
+    assert plain.rope_delta == 0
+
+
+def test_the_positions_match_the_transformers_reference():
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from mlx_beam_vision.families.qwen3_vl import positions
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+    class Reference:
+        config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2))
+        get_vision_position_ids = Qwen3VLModel.get_vision_position_ids
+        get_rope_index = Qwen3VLModel.get_rope_index
+
+    image = TOWER_CONFIG["image_token_id"]
+    # A 4 x 4 grid merged by 2 is 2 x 2 = 4 tokens, a 2 x 6 grid 1 x 3 = 3.
+    ids = [3, 4] + [image] * 4 + [5, 6] + [image] * 3 + [7]
+    grids = [(1, 4, 4), (1, 2, 6)]
+    token_types = [1 if t == image else 0 for t in ids]
+    expected, delta = Reference().get_rope_index(
+        torch.tensor([ids]),
+        torch.tensor([token_types]),
+        image_grid_thw=torch.tensor(grids),
+    )
+    ours, our_delta = positions(ids, image, grids, 2)
+    assert ours.tolist() == expected[:, 0].tolist()
+    assert our_delta == int(delta.item())
+
+
 def test_frontend_builds_spans_and_caches_by_digest():
     front = VisionFrontend(FakeProcessor([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
     messages = [
@@ -275,7 +341,11 @@ def test_provider_dispatches_by_model_type():
     with pytest.raises(ValueError, match="bidirectionally"):
         provider.load(None, ".", unified, None)
     # What the tower will ask of the prefill, from the config alone.
-    assert provider.needs(TOWER_CONFIG) == ("input_embeddings", "layer_hook")
+    assert provider.needs(TOWER_CONFIG) == (
+        "input_embeddings",
+        "layer_hook",
+        "position_ids",
+    )
     no_deepstack = {
         **TOWER_CONFIG,
         "vision_config": {
@@ -283,7 +353,7 @@ def test_provider_dispatches_by_model_type():
             "deepstack_visual_indexes": [],
         },
     }
-    assert provider.needs(no_deepstack) == ("input_embeddings",)
+    assert provider.needs(no_deepstack) == ("input_embeddings", "position_ids")
     assert provider.needs({"model_type": "gemma4", "vision_config": {}}) == (
         "input_embeddings",
     )
@@ -340,7 +410,9 @@ def test_engine_path_matches_a_direct_forward():
     with Engine(model) as engine:
         out = [e.token for e in engine.submit(gen)]
         h = engine.health()
-    assert out == reference(model, gen.tokens, list(gen.spans), 6)
+    # 4 placeholders of a 2 x 2 block take 2 positions: the delta is -2.
+    assert gen.positions is not None and gen.rope_delta == -2
+    assert out == reference(model, gen.tokens, list(gen.spans), 6, gen.positions)
     assert h["alive"]
 
 

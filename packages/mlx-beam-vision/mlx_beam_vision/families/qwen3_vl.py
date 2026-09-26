@@ -30,6 +30,48 @@ NAME = "qwen3_vl"
 PARTS = ("visual", "vision_tower")
 
 
+def positions(ids: list[int], image_token_id: int, grids, merge: int):
+    """The prompt's MRoPE positions (3, len(ids)) and the decode delta, as
+    the reference's get_rope_index builds them for images: text tokens at
+    one running position on all three axes; an image's tokens at the
+    block's start plus (frame, row, column) of its merged grid, the text
+    after it continuing from the block's largest position plus one. The
+    delta is that continuation minus the token count: what the decode adds
+    to its offsets."""
+    import numpy as np
+
+    out = np.zeros((3, len(ids)), dtype=np.int32)
+    grids = [tuple(int(v) for v in g) for g in grids]
+    start = 0  # the next free position
+    i = 0
+    image = 0
+    while i < len(ids):
+        if ids[i] != image_token_id:
+            out[:, i] = start
+            start += 1
+            i += 1
+            continue
+        if image >= len(grids):
+            raise ValueError("more image placeholders than images in the prompt")
+        t, h, w = grids[image]
+        h, w = h // merge, w // merge
+        n = t * h * w
+        if ids[i : i + n] != [image_token_id] * n:
+            raise ValueError(f"image {image} needs {n} contiguous placeholders at {i}")
+        frame = np.repeat(np.arange(t), h * w)
+        row = np.tile(np.repeat(np.arange(h), w), t)
+        col = np.tile(np.arange(w), t * h)
+        out[0, i : i + n] = start + frame
+        out[1, i : i + n] = start + row
+        out[2, i : i + n] = start + col
+        start = int(out[:, i : i + n].max()) + 1
+        i += n
+        image += 1
+    if image != len(grids):
+        raise ValueError("fewer image placeholders than images in the prompt")
+    return out, start - len(ids)
+
+
 def per_layer(config: dict) -> bool:
     """The extras ahead of certain text layers need the prefill's layer
     hook - when the checkpoint has DeepStack blocks at all."""

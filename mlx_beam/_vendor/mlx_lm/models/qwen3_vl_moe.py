@@ -31,9 +31,15 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+        rope_offset: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
+            rope_offset=rope_offset,
         )
 
     def sanitize(self, weights):
