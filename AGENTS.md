@@ -95,6 +95,14 @@ choice["message"]["content"] = text if text else None
   branches meet, their sections are merged, not stacked. A first release
   has only `Added`.
 - Vendored parts are updated in their own commit (`vendor: <part> <old> -> <new>`).
+- Commit identities are GitHub noreply addresses only - author, committer
+  and every `Co-authored-by` trailer (`<login>@users.noreply.github.com`,
+  or GitHub's own `noreply@github.com`). `tools/check_identity.py` refuses
+  anything else: as a commit-msg hook (`pre-commit install --hook-type
+  commit-msg`) and as the `identity` job of CI, a required check on `main`.
+  Squash merges through the API carry the pull request's body as the
+  commit message; the default message would list the branch commits with
+  their authors.
 
 ## AI usage
 

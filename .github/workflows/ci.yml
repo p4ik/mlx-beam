@@ -9,6 +9,23 @@ permissions:
   contents: read
 
 jobs:
+  identity:
+    # Every commit of the range carries GitHub noreply identities only -
+    # author, committer, co-authors. A required check: nothing else reaches
+    # main. The offending identity is never printed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            range="${{ github.event.before }}..${{ github.sha }}"
+          fi
+          python3 tools/check_identity.py --range "$range"
+
   lint:
     runs-on: ubuntu-latest
     steps:

@@ -52,3 +52,16 @@ problems go through private reporting instead (SECURITY.md).
 
 By contributing you agree that your contributions are licensed under the
 Apache License 2.0 (see LICENSE).
+
+## Commit identity
+
+Commits carry GitHub noreply addresses only (`<login>@users.noreply.github.com`).
+Set them once per clone and install the hook that refuses anything else:
+
+```
+git config user.name <login>
+git config user.email <id>+<login>@users.noreply.github.com
+uv run pre-commit install --hook-type commit-msg
+```
+
+CI checks every commit of a pull request the same way.
