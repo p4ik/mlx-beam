@@ -32,10 +32,11 @@ jobs:
   content:
     # Nothing on the private denylist in any commit of the range (identities,
     # messages, added lines) or in the tree at its head. The list is the
-    # secret LEAK_PATTERNS, which a pull request from a fork does not get: the
-    # check is required for this repository's own commits and passes with a
-    # notice for a fork. The pull request's title and body are checked too.
-    # A match is reported by place and count, never shown.
+    # secret LEAK_PATTERNS, which a run triggered by a fork or by Dependabot
+    # does not get (Dependabot runs see only Dependabot secrets): the check is
+    # required for this repository's own commits and passes with a notice
+    # otherwise. The pull request's title and body are checked too. A match
+    # is reported by place and count, never shown.
     runs-on: ubuntu-latest
     env:
       LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
@@ -53,6 +54,7 @@ jobs:
             range="${{ github.event.before }}..${{ github.sha }}"
             required=1
           fi
+          [ "${{ github.actor }}" = "dependabot[bot]" ] && required=0
           [ -n "$LEAK_PATTERNS" ] || unset LEAK_PATTERNS
           LEAK_PATTERNS_REQUIRED=$required python3 tools/check_content.py --range "$range"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
