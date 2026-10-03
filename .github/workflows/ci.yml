@@ -69,6 +69,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.1.0
       - run: uvx pre-commit run --all-files --show-diff-on-failure
+        env:
+          # The denylist hook needs the private list, which only the content
+          # job has; without one it refuses, so that job covers it instead.
+          SKIP: content
       - name: Vendored parts match their pinned upstream except the listed changes
         run: python3 tools/vendor_diff.py
       - name: The configuration page matches the serve parser
