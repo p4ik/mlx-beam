@@ -353,6 +353,17 @@ dd {
   max-width: 58ch;
 }
 
+/* the state sits on the title line; built things carry light, planned ones only the outline */
+dt .state {
+  display: inline-block;
+  margin-left: 0.75rem;
+  font-weight: 400;
+  font-stretch: 100%;
+  font-size: 0.9rem;
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
 /* status: built things carry light, planned ones only the outline */
 table {
   border-collapse: collapse;

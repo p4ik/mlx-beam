@@ -6,33 +6,23 @@ import Header from "../components/Header.astro";
 const repo = "https://github.com/p4ik/mlx-beam";
 const install = `uv tool install mlx-beam\nbeam doctor`;
 
-// The same list as the README's "What sets it apart": present tense only
-// for what is built, planned things say so.
-const built = [
-  { title: "Robust prefix cache", text: "Trie-backed store with its own byte budget, checkpoints for hybrid models, partial hits cut back to the last usable boundary. An SSD tier that survives restarts is planned." },
-  { title: "No stalls", text: "A short request beside a long prefill answers in seconds." },
-  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion. Quantized after the prefill by default; from the first token for profiles measured that way." },
-  { title: "Multi-token prediction", text: "The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned." },
-  { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request." },
-  { title: "Responses and Messages APIs", text: "OpenAI's Responses shape and Anthropic's Messages shape next to chat completions, stateless." },
-  { title: "No bloat", text: "The core is the token path and the API formats. Vision is its own package, mlx-beam-vision, selected through the vision extra; audio will join it. Structured output and GGUF come as extras with a guard. Expert streaming for models larger than memory is planned." },
+// The same list as the README's "Features": present tense only for what
+// is built, planned things say so.
+const featureList = [
+  { title: "Robust prefix cache", text: "Trie-backed store with its own byte budget, checkpoints for hybrid models, partial hits cut back to the last usable boundary.", state: "built, RAM tier; SSD tier planned", built: true },
+  { title: "No stalls", text: "A short request beside a long prefill answers in seconds: continuous batching with a prefill valve.", state: "built", built: true },
+  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion. Quantized after the prefill by default; from the first token for profiles measured that way.", state: "built", built: true },
+  { title: "Multi-token prediction", text: "The checkpoint's own draft head, verified exactly, greedy or sampled; a regulator picks the depth per cycle.", state: "built for one request at a time; in the batch planned", built: true },
+  { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request, next to request defaults and sampling controls.", state: "built", built: true },
+  { title: "Responses and Messages APIs", text: "OpenAI's Responses shape and Anthropic's Messages shape next to chat completions, stateless; /metrics; a repair ladder for tool calls the model wrote badly.", state: "built", built: true },
+  { title: "Vision", text: "Its own package, mlx-beam-vision, selected through the vision extra: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers. Audio will join it.", state: "built", built: true },
+  { title: "Structured output, GGUF", text: "Extras with a guard: a request that needs what is not installed gets a clear refusal.", state: "planned", built: false },
+  { title: "Expert streaming", text: "Models larger than memory, their experts streamed from SSD.", state: "planned", built: false },
+  { title: "No bloat", text: "The core is the token path and the API formats; everything else is a package or an extra you choose to install. Nothing in the core talks to the network on its own.", state: "built", built: true },
 ];
-
 
 const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
 
-const status = [
-  { piece: "CLI, packaging, CI", state: "built", built: true },
-  { piece: "Vendored mlx-lm base", state: "built", built: true },
-  { piece: "OpenAI server with continuous batching, quantized KV cache", state: "built", built: true },
-  { piece: "Prefix cache with recurrent-state checkpoints, RAM tier", state: "built", built: true },
-  { piece: "Multi-token prediction, one request at a time, greedy or sampled", state: "built", built: true },
-  { piece: "Vision as the package mlx-beam-vision (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite Vision towers)", state: "built", built: true },
-  { piece: "Prefix cache SSD tier", state: "planned", built: false },
-  { piece: "Multi-token prediction in the batch", state: "planned", built: false },
-  { piece: "Structured output, GGUF (extras with a guard)", state: "planned", built: false },
-  { piece: "Expert streaming from SSD", state: "planned", built: false },
-];
 ---
 
 <html lang="en">
@@ -87,15 +77,19 @@ const status = [
 
       <section id="what">
         <div class="wrap">
-          <h2>What sets it apart</h2>
+          <h2>Features</h2>
           <dl>
-            {built.map((b) => (
+            {featureList.map((f) => (
               <div>
-                <dt>{b.title}</dt>
-                <dd>{b.text}</dd>
+                <dt>
+                  {f.title}
+                  <span class="state"><span class={`mark ${f.built ? "built" : "planned"}`}></span>{f.state}</span>
+                </dt>
+                <dd>{f.text}</dd>
               </div>
             ))}
           </dl>
+          <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
         </div>
       </section>
 
@@ -113,22 +107,6 @@ const status = [
         </div>
       </section>
 
-      <section id="where">
-        <div class="wrap">
-          <h2>Where it stands</h2>
-          <table>
-            <tbody>
-              {status.map((s) => (
-                <tr>
-                  <td>{s.piece}</td>
-                  <td class="state"><span class={`mark ${s.built ? "built" : "planned"}`}></span>{s.state}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
-        </div>
-      </section>
     </main>
 
     <footer>

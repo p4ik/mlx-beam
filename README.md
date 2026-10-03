@@ -33,15 +33,22 @@ Access follows the bind. On a loopback address (`127.0.0.1`, `::1`, `localhost` 
 
 Requests may use the names other servers taught clients: `max_tokens`, `thinking_token_budget`, `reasoning: {effort, max_tokens}`, `enable_thinking`, `reasoning_effort`. The model's thinking is returned in `reasoning` (`--reasoning-field` switches to `reasoning_content`, both, or none), counted in `usage.completion_tokens_details.reasoning_tokens`, and flagged there when a limit cut it (`thinking_truncated`, `response_truncated`). A tool call the model wrote badly goes through a repair ladder - mended JSON, values coerced to the declared schema - with every step reported in the call's `repair_actions`, and comes back as text when no step makes it valid.
 
-## What sets it apart
+## Features
 
-- **Robust prefix cache** — Trie-backed store with its own byte budget, checkpoints for hybrid (recurrent) models, partial hits cut back to the last usable boundary. An SSD tier that survives restarts is planned.
-- **No stalls** — A short request beside a long prefill answers in seconds.
-- **Mixed-precision KV cache** — Bits per layer, set at conversion. Quantized after the prefill by default (the prefill never reads quantized data); `--kv-prefill quantized` writes it quantized from the first token for profiles measured that way.
-- **Multi-token prediction** — The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned.
-- **Thinking budget** — A hard cap on the reasoning trace, per request.
-- **Responses and Messages APIs** — Next to chat completions, stateless: OpenAI's Responses shape and Anthropic's Messages shape on the same token path.
-- **No bloat** — The core is the token path and the API formats. Vision is its own package, `mlx-beam-vision`, selected through the `vision` extra of this one (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers); audio will join it; structured output and GGUF come as extras with a guard - a request that needs what is not installed gets a clear refusal. Expert streaming for models larger than memory is planned. Nothing in the core talks to the network on its own.
+One list, with where each piece stands. Present tense only for what is built; planned things say so.
+
+| Feature | What it does | State |
+|---|---|---|
+| **Robust prefix cache** | Trie-backed store with its own byte budget, checkpoints for hybrid (recurrent) models, partial hits cut back to the last usable boundary. | built, RAM tier; an SSD tier that survives restarts is planned |
+| **No stalls** | A short request beside a long prefill answers in seconds: continuous batching with a prefill valve. | built |
+| **Mixed-precision KV cache** | Bits per layer, set at conversion. Quantized after the prefill by default (the prefill never reads quantized data); `--kv-prefill quantized` writes it quantized from the first token for profiles measured that way. | built |
+| **Multi-token prediction** | The checkpoint's own draft head, verified exactly, greedy or sampled; a regulator picks the depth per cycle. | built for one request at a time; in the batch planned |
+| **Thinking budget** | A hard cap on the reasoning trace, per request, next to request defaults and sampling controls. | built |
+| **Responses and Messages APIs** | OpenAI's Responses shape and Anthropic's Messages shape next to chat completions, stateless, on the same token path; `/metrics`; a repair ladder for tool calls the model wrote badly. | built |
+| **Vision** | Its own package, `mlx-beam-vision`, selected through the `vision` extra of this one: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers. Audio will join it. | built |
+| **Structured output, GGUF** | Extras with a guard: a request that needs what is not installed gets a clear refusal. | planned |
+| **Expert streaming** | Models larger than memory, their experts streamed from SSD. | planned |
+| **No bloat** | The core is the token path and the API formats; everything else is a package or an extra you choose to install. Nothing in the core talks to the network on its own. The vendored mlx-lm base is pinned, its local changes listed in `VENDORED.md`. | built |
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 
@@ -49,20 +56,7 @@ The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package 
 
 Existing MLX servers either stop at the basics or grow things that have no place in an inference engine: a built-in game, a cloud path that arrives with an update. The ones we ran daily also had bugs where it matters most: prefix cache, batching under load, vision. B.E.A.M. keeps the core to the token path and fixes those paths at the source. Everything else is a package or an extra you choose to install; nothing ever ships in the core that you did not ask for.
 
-## Status
-
-| Piece | State |
-|---|---|
-| CLI, packaging, CI | done |
-| Vendored mlx-lm base (pinned; the local changes are listed in `VENDORED.md`) | done |
-| OpenAI-compatible server, continuous batching, quantized KV cache | done |
-| Prefix cache with recurrent-state checkpoints | done, RAM tier |
-| Reasoning budget, request defaults, sampling controls | done |
-| Multi-token prediction | done, greedy or sampled, one request at a time; in the batch planned |
-| Vision | done as the package `mlx-beam-vision`: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite Vision towers |
-| Responses and Messages APIs, `/metrics`, tool-call repair | done |
-| Structured output, GGUF | planned, as extras with a guard |
-| Expert streaming from SSD | planned |
+## Measured
 
 Measured numbers are published as they are measured, with machine, model and date. Mac mini M4 Pro 64 GB, Qwen3.8-27B 5-bit with 8-bit KV, one request, 2026-09-26 (`0.1.0a6`): decode 11.4 tok/s at 12 000 generated tokens; prefill 115 tok/s over a 16 588-token prompt; a short request answered in 2.4 s while that prefill ran; 45 minutes under a steady stream, 5 057 requests, none failed. Speculative acceptance and batch numbers follow when they are measured the same way.
 
