@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import socket
 import threading
 
 import pytest
@@ -583,6 +584,70 @@ def test_preflight_allows_the_headers_the_browser_asks_for():
         resp.getheader("Access-Control-Allow-Headers") == "x-stainless-os, content-type"
     )
     assert resp.getheader("Access-Control-Max-Age") == "600"
+    server.shutdown()
+    engine.stop()
+
+
+def test_an_allowed_origin_with_whitespace_is_refused_at_start():
+    engine = Engine(tiny_llama()).start()
+    try:
+        for bad in ("http://app\r\nX: 1", "http://app ", "http://a b"):
+            with pytest.raises(ValueError):
+                Served(engine, StubTokenizer(), "tiny", allowed_origins=[bad])
+    finally:
+        engine.stop()
+
+
+def test_a_folded_origin_never_matches_the_list():
+    # The folded header's value keeps its line break; it equals no
+    # configured origin, so no Access-Control-Allow-Origin goes out.
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://app"])
+    server = BeamServer(served, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    raw = (
+        b"OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Origin: http://app\r\n X-Injected: 1\r\n"
+        b"Access-Control-Request-Method: POST\r\n\r\n"
+    )
+    head = _raw_request(server.server_port, raw)
+    assert head.split("\r\n", 1)[0].split()[1] == "204"
+    assert "X-Injected" not in head
+    assert "Access-Control-Allow-Origin" not in head
+    server.shutdown()
+    engine.stop()
+
+
+def _raw_request(port, raw):
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+        s.sendall(raw)
+        s.settimeout(2)
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+    return reply.split(b"\r\n\r\n", 1)[0].decode()
+
+
+def test_preflight_drops_a_folded_request_header_instead_of_echoing_it():
+    # http.client refuses to send a folded header, so the bytes go raw.
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://app"])
+    server = BeamServer(served, "127.0.0.1", 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    raw = (
+        b"OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Origin: http://app\r\nAccess-Control-Request-Method: POST\r\n"
+        b"Access-Control-Request-Headers: x-stainless-os,\r\n X-Injected: 1\r\n\r\n"
+    )
+    head = _raw_request(server.server_port, raw)
+    assert head.split("\r\n", 1)[0].split()[1] == "204"
+    assert "X-Injected" not in head
+    lines = dict(h.split(": ", 1) for h in head.split("\r\n")[1:] if ": " in h)
+    # The valid name stays, the folded continuation is dropped.
+    assert lines["Access-Control-Allow-Headers"] == "x-stainless-os"
     server.shutdown()
     engine.stop()
 

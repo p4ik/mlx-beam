@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import select
 import signal
 import socket
@@ -52,6 +53,10 @@ DISCONNECT_CHECK_S = 1.0
 SSE_WRITE_BATCH_BYTES = 64 << 10
 
 
+# An HTTP token (RFC 9110 5.6.2): the only shape a header name has.
+_HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
 class Served:
     """What the handler threads share: the engine, the tokenizer, the name."""
 
@@ -75,6 +80,11 @@ class Served:
         self.model_name = model_name
         self.reasoning_field = reasoning_field
         self.defaults = defaults or RequestDefaults()
+        # An origin goes back out as a header value; one with a line break
+        # or a space would write into the response, so it is refused here.
+        for origin in allowed_origins:
+            if origin != origin.strip() or any(c in origin for c in "\r\n "):
+                raise ValueError("an allowed origin must not contain whitespace")
         self.allowed_origins = tuple(allowed_origins)
         # Who may call: the key policy and the Host names, from the bind.
         self.access = access or Access.local()
@@ -112,10 +122,14 @@ class Served:
         """The think family and its markers as the tokenizer found them:
         the evidence behind capabilities.thinking."""
         t = self.tokenizer
-        if not getattr(t, "has_thinking", False):
+        if not getattr(t, "think_start", None):
             return {"family": None}
         return {
             "family": getattr(t, "think_family", None),
+            # How a request switches the block off: the template's kwarg,
+            # the answer's opener, or not at all (then capabilities.thinking
+            # is false unless the template or the family opens it).
+            "switch": getattr(t, "thinking_switch", None),
             "start": getattr(t, "think_start", None),
             "end": getattr(t, "think_end", None),
             "openers": list(getattr(t, "think_openers", None) or ()),
@@ -262,18 +276,25 @@ class Handler(BaseHTTPRequestHandler):
         if "*" in allowed:
             origin = "*"
         else:
-            # Echo the caller's origin only when it is on the list.
+            # Answer with the configured origin the caller's one equals -
+            # the configuration's string, not the request's, goes out.
             self.send_header("Vary", "Origin")
-            origin = self.headers.get("Origin")
-            if origin not in allowed:
+            asked_origin = self.headers.get("Origin")
+            origin = next((o for o in allowed if o == asked_origin), None)
+            if origin is None:
                 return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         # A browser client sends its own header names (the OpenAI SDK adds
-        # x-stainless-*); the preflight must allow what it asked for.
-        asked = self.headers.get("Access-Control-Request-Headers")
+        # x-stainless-*); the preflight must allow what it asked for. Only
+        # header names go back out: http.server writes header values as
+        # they are, so a folded request line must not reach the response.
+        asked = self.headers.get("Access-Control-Request-Headers") or ""
+        names = [n.strip() for n in asked.split(",")]
+        allowed_headers = ", ".join(n for n in names if _HEADER_NAME.fullmatch(n))
         self.send_header(
-            "Access-Control-Allow-Headers", asked or "Content-Type, Authorization"
+            "Access-Control-Allow-Headers",
+            allowed_headers or "Content-Type, Authorization",
         )
         self.send_header("Access-Control-Max-Age", "600")
 

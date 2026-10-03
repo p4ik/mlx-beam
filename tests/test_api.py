@@ -527,7 +527,9 @@ def test_the_channel_family_is_inferred_on_the_marker_alone():
         """What the wrapper reads: a vocabulary with the channel markers."""
 
         eos_token_id = 1
-        chat_template = "{{ messages }}"
+        # Gemma 4's template takes the switch; the marker alone would be
+        # no capability (see the Granite-shaped case below).
+        chat_template = "{{ messages }}{% if enable_thinking %}{% endif %}"
         _vocab = {
             "<eos>": 1,
             "<|channel>": 5,
@@ -575,6 +577,27 @@ def test_the_channel_family_is_inferred_on_the_marker_alone():
 
     tok = TokenizerWrapper(Qwenish())
     assert tok.think_start == "<think>" and tok.think_label_end is None
+    assert tok.has_thinking and tok.thinking_switch == "template"
+
+    class Graniteish(Qwenish):
+        """<think> in the vocabulary, a template that knows nothing of it:
+        the model never thinks, and health must not say it can."""
+
+        chat_template = "{{ messages }}"
+
+    tok = TokenizerWrapper(Graniteish())
+    assert tok.think_start == "<think>"  # the markers are still known
+    assert not tok.has_thinking and tok.thinking_switch is None
+    assert chat.reasoning_limits(tok, [9], 100) is None
+
+    class Distilled(Qwenish):
+        """A template that opens <think> itself: the model always thinks,
+        there is no switch."""
+
+        chat_template = "{{ messages }}<think>\n"
+
+    tok = TokenizerWrapper(Distilled())
+    assert tok.has_thinking and tok.thinking_switch is None
 
 
 def test_reasoning_tokens_are_counted():

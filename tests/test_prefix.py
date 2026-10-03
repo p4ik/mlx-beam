@@ -10,7 +10,7 @@ from mlx_beam._vendor.mlx_lm.models.cache import KVCache
 from mlx_beam.api import chat
 from mlx_beam.engine import Engine, GenerationRequest
 from mlx_beam.engine.prefix import PrefixStore, cut_back
-from tests.stub_tokenizer import StubTokenizer
+from tests.stub_tokenizer import THINK_END, THINK_START, StubTokenizer
 from tests.test_engine import tiny_hybrid
 from tests.test_vendor_optiq_kv import tiny_llama
 
@@ -126,8 +126,57 @@ def test_chat_boundaries_from_the_template():
     bounds, _ = chat.boundaries_and_system_end(tok, req, prompt)
     # The system block ends after the first user header (the header is the
     # same for any next user message); the first user turn ends after the
-    # assistant header that follows it.
-    assert bounds == [5, 7]
+    # assistant header that follows it; the last user turn ends before
+    # the generation prompt, the one point the next round is sure to share.
+    assert bounds == [5, 7, 10]
+
+
+class ThinkOffStubTokenizer(StubTokenizer):
+    """A template like Qwen3's with thinking off: the generation prompt
+    carries an empty think block, the finished turn in the history does
+    not - so the prompt end is no prefix of the next round."""
+
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tokenize=True, tools=None, **kw
+    ):
+        ids = super().apply_chat_template(
+            messages, add_generation_prompt, tokenize=True, tools=tools, **kw
+        )
+        if add_generation_prompt and kw.get("enable_thinking") is False:
+            ids += [THINK_START, THINK_END]
+        return ids if tokenize else self.decode(ids)
+
+
+def test_the_last_user_turn_is_a_boundary_when_the_prompt_end_is_not():
+    tok = ThinkOffStubTokenizer()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w3"}], "enable_thinking": False},
+        "m",
+    )
+    prompt = chat.build_prompt(tok, req)
+    assert prompt == [2, 6, 3, 7, THINK_START, THINK_END]
+    bounds, _ = chat.boundaries_and_system_end(tok, req, prompt)
+    assert bounds == [3]  # the user turn's end, before the assistant header
+
+
+def test_hybrid_second_turn_resumes_from_the_user_turn_boundary():
+    """Round two renders the first answer without the think block the
+    prompt had asked for; the entry's checkpoint at the user turn's end is
+    the one the recurrent layers can resume from."""
+    tok = ThinkOffStubTokenizer()
+    model = tiny_hybrid()
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w3"}], "enable_thinking": False},
+        "m",
+    )
+    prompt = chat.build_prompt(tok, req)
+    bounds, _ = chat.boundaries_and_system_end(tok, req, prompt)
+    with Engine(model) as engine:
+        out, _ = run(engine, prompt, boundaries=bounds)
+        # The history keeps the answer, not the block: [user][assistant]answer
+        turn2 = prompt[:4] + out + [6, 5, 7, THINK_START, THINK_END]
+        _, cached = run(engine, turn2, boundaries=[3, 4, 4 + len(out) + 2])
+        assert cached == 3
 
 
 def test_system_entry_outlives_the_conversations():

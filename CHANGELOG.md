@@ -6,6 +6,38 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Fixed
+- A model that thinks but cannot be told not to - its chat template has
+  no switch and its answer cannot be opened in the prompt either (Muse)
+  - refuses `enable_thinking: false` and `reasoning_effort: none` with a
+  400 that points at `reasoning_effort: low` and `max_reasoning_tokens`.
+  Before, the answer was opened in the prompt and the model kept reasoning
+  inside it: the frame's `to=self` and an echo of the question came back
+  as the answer, and with tools on offer the budget's mask took the tool
+  recipient away with the reasoning label, so no call was made. Harmony
+  (gpt-oss) keeps its opener; `/health.reasoning.switch` says which of
+  `template`, `opener` or none a model has.
+- `/health.capabilities.thinking` said `true` for a model whose
+  vocabulary reserves a think marker pair that its template never writes
+  (Granite 4.0 inherits `<think>` from Granite 3.3 and never thinks): a
+  thinking budget was set up, reasoning counted, nothing came. Thinking
+  is a capability only when the template takes the switch, the family
+  opens the reasoning in its frame, or the template opens the marker
+  itself; the markers stay reported under `/health.reasoning`.
+- A hybrid model prefilled the whole conversation again on every second
+  turn when the template renders the finished answer differently from
+  the prompt that asked for it (Qwen3 with thinking off: the empty think
+  block is in the generation prompt, not in the history). The entry's
+  checkpoint sat at the prompt end, behind the point the next round
+  agrees with; the last user turn is a boundary now, so the recurrent
+  layers resume from where the generation prompt begins. One checkpoint
+  more per request for recurrent and sliding-window models, none for
+  plain attention.
+- The CORS preflight answered `Access-Control-Allow-Headers` with the
+  request's `Access-Control-Request-Headers` as sent, and `http.server`
+  writes header values unchecked, so a folded request line could write
+  into the response's headers. Only header names go back out now.
+
 ## [0.1.0a8] - 2026-09-26
 
 ### Fixed

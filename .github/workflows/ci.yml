@@ -4,6 +4,8 @@ on:
   push:
     branches: ['**']
   pull_request:
+    # edited: a changed title or description is checked by the content job.
+    types: [opened, synchronize, reopened, edited]
 
 # The guard jobs run on every push so a branch is checked before a pull
 # request exists; lint, tests and build run for pull requests and main.

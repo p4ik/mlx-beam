@@ -134,11 +134,18 @@ def test_a_range_catches_the_message_and_the_tree(repo, monkeypatch):
     assert found[1][0] == "a.txt"
 
 
-def test_a_first_push_scans_the_head_alone(repo, monkeypatch):
+def test_a_first_push_scans_the_whole_history(repo, monkeypatch):
     monkeypatch.setenv("LEAK_PATTERNS", "forbidden")
+    (repo / "b.txt").write_text("forbidden\n")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-q", "-m", "add")
+    _git(repo, "rm", "-q", "b.txt")
+    _git(repo, "commit", "-q", "-m", "remove again")
     head = _git(repo, "rev-parse", "HEAD")
     monkeypatch.chdir(repo)
-    assert content.scan_range(f"{'0' * 40}..{head}", content.load_patterns()) == []
+    # The head commit alone is clean; the import brings the older commit too.
+    found = content.scan_range(f"{'0' * 40}..{head}", content.load_patterns())
+    assert [n for _, n in found] == [1] and found[0][0].startswith("commit ")
 
 
 def test_the_tools_run_as_scripts(repo, monkeypatch):
@@ -167,7 +174,18 @@ def test_the_tools_run_as_scripts(repo, monkeypatch):
     assert "forbidden" not in r.stderr and "a.txt" in r.stderr
 
 
-def test_identity_range_with_a_zero_base_checks_the_head_alone(repo, monkeypatch):
+def test_identity_range_with_a_zero_base_checks_the_whole_history(repo, monkeypatch):
+    _git(
+        repo,
+        "-c",
+        "user.email=someone@example.com",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "older commit, foreign address",
+    )
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "head commit, clean")
     head = _git(repo, "rev-parse", "HEAD")
     r = subprocess.run(
         [
@@ -180,4 +198,6 @@ def test_identity_range_with_a_zero_base_checks_the_head_alone(repo, monkeypatch
         capture_output=True,
         text=True,
     )
-    assert r.returncode == 0, r.stderr
+    # author and committer of the older commit: two identities, never shown
+    assert r.returncode == 1 and "2 identit" in r.stderr
+    assert "example.com" not in r.stderr
