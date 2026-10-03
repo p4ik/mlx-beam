@@ -96,13 +96,13 @@ const featureGroups = [
       },
       {
         "name": "Prefix cache",
-        "text": "Trie store, checkpoints for recurrent and window layers, partial hits.",
+        "text": "Reuses the KV of a shared prefix; recurrent and window layers too.",
         "state": "built",
         "built": true
       },
       {
         "name": "Prefix cache SSD tier",
-        "text": "Entries that survive a restart; today the store is RAM only.",
+        "text": "Second tier on SSD: entries outlive eviction from RAM and restarts.",
         "state": "planned",
         "built": false
       },
@@ -223,9 +223,6 @@ const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
           <p class="prose">Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.</p>
           <table class="features">
             <colgroup><col class="c-name" /><col class="c-text" /><col class="c-state" /></colgroup>
-            <thead>
-              <tr><th>Feature</th><th>What it does</th><th>State</th></tr>
-            </thead>
             <tbody>
               {featureGroups.map((g) => (
                 <>

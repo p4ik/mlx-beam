@@ -54,8 +54,8 @@ Everything the engine does, with where each piece stands. Present tense only for
 | **images [extra]** | Image generation and editing through the Images API. | planned |
 | *Engine* | | |
 | **Continuous batching** | Short requests answer beside a long prefill; prefill valve. | built |
-| **Prefix cache** | Trie store, checkpoints for recurrent and window layers, partial hits. | built |
-| **Prefix cache SSD tier** | Entries that survive a restart; today the store is RAM only. | planned |
+| **Prefix cache** | Reuses the KV of a shared prefix; recurrent and window layers too. | built |
+| **Prefix cache SSD tier** | Second tier on SSD: entries outlive eviction from RAM and restarts. | planned |
 | **Mixed-precision KV cache** | Bits per layer from the conversion; quantized after or during prefill. | built |
 | **Multi-token prediction** | Own draft head, exact verify, depth regulator; one request at a time. | built |
 | **Batched MTP** | Several requests speculating at once. | planned |
