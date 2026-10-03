@@ -1,20 +1,51 @@
-# Actions and the two Python packages, weekly. Python dependencies carry a
-# major cap in pyproject (`transformers>=5.7,<6`); with
-# `increase-if-necessary` a pull request comes only when a release falls
-# outside such a range (pip knows no `widen`; Dependabot refused it).
+# Actions, the two Python packages and the site, weekly. One pull request per
+# ecosystem and week for version updates, one per manifest for security
+# updates - two overlapping bumps of the same package came as two pull
+# requests before. Python dependencies carry a major cap in pyproject
+# (`transformers>=5.7,<6`); with `increase-if-necessary` a pull request comes
+# only when a release falls outside such a range (pip knows no `widen`;
+# Dependabot refused it).
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: pip
     directory: /
     schedule:
       interval: weekly
     versioning-strategy: increase-if-necessary
+    groups:
+      python:
+        patterns: ["*"]
+      python-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: pip
     directory: /packages/mlx-beam-vision
     schedule:
       interval: weekly
     versioning-strategy: increase-if-necessary
+    groups:
+      vision:
+        patterns: ["*"]
+      vision-security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /docs/site
+    schedule:
+      interval: weekly
+    groups:
+      site:
+        patterns: ["*"]
+      site-security:
+        applies-to: security-updates
+        patterns: ["*"]

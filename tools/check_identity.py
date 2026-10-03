@@ -46,8 +46,9 @@ def main(argv: list[str]) -> int:
         return 2
     if len(argv) == 3 and argv[1] == "--range":
         base, _, head = argv[2].partition("..")
-        # A first push has no base (all zeros): the head commit alone is the range.
-        selector = ["-1", head or "HEAD"] if re.fullmatch(r"0+", base) else [argv[2]]
+        # A first push has no base (all zeros): everything the head reaches
+        # is new to the remote, so the whole history is the range.
+        selector = [head or "HEAD"] if re.fullmatch(r"0+", base) else [argv[2]]
         log = subprocess.run(
             ["git", "log", "--format=%an <%ae>%n%cn <%ce>%n%B%x00", *selector],
             capture_output=True,

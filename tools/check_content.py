@@ -87,8 +87,9 @@ def scan_range(spec: str, patterns) -> list[tuple[str, int]]:
     found = []
     base, _, head_rev = spec.partition("..")
     head_rev = head_rev or "HEAD"
-    # A first push has no base (all zeros): the head commit alone is the range.
-    selector = ["-1", head_rev] if re.fullmatch(r"0+", base) else [spec]
+    # A first push has no base (all zeros): everything the head reaches is
+    # new to the remote, so the whole history is the range.
+    selector = [head_rev] if re.fullmatch(r"0+", base) else [spec]
     log = git(
         "log",
         "--format=%x00%h%n%an <%ae>%n%cn <%ce>%n%B",
