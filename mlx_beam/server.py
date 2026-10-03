@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import select
 import signal
 import socket
@@ -50,6 +51,10 @@ DISCONNECT_CHECK_S = 1.0
 # Tokens ready at once go out in one write; a slow socket blocks once per
 # batch of chunks instead of once per token.
 SSE_WRITE_BATCH_BYTES = 64 << 10
+
+
+# An HTTP token (RFC 9110 5.6.2): the only shape a header name has.
+_HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
 
 
 class Served:
@@ -270,10 +275,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         # A browser client sends its own header names (the OpenAI SDK adds
-        # x-stainless-*); the preflight must allow what it asked for.
-        asked = self.headers.get("Access-Control-Request-Headers")
+        # x-stainless-*); the preflight must allow what it asked for. Only
+        # header names go back out: http.server writes header values as
+        # they are, so a folded request line must not reach the response.
+        asked = self.headers.get("Access-Control-Request-Headers") or ""
+        names = [n.strip() for n in asked.split(",")]
+        allowed_headers = ", ".join(n for n in names if _HEADER_NAME.fullmatch(n))
         self.send_header(
-            "Access-Control-Allow-Headers", asked or "Content-Type, Authorization"
+            "Access-Control-Allow-Headers",
+            allowed_headers or "Content-Type, Authorization",
         )
         self.send_header("Access-Control-Max-Age", "600")
 
