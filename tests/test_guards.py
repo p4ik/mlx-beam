@@ -33,7 +33,20 @@ def test_only_noreply_identities_pass():
     ]
     assert identity.check(["x <a@users.noreply.github.com.evil.org>"])
     msg = "fix\n\nSigned-off-by: Someone <someone@example.com>\n"
-    assert identity.TRAILER.findall(msg) == ["Someone <someone@example.com>"]
+    assert identity.SIGNOFF.findall(msg) == ["Someone <someone@example.com>"]
+
+
+def test_dependabots_sign_off_passes_only_on_its_own_commits():
+    bot = identity.DEPENDABOT
+    gh = "GitHub <noreply@github.com>"
+    me = "p4ik <1+p4ik@users.noreply.github.com>"
+    signoff = "bump\n\nSigned-off-by: dependabot[bot] <support@github.com>\n"
+    assert identity.check(identity.commit_identities(bot, gh, signoff)) == []
+    assert identity.check(identity.commit_identities(me, gh, signoff))
+    other = "bump\n\nSigned-off-by: dependabot[bot] <someone@example.com>\n"
+    assert identity.check(identity.commit_identities(bot, gh, other))
+    coauthor = "bump\n\nCo-authored-by: dependabot[bot] <support@github.com>\n"
+    assert identity.check(identity.commit_identities(bot, gh, coauthor))
 
 
 def test_patterns_come_from_the_environment_or_a_file_outside_the_tree(

@@ -13,7 +13,21 @@ import sys
 ALLOWED = re.compile(
     r"^[^<]*<(?:[^@<>]+@users\.noreply\.github\.com|noreply@github\.com)>$"
 )
-TRAILER = re.compile(r"^(?:Co-authored-by|Signed-off-by):\s*(.+)$", re.M | re.I)
+COAUTHOR = re.compile(r"^Co-authored-by:\s*(.+)$", re.M | re.I)
+SIGNOFF = re.compile(r"^Signed-off-by:\s*(.+)$", re.M | re.I)
+# Dependabot signs its own commits off with GitHub's support address; that
+# sign-off passes only on a commit Dependabot authored, nowhere else.
+DEPENDABOT = "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>"
+DEPENDABOT_SIGNOFF = "dependabot[bot] <support@github.com>"
+
+
+def commit_identities(author: str, committer: str, body: str) -> list[str]:
+    """Author, committer, co-authors and sign-offs to check."""
+    ids = [author, committer, *COAUTHOR.findall(body)]
+    for s in SIGNOFF.findall(body):
+        if not (author.strip() == DEPENDABOT and s.strip() == DEPENDABOT_SIGNOFF):
+            ids.append(s)
+    return ids
 
 
 def ident(var: str) -> str:
@@ -45,12 +59,13 @@ def main(argv: list[str]) -> int:
             if not entry:
                 continue
             lines = entry.split("\n")
-            bad += check(lines[:2] + TRAILER.findall("\n".join(lines[2:])))
+            bad += check(commit_identities(lines[0], lines[1], "\n".join(lines[2:])))
     else:
         message = open(argv[1], encoding="utf-8").read() if len(argv) > 1 else ""
         bad += check(
-            [ident("GIT_AUTHOR_IDENT"), ident("GIT_COMMITTER_IDENT")]
-            + TRAILER.findall(message)
+            commit_identities(
+                ident("GIT_AUTHOR_IDENT"), ident("GIT_COMMITTER_IDENT"), message
+            )
         )
     if bad:
         # The offending identity is not printed: it may be what must not
