@@ -129,6 +129,7 @@ def test_harmony_is_inferred_from_vocab_and_template():
         t._tokenizer.encode("<|channel|>final<|message|>")
     )
     assert t.frame_start == "<|start|>assistant"
+    assert t.has_thinking and t.thinking_switch == "opener"
     assert t.reasoning_label_tokens == tuple(t._tokenizer.encode("analysis"))
     assert t.think_label_end_tokens == tuple(t._tokenizer.encode("<|message|>"))
 
@@ -139,7 +140,10 @@ def test_muse_is_inferred_from_vocab_and_template():
     assert t.think_start == " to=" and t.think_end == "<|eom|>"
     assert t.think_label_end == "<|message|>" and t.think_openers == (" to=",)
     assert t.tool_call_via_label and t.tool_call_end == "</atem:function_calls>"
-    assert t.answer_opener_tokens == tuple(t._tokenizer.encode("<|message|>"))
+    # No opener: primed with <|message|> the model keeps reasoning inside
+    # the answer, so the family has no switch at all.
+    assert t.answer_opener_tokens is None
+    assert t.has_thinking and t.thinking_switch is None
     assert t.frame_start == "<|start|>assistant"
     # This vocabulary keeps `to=self` in one token: the opener's token form
     # is the whole pair, no label follows (see MergingHF below).
@@ -369,10 +373,7 @@ def test_the_budget_asks_the_router_which_labels_are_reasoning():
 
 
 def test_thinking_off_opens_the_answer_in_the_prompt():
-    for tok, opener in (
-        (HARMONY, "<|channel|>final<|message|>"),
-        (MUSE, "<|message|>"),
-    ):
+    for tok, opener in ((HARMONY, "<|channel|>final<|message|>"),):
         req = chat.parse_chat_request(
             {"messages": [{"role": "user", "content": "hi"}], "enable_thinking": False},
             "m",
@@ -400,13 +401,45 @@ def test_thinking_off_opens_the_answer_in_the_prompt():
         assert initial_state(tok, tokens) == ("frame", "")
 
 
+def test_a_family_without_a_switch_refuses_thinking_off():
+    """Muse: no template switch, and a primed answer keeps the reasoning
+    inside it - so the request is refused, with and without tools, and
+    pointed at the effort word."""
+    from mlx_beam.api.errors import ApiError
+
+    for body in (
+        {"messages": [{"role": "user", "content": "hi"}], "enable_thinking": False},
+        {
+            "messages": [{"role": "user", "content": "hi"}],
+            "enable_thinking": False,
+            "tools": TOOLS,
+        },
+        {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "none"},
+    ):
+        req = chat.parse_chat_request(body, "m")
+        with pytest.raises(ApiError) as e:
+            chat.build_prompt(MUSE, req)
+        assert e.value.status == 400 and "reasoning_effort: low" in str(e.value)
+    # Thinking on, and an effort word, render as before.
+    on = chat.parse_chat_request({"messages": [{"role": "user", "content": "hi"}]}, "m")
+    assert initial_state(MUSE, chat.build_prompt(MUSE, on)) == ("frame", "")
+    # A zero budget on such a model keeps the mask, no re-render, no 400.
+    zero = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}], "max_reasoning_tokens": 0},
+        "m",
+    )
+    gen = chat.to_generation_request(MUSE, zero)
+    assert gen.reasoning is not None and gen.reasoning.max_tokens == 0
+    assert zero.template_kwargs.get("enable_thinking") is not False
+
+
 def test_thinking_off_with_tools_is_a_zero_budget():
     """Without the opener in the prompt the block is kept out by the
     budget: zero masks the reasoning label behind the shared opener
     (Harmony's `analysis`, Muse's `=self`), the answer's and the tools'
     channels stay open. Without tools the opener does the job and no
-    budget is set."""
-    for tok in (HARMONY, MUSE):
+    budget is set. Muse refuses thinking off altogether (above)."""
+    for tok in (HARMONY,):
         req = chat.parse_chat_request(
             {
                 "messages": [{"role": "user", "content": "hi"}],

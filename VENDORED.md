@@ -347,6 +347,24 @@ previous call's JSON, with only whitespace and the model's repeated
 returns the block as text. Test:
 `test_mistral_headers_are_anchored_never_read_out_of_a_json_string`.
 
+`thinking switch` - `tokenizer_utils.py`, `_infer_thinking_switch`,
+`_template_opens_thinking`, `TokenizerWrapper.has_thinking`,
+`thinking_switch`: upstream reports `has_thinking` whenever the vocabulary
+holds a marker pair, and a reserved pair is no capability (Granite 4.0
+carries `<think>` tokens, its template never writes them, the model never
+thinks). The wrapper now reads the template: `thinking_switch` is
+`"template"` when it takes the kwarg (`enable_thinking` or `thinking`,
+as text or as a renderer's parameter), `"opener"` when the family's
+answer can be opened in the prompt instead (Harmony), `None` otherwise;
+`has_thinking` holds when there is a switch, the family carries the
+reasoning in its frame (Harmony, Muse), or the template opens the marker
+itself (distilled reasoning models). Muse lost its `answer_opener`: primed
+with `<|message|>` the model keeps reasoning inside the answer, so the
+API refuses `enable_thinking: false` for a model without a switch
+(`mlx_beam/api/chat.py`, `no_switch`). Tests: `tests/test_api.py`
+(`test_the_channel_family_is_inferred_on_the_marker_alone`),
+`tests/test_families.py` (`test_a_family_without_a_switch_refuses_thinking_off`).
+
 `parameter end` - `tool_parsers/qwen3_coder.py`, `_parameter_bodies` and
 `_closed_parameters`: upstream cuts every parameter at the first
 `</parameter>` (`<parameter=(.*?)</parameter>`), so a value that contains the

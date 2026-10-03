@@ -367,7 +367,8 @@ FAMILY_MARKERS = {
     "muse": {
         "openers": (" to=",),
         "close": "<|eom|><|start|>assistant<|message|>",
-        "answer_opener": "<|message|>",
+        # No answer_opener: primed with `<|message|>` the model keeps
+        # reasoning inside the answer (measured), so there is no switch.
         "structural": ("<|start|>assistant", "<|message|>", "<|eom|>"),
         "frame": "<|start|>assistant",
         "reasoning_label": "self",
@@ -407,6 +408,39 @@ def _infer_structural_markers(tokenizer):
     if _is_muse_vocab(vocab):
         return FAMILY_MARKERS["muse"]["structural"]
     return ()
+
+
+def _infer_thinking_switch(tokenizer, chat_template, kwarg, family):
+    """How a request switches the reasoning off: "template" when the
+    template takes the kwarg, "opener" when the family's answer can be
+    opened in the prompt instead, None when neither - then the model
+    thinks as it was trained to, or not at all."""
+    renderers = [chat_template] if callable(chat_template) else []
+    if (
+        getattr(type(tokenizer), "apply_chat_template", None)
+        is not PreTrainedTokenizerBase.apply_chat_template
+    ):
+        renderers.append(type(tokenizer).apply_chat_template)
+    for renderer in renderers:
+        try:
+            if kwarg in inspect.signature(renderer).parameters:
+                return "template"
+        except (ValueError, TypeError):
+            pass
+    text = getattr(tokenizer, "chat_template", None)
+    if isinstance(text, str) and kwarg in text:
+        return "template"
+    if "answer_opener" in FAMILY_MARKERS.get(family, {}):
+        return "opener"
+    return None
+
+
+def _template_opens_thinking(tokenizer, think_start):
+    """A template that writes the marker itself (the distilled reasoning
+    models open `<think>` in the generation prompt) makes the model think
+    without any switch."""
+    text = getattr(tokenizer, "chat_template", None)
+    return bool(think_start) and isinstance(text, str) and think_start in text
 
 
 def _infer_thinking_kwarg(tokenizer):
@@ -495,6 +529,18 @@ class TokenizerWrapper:
 
         self._chat_template = chat_template
         self._thinking_kwarg, has_custom_renderer = _infer_thinking_kwarg(tokenizer)
+        self._thinking_switch = _infer_thinking_switch(
+            tokenizer, chat_template, self._thinking_kwarg, self._think_family
+        )
+        # A reserved marker pair in the vocabulary is no capability: the
+        # model thinks when its template can switch it, opens it, or the
+        # family's frame carries it (Granite 4.0 has <think> tokens and
+        # never thinks).
+        self._has_thinking = self._think_start is not None and (
+            self._thinking_switch is not None
+            or self._think_family in FAMILY_MARKERS
+            or _template_opens_thinking(tokenizer, self._think_start)
+        )
         self.has_chat_template = (
             tokenizer.chat_template is not None
             or chat_template is not None
@@ -573,7 +619,11 @@ class TokenizerWrapper:
 
     @property
     def has_thinking(self):
-        return self._think_start is not None
+        return self._has_thinking
+
+    @property
+    def thinking_switch(self):
+        return self._thinking_switch
 
     @property
     def think_start(self):

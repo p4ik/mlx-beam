@@ -117,10 +117,14 @@ class Served:
         """The think family and its markers as the tokenizer found them:
         the evidence behind capabilities.thinking."""
         t = self.tokenizer
-        if not getattr(t, "has_thinking", False):
+        if not getattr(t, "think_start", None):
             return {"family": None}
         return {
             "family": getattr(t, "think_family", None),
+            # How a request switches the block off: the template's kwarg,
+            # the answer's opener, or not at all (then capabilities.thinking
+            # is false unless the template or the family opens it).
+            "switch": getattr(t, "thinking_switch", None),
             "start": getattr(t, "think_start", None),
             "end": getattr(t, "think_end", None),
             "openers": list(getattr(t, "think_openers", None) or ()),

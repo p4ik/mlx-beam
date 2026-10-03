@@ -468,6 +468,8 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     settled = {k: v for k, v in req.template_kwargs.items() if k == effort_kwarg}
     if not req.images:
         req.assistant_start = _assistant_start(render, tokens, settled)
+    if kwargs.get("enable_thinking") is False:
+        no_switch(tokenizer)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False and not req.tools:
         # A family whose template has no switch (Harmony, Muse): the answer
@@ -477,6 +479,22 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
         # ` to=<tool>`), so there the model keeps the choice.
         tokens += list(opener)
     return tokens
+
+
+def no_switch(tokenizer) -> None:
+    """A model that thinks but cannot be told not to: its template has no
+    switch and the family's answer cannot be opened in the prompt either
+    (Muse keeps reasoning inside a primed answer, measured). The request
+    is refused rather than answered with a block in disguise."""
+    if getattr(tokenizer, "has_thinking", False) and (
+        getattr(tokenizer, "thinking_switch", "template") is None
+    ):
+        raise ApiError(
+            "this model cannot switch its reasoning off: the chat template "
+            "has no switch for it; ask for less with reasoning_effort: low "
+            "or bound it with max_reasoning_tokens",
+            param="enable_thinking",
+        )
 
 
 def _assistant_start(render, tokens: list[int], extra: dict) -> int:
@@ -592,8 +610,11 @@ def to_generation_request(
         limit = 0
     if limit == 0 and getattr(tokenizer, "has_thinking", False):
         # No room to think: ask the template to leave the block out, which
-        # a Qwen template does; then check whether it did.
-        if req.template_kwargs.get("enable_thinking") is not False:
+        # a Qwen template does; then check whether it did. A model without
+        # any switch keeps the budget's mask instead.
+        if req.template_kwargs.get("enable_thinking") is not False and getattr(
+            tokenizer, "thinking_switch", "template"
+        ):
             req.template_kwargs["enable_thinking"] = False
             prompt = build_prompt(tokenizer, req, frontend)
             completion_cap, _ = budget(
