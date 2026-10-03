@@ -77,7 +77,11 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync --extra dev --extra vision
-      - run: uvx pre-commit run --all-files
+      - run: |
+          # A missing secret arrives as an empty string, which the check
+          # would take for a configured, empty list - refuse instead.
+          test -n "$LEAK_PATTERNS" || { echo "::error::the secret LEAK_PATTERNS is missing"; exit 1; }
+          uvx pre-commit run --all-files
         env:
           # The denylist hook needs the private list; a tag or a dispatch
           # runs with the repository's secrets, so the hook checks for real.
