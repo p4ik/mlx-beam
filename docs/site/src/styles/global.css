@@ -127,13 +127,13 @@ a:hover {
 /* hero: the wall the beam lights from below */
 .hero {
   position: relative;
-  padding: 6.5rem 0 4.5rem;
+  padding: 3.5rem 0 2.25rem;
   background: radial-gradient(60% 55% at 50% 100%, rgba(102, 0, 0, 0.28), transparent 70%);
 }
 
 h1 {
-  margin: 0 0 1.4rem;
-  font-size: clamp(2.6rem, 6vw, 4.6rem);
+  margin: 0 0 0.8rem;
+  font-size: clamp(2.2rem, 5vw, 3.4rem);
   line-height: 1.02;
   font-weight: 700;
   font-stretch: 112%;
@@ -169,7 +169,7 @@ h1 {
 .beam {
   position: relative;
   height: 2px;
-  margin: 0 0 4rem;
+  margin: 0 0 2rem;
   animation: ignite 0.9s ease-out both;
 }
 
@@ -255,12 +255,12 @@ h1 {
 
 /* sections */
 section {
-  padding: 0 0 3.5rem;
+  padding: 0 0 2rem;
 }
 
 h2 {
-  margin: 0 0 1rem;
-  font-size: 1.35rem;
+  margin: 0 0 0.6rem;
+  font-size: 1.2rem;
   font-weight: 600;
   font-stretch: 108%;
   letter-spacing: -0.01em;
@@ -273,9 +273,9 @@ h2 {
 }
 
 .note {
-  margin: 0.9rem 0 0;
+  margin: 1rem 0 0;
   color: var(--text-dim);
-  font-size: 0.95rem;
+  font-size: 0.9rem;
   max-width: 60ch;
 }
 
@@ -353,15 +353,48 @@ dd {
   max-width: 58ch;
 }
 
-/* the state sits on the title line; built things carry light, planned ones only the outline */
-dt .state {
-  display: inline-block;
-  margin-left: 0.75rem;
-  font-weight: 400;
-  font-stretch: 100%;
+
+/* the feature table: name, what it does, state in its own column */
+table.features {
+  max-width: none;
+  table-layout: fixed;
+  margin-top: 1rem;
+}
+
+table.features col.c-name { width: 27%; }
+table.features col.c-text { width: 61%; }
+table.features col.c-state { width: 12%; }
+
+table.features tr.group th {
+  padding: 1.1rem 0 0.3rem;
   font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   color: var(--text-soft);
-  white-space: nowrap;
+  border-top: 0;
+}
+
+table.features th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  padding: 0 0.75rem 0.5rem 0;
+}
+
+table.features td {
+  padding-right: 0.75rem;
+  vertical-align: top;
+  font-size: 0.93rem;
+  line-height: 1.35;
+}
+
+table.features td.name {
+  font-weight: 600;
+}
+
+table.features td.state {
+  width: auto;
 }
 
 /* status: built things carry light, planned ones only the outline */
@@ -372,7 +405,7 @@ table {
 }
 
 td {
-  padding: 0.75rem 0;
+  padding: 0.45rem 0;
   border-top: 1px solid rgba(102, 0, 0, 0.55);
   vertical-align: middle;
 }
@@ -406,7 +439,7 @@ td.state {
 }
 
 footer {
-  padding: 2.5rem 0 3.5rem;
+  padding: 1.5rem 0 2rem;
   color: var(--text-dim);
   font-size: 0.95rem;
 }

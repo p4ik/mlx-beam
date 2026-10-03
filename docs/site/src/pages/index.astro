@@ -7,18 +7,160 @@ const repo = "https://github.com/p4ik/mlx-beam";
 const install = `uv tool install mlx-beam\nbeam doctor`;
 
 // The same list as the README's "Features": present tense only for what
-// is built, planned things say so.
-const featureList = [
-  { title: "Robust prefix cache", text: "Trie-backed store with its own byte budget, checkpoints for hybrid models, partial hits cut back to the last usable boundary.", state: "built, RAM tier; SSD tier planned", built: true },
-  { title: "No stalls", text: "A short request beside a long prefill answers in seconds: continuous batching with a prefill valve.", state: "built", built: true },
-  { title: "Mixed-precision KV cache", text: "Bits per layer, set at conversion. Quantized after the prefill by default; from the first token for profiles measured that way.", state: "built", built: true },
-  { title: "Multi-token prediction", text: "The checkpoint's own draft head, verified exactly, greedy or sampled; a regulator picks the depth per cycle.", state: "built for one request at a time; in the batch planned", built: true },
-  { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request, next to request defaults and sampling controls.", state: "built", built: true },
-  { title: "Responses and Messages APIs", text: "OpenAI's Responses shape and Anthropic's Messages shape next to chat completions, stateless; /metrics; a repair ladder for tool calls the model wrote badly.", state: "built", built: true },
-  { title: "Vision", text: "Its own package, mlx-beam-vision, selected through the vision extra: Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer and Granite Vision towers. Audio will join it.", state: "built", built: true },
-  { title: "Structured output, GGUF", text: "Extras with a guard: a request that needs what is not installed gets a clear refusal.", state: "planned", built: false },
-  { title: "Expert streaming", text: "Models larger than memory, their experts streamed from SSD.", state: "planned", built: false },
-  { title: "No bloat", text: "The core is the token path and the API formats; everything else is a package or an extra you choose to install. Nothing in the core talks to the network on its own.", state: "built", built: true },
+// is built, planned things say so. Extras are packages or optional installs.
+const featureGroups = [
+  {
+    "group": "Server and APIs",
+    "rows": [
+      {
+        "name": "OpenAI API",
+        "text": "Chat completions, completions, Responses, models; streaming.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Anthropic API",
+        "text": "Messages with thinking blocks and tool use, same token path.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Health and metrics",
+        "text": "/health with evidence per capability, /metrics as plain-text counters.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Access control",
+        "text": "API key off loopback, Host check, CORS allowlist.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "CLI",
+        "text": "beam serve with mlx-lm's flag names, beam doctor.",
+        "state": "built",
+        "built": true
+      }
+    ]
+  },
+  {
+    "group": "Models",
+    "rows": [
+      {
+        "name": "Model classes",
+        "text": "Dense, MoE, hybrid-recurrent, sliding window, sinks, MLA, MRoPE.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Package layout",
+        "text": "Manifest with KV profile and draft-head quantization; plain MLX too.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "vision [extra]",
+        "text": "Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "audio [extra]",
+        "text": "Audio input for models that take it; own package.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "gguf [extra]",
+        "text": "GGUF checkpoints behind a guard.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "images [extra]",
+        "text": "Image generation and editing through the Images API.",
+        "state": "planned",
+        "built": false
+      }
+    ]
+  },
+  {
+    "group": "Engine",
+    "rows": [
+      {
+        "name": "Continuous batching",
+        "text": "Short requests answer beside a long prefill; prefill valve.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Prefix cache",
+        "text": "Trie store, checkpoints for recurrent and window layers, partial hits.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Prefix cache SSD tier",
+        "text": "Entries that survive a restart; today the store is RAM only.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "Mixed-precision KV cache",
+        "text": "Bits per layer from the conversion; quantized after or during prefill.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Multi-token prediction",
+        "text": "Own draft head, exact verify, depth regulator; one request at a time.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Batched MTP",
+        "text": "Several requests speculating at once.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "Expert streaming",
+        "text": "Models larger than memory, experts streamed from SSD.",
+        "state": "planned",
+        "built": false
+      }
+    ]
+  },
+  {
+    "group": "Request control",
+    "rows": [
+      {
+        "name": "Reasoning control",
+        "text": "Thinking field, budget, effort translation, marker families.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Tool calling",
+        "text": "Parsers per model family, repair ladder with every step reported.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "Sampling controls",
+        "text": "Temperature, top-p/k, min-p, penalties, logit bias, seeds, defaults.",
+        "state": "built",
+        "built": true
+      },
+      {
+        "name": "structured [extra]",
+        "text": "Structured output: JSON schema and grammar-constrained decoding.",
+        "state": "planned",
+        "built": false
+      }
+    ]
+  }
 ];
 
 const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
@@ -78,17 +220,27 @@ const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
       <section id="what">
         <div class="wrap">
           <h2>Features</h2>
-          <dl>
-            {featureList.map((f) => (
-              <div>
-                <dt>
-                  {f.title}
-                  <span class="state"><span class={`mark ${f.built ? "built" : "planned"}`}></span>{f.state}</span>
-                </dt>
-                <dd>{f.text}</dd>
-              </div>
-            ))}
-          </dl>
+          <p class="prose">Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.</p>
+          <table class="features">
+            <colgroup><col class="c-name" /><col class="c-text" /><col class="c-state" /></colgroup>
+            <thead>
+              <tr><th>Feature</th><th>What it does</th><th>State</th></tr>
+            </thead>
+            <tbody>
+              {featureGroups.map((g) => (
+                <>
+                  <tr class="group"><th colspan="3">{g.group}</th></tr>
+                  {g.rows.map((r) => (
+                    <tr>
+                      <td class="name">{r.name}</td>
+                      <td>{r.text}</td>
+                      <td class="state"><span class={`mark ${r.built ? "built" : "planned"}`}></span>{r.state}</td>
+                    </tr>
+                  ))}
+                </>
+              ))}
+            </tbody>
+          </table>
           <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
         </div>
       </section>
@@ -98,11 +250,9 @@ const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
           <h2>Why it exists</h2>
           <p class="prose">
             Existing MLX servers either stop at the basics or grow things that have no place in an
-            inference engine: a built-in game, a cloud path that arrives with an update. The ones we ran
-            daily also had bugs where it matters most: prefix cache, batching under load, vision.
-            B.E.A.M. keeps the core to the token path and fixes those paths at the source. Everything
-            else is a package or an extra you choose to install; nothing ever ships in the core that you
-            did not ask for.
+            inference engine, and the ones we ran daily had bugs where it matters most: prefix cache,
+            batching under load, vision. B.E.A.M. keeps the core to the token path and fixes those paths
+            at the source; everything else is a package or an extra you choose to install.
           </p>
         </div>
       </section>
