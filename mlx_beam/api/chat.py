@@ -562,7 +562,17 @@ def boundaries_and_system_end(
     user_idx = [i for i, m in enumerate(messages) if m["role"] == "user"]
     for i in user_idx[-BOUNDARY_TURNS:]:
         if i == len(messages) - 1:
-            continue  # the prompt end is a boundary by itself
+            # The last user turn ends where the generation prompt begins.
+            # The prompt end itself is no boundary the next round shares:
+            # a template renders the finished turn differently from the
+            # prompt that asked for it (Qwen3 drops the empty think block
+            # from the history), and a recurrent layer resumes only from
+            # a checkpoint at or before where the two agree.
+            ends.add(
+                req.assistant_start
+                or _common_prefix(render(messages[: i + 1], False), prompt)
+            )
+            continue
         ends.add(_common_prefix(render(messages[: i + 1], True), prompt))
     bounds = sorted(e for e in ends if 0 < e < len(prompt))
     if system_end is not None and not 0 < system_end < len(prompt):
