@@ -78,6 +78,10 @@ jobs:
           python-version: "3.12"
       - run: uv sync --extra dev --extra vision
       - run: uvx pre-commit run --all-files
+        env:
+          # The denylist hook needs the private list; a tag or a dispatch
+          # runs with the repository's secrets, so the hook checks for real.
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
       - run: uv run beam doctor --json
       - run: uv run pytest -q
       - run: uv run pytest -q packages/mlx-beam-vision/tests

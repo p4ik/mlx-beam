@@ -93,6 +93,23 @@ jobs:
           uv sync --extra dev --extra vision
           uv run lint-imports
 
+  site:
+    # The site is deployed from main only; a dependency bump that breaks
+    # the build must show up in the pull request, not after the merge.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/site/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: docs/site
+      - run: npm run build
+        working-directory: docs/site
+
   test-apple-silicon:
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     # macos-15 runners are Apple silicon (M-series): real MLX, tiny models.
