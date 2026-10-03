@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
+
+# The guard jobs run on every push so a branch is checked before a pull
+# request exists; lint, tests and build run for pull requests and main.
 
 permissions:
   contents: read
@@ -11,8 +14,8 @@ permissions:
 jobs:
   identity:
     # Every commit of the range carries GitHub noreply identities only -
-    # author, committer, co-authors. A required check: nothing else reaches
-    # main. The offending identity is never printed.
+    # author, committer, co-authors, sign-offs. Runs on every push and a
+    # required check on main. The offending identity is never printed.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,7 +29,39 @@ jobs:
           fi
           python3 tools/check_identity.py --range "$range"
 
+  content:
+    # Nothing on the private denylist in any commit of the range (identities,
+    # messages, added lines) or in the tree at its head. The list is the
+    # secret LEAK_PATTERNS, which a pull request from a fork does not get: the
+    # check is required for this repository's own commits and passes with a
+    # notice for a fork. The pull request's title and body are checked too.
+    # A match is reported by place and count, never shown.
+    runs-on: ubuntu-latest
+    env:
+      LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+            [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && required=1 || required=0
+          else
+            range="${{ github.event.before }}..${{ github.sha }}"
+            required=1
+          fi
+          [ -n "$LEAK_PATTERNS" ] || unset LEAK_PATTERNS
+          LEAK_PATTERNS_REQUIRED=$required python3 tools/check_content.py --range "$range"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pull-request-text"
+            LEAK_PATTERNS_REQUIRED=$required python3 tools/check_content.py "$RUNNER_TEMP/pull-request-text"
+          fi
+
   lint:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -43,6 +78,7 @@ jobs:
           uv run lint-imports
 
   test-apple-silicon:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     # macos-15 runners are Apple silicon (M-series): real MLX, tiny models.
     runs-on: macos-15
     strategy:
@@ -63,6 +99,7 @@ jobs:
       - run: uv run pytest -q packages/mlx-beam-vision/tests
 
   test-linux:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     # No MLX here: packaging, CLI and the tests that do not need the device.
     runs-on: ubuntu-latest
     steps:
@@ -78,6 +115,7 @@ jobs:
       - run: uv run pytest -q packages/mlx-beam-vision/tests
 
   build:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

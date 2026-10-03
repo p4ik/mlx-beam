@@ -96,11 +96,26 @@ choice["message"]["content"] = text if text else None
   has only `Added`.
 - Vendored parts are updated in their own commit (`vendor: <part> <old> -> <new>`).
 - Commit identities are GitHub noreply addresses only - author, committer
-  and every `Co-authored-by` trailer (`<login>@users.noreply.github.com`,
-  or GitHub's own `noreply@github.com`). `tools/check_identity.py` refuses
-  anything else: as a commit-msg hook (`pre-commit install --hook-type
-  commit-msg`) and as the `identity` job of CI, a required check on `main`.
-  Squash merges through the API carry the pull request's body as the
+  and every `Co-authored-by` / `Signed-off-by` trailer
+  (`<login>@users.noreply.github.com`, or GitHub's own `noreply@github.com`).
+  `git config user.useConfigOnly true`, so nothing falls back to a login
+  name. `tools/check_identity.py` refuses anything else.
+- A private denylist of words that must not appear anywhere in the
+  repository - not in a file, a path, a commit message, a pull request
+  text or an identity - is enforced by `tools/check_content.py`. The list
+  is never committed: locally it is read from `~/.config/mlx-beam/denylist`
+  (outside the checkout, one regular expression per line; a contributor
+  keeps an empty file there), in CI from a repository secret. A match is
+  reported by place and count, never shown.
+- Check the whole branch before it leaves the machine, not the last commit
+  (`cherry-pick`, `rebase` and `--amend` carry foreign identities past the
+  hooks): `python3 tools/check_identity.py --range origin/main..HEAD` and
+  `python3 tools/check_content.py --range origin/main..HEAD`.
+- Push the branch first and wait for the `identity` and `content` jobs of
+  that push to pass; open the pull request only then. A branch can be
+  deleted, a pull request's refs cannot. Both jobs are required checks on
+  `main`.
+- Squash merges through the API carry the pull request's body as the
   commit message; the default message would list the branch commits with
   their authors.
 

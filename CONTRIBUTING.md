@@ -61,7 +61,20 @@ Set them once per clone and install the hook that refuses anything else:
 ```
 git config user.name <login>
 git config user.email <id>+<login>@users.noreply.github.com
-uv run pre-commit install --hook-type commit-msg
+uv sync --extra dev
+uv run pre-commit install --hook-type pre-commit --hook-type commit-msg
+mkdir -p ~/.config/mlx-beam && touch ~/.config/mlx-beam/denylist
 ```
+
+The hooks also check the staged files and the commit message against a
+private denylist of words that must not appear in this repository
+(`tools/check_content.py`). The list lives outside the checkout in
+`~/.config/mlx-beam/denylist`, one regular expression per line; an empty
+file is a configured, empty list.
+
+Before a pull request: push the branch and let the `identity` and
+`content` jobs of that push pass (they run on every push), then open the
+pull request. CI runs the same checks with the maintainers' list over every
+commit of the pull request and over its title and text.
 
 CI checks every commit of a pull request the same way.

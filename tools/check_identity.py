@@ -1,6 +1,6 @@
 """Every commit in a range carries only GitHub noreply identities.
 
-Author, committer and every Co-authored-by trailer must be a
+Author, committer and every Co-authored-by / Signed-off-by trailer must be a
 `@users.noreply.github.com` address (or GitHub's own noreply): nothing
 else is a valid identity for this repository. Run as a commit-msg hook
 (the commit being made) or over a range in CI (the pull request).
@@ -13,7 +13,7 @@ import sys
 ALLOWED = re.compile(
     r"^[^<]*<(?:[^@<>]+@users\.noreply\.github\.com|noreply@github\.com)>$"
 )
-TRAILER = re.compile(r"^Co-authored-by:\s*(.+)$", re.M | re.I)
+TRAILER = re.compile(r"^(?:Co-authored-by|Signed-off-by):\s*(.+)$", re.M | re.I)
 
 
 def ident(var: str) -> str:
@@ -31,8 +31,11 @@ def main(argv: list[str]) -> int:
         print("usage: check_identity.py --range <base>..<head> | <commit-msg-file>")
         return 2
     if len(argv) == 3 and argv[1] == "--range":
+        base, _, head = argv[2].partition("..")
+        # A first push has no base (all zeros): the head commit alone is the range.
+        selector = ["-1", head or "HEAD"] if re.fullmatch(r"0+", base) else [argv[2]]
         log = subprocess.run(
-            ["git", "log", "--format=%an <%ae>%n%cn <%ce>%n%B%x00", argv[2]],
+            ["git", "log", "--format=%an <%ae>%n%cn <%ce>%n%B%x00", *selector],
             capture_output=True,
             text=True,
             check=True,

@@ -24,3 +24,15 @@ repos:
         stages: [commit-msg]
         always_run: true
         pass_filenames: true
+    -   id: content
+        name: nothing on the denylist in the staged files
+        entry: python3 tools/check_content.py
+        language: system
+        pass_filenames: true
+    -   id: content-msg
+        name: nothing on the denylist in the message or identity
+        entry: python3 tools/check_content.py --msg
+        language: system
+        stages: [commit-msg]
+        always_run: true
+        pass_filenames: true
