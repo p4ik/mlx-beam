@@ -80,6 +80,11 @@ class Served:
         self.model_name = model_name
         self.reasoning_field = reasoning_field
         self.defaults = defaults or RequestDefaults()
+        # An origin goes back out as a header value; one with a line break
+        # or a space would write into the response, so it is refused here.
+        for origin in allowed_origins:
+            if origin != origin.strip() or any(c in origin for c in "\r\n "):
+                raise ValueError("an allowed origin must not contain whitespace")
         self.allowed_origins = tuple(allowed_origins)
         # Who may call: the key policy and the Host names, from the bind.
         self.access = access or Access.local()
@@ -271,10 +276,12 @@ class Handler(BaseHTTPRequestHandler):
         if "*" in allowed:
             origin = "*"
         else:
-            # Echo the caller's origin only when it is on the list.
+            # Answer with the configured origin the caller's one equals -
+            # the configuration's string, not the request's, goes out.
             self.send_header("Vary", "Origin")
-            origin = self.headers.get("Origin")
-            if origin not in allowed:
+            asked_origin = self.headers.get("Origin")
+            origin = next((o for o in allowed if o == asked_origin), None)
+            if origin is None:
                 return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
