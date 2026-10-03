@@ -24,8 +24,12 @@ jobs:
       - run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
-          else
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
             range="${{ github.event.before }}..${{ github.sha }}"
+          else
+            # A force-push (rebase) leaves the old head unreachable, so the
+            # branch is checked by what it adds over main instead.
+            range="origin/main..${{ github.sha }}"
           fi
           python3 tools/check_identity.py --range "$range"
 
@@ -50,8 +54,12 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
             [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ] && required=1 || required=0
-          else
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
             range="${{ github.event.before }}..${{ github.sha }}"
+            required=1
+          else
+            # Same as in the identity job: a rebased branch has no reachable old head.
+            range="origin/main..${{ github.sha }}"
             required=1
           fi
           [ "${{ github.actor }}" = "dependabot[bot]" ] && required=0
