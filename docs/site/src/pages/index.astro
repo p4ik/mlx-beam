@@ -15,7 +15,7 @@ const built = [
   { title: "Multi-token prediction", text: "The checkpoint's own draft head, verified exactly, greedy or sampled. On today for one request at a time; in the batch planned." },
   { title: "Thinking budget", text: "A hard cap on the reasoning trace, per request." },
   { title: "Responses and Messages APIs", text: "OpenAI's Responses shape and Anthropic's Messages shape next to chat completions, stateless." },
-  { title: "No bloat", text: "The core is the token path and the API formats. Vision and audio will come as their own package, structured output and GGUF as extras with a guard - none of them in this release yet. Expert streaming for models larger than memory is planned." },
+  { title: "No bloat", text: "The core is the token path and the API formats. Vision is its own package, mlx-beam-vision, selected through the vision extra; audio will join it. Structured output and GGUF come as extras with a guard. Expert streaming for models larger than memory is planned." },
 ];
 
 
@@ -27,9 +27,10 @@ const status = [
   { piece: "OpenAI server with continuous batching, quantized KV cache", state: "built", built: true },
   { piece: "Prefix cache with recurrent-state checkpoints, RAM tier", state: "built", built: true },
   { piece: "Multi-token prediction, one request at a time, greedy or sampled", state: "built", built: true },
+  { piece: "Vision as the package mlx-beam-vision (Qwen3-VL / Qwen3.5 / Qwen3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite Vision towers)", state: "built", built: true },
   { piece: "Prefix cache SSD tier", state: "planned", built: false },
-  { piece: "Multi-token prediction in the batch and under sampling", state: "planned", built: false },
-  { piece: "Vision, structured output", state: "planned", built: false },
+  { piece: "Multi-token prediction in the batch", state: "planned", built: false },
+  { piece: "Structured output, GGUF (extras with a guard)", state: "planned", built: false },
   { piece: "Expert streaming from SSD", state: "planned", built: false },
 ];
 ---
