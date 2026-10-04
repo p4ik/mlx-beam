@@ -1,4 +1,4 @@
-"""Qwen3-VL's tower, which Qwen3.5 and Qwen3.8 carry unchanged: a ViT with
+"""Qwen3-VL's tower, which Qwen3.5, 3.6 and 3.8 carry unchanged: a ViT with
 2D rotary embeddings, windowed and full blocks, a patch merger projecting to
 the text width, and DeepStack - the outputs of three intermediate blocks,
 merged the same way, that the text model adds at the image positions after

@@ -13,6 +13,8 @@ hand and left alone.
 from __future__ import annotations
 
 import argparse
+import html
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +36,22 @@ def serve_parser() -> argparse.ArgumentParser:
 
 def cell(text: str) -> str:
     return " ".join(text.split()).replace("|", "\\|")
+
+
+# The table shows the lead of a help text; the full text opens on hover or focus.
+# A lead ends where the help explains itself: at a colon, a semicolon or a
+# parenthesis. "a, or b" is one thought and stays whole.
+_LEAD_END = re.compile(r"((?<=[A-Za-z0-9]): |; | \()")
+
+
+def description(text: str) -> str:
+    full = cell(text)
+    m = _LEAD_END.search(full)
+    if not m:
+        return full
+    lead = full[: m.start()]
+    tip = html.escape(full, quote=True)
+    return f'<span class="hint" tabindex="0" data-tip="{tip}">{lead}</span>'
 
 
 def value_column(action: argparse.Action) -> str:
@@ -79,9 +97,10 @@ def render(parser: argparse.ArgumentParser) -> str:
         out.append("| Flag | Value | Default | What it does |")
         out.append("|---|---|---|---|")
         for a in actions:
-            flags = ", ".join(f"`{f}`" for f in a.option_strings)
+            # One name per line: an alias reads as an alias, not as a second flag.
+            flags = "<br>".join(f"`{f}`" for f in a.option_strings)
             out.append(
-                f"| {flags} | {value_column(a)} | {default_column(a)} | {cell(a.help or '')} |"
+                f"| {flags} | {value_column(a)} | {default_column(a)} | {description(a.help or '')} |"
             )
         out.append("")
     out.append(END)

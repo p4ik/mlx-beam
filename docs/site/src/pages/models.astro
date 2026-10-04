@@ -1,0 +1,186 @@
+---
+import "@fontsource-variable/archivo/standard.css";
+import "../styles/global.css";
+import Header from "../components/Header.astro";
+
+const repo = "https://github.com/p4ik/mlx-beam";
+
+// One row per model family, alphabetical. A cell is a mark; its label and
+// the sentence behind it open on hover. state: "built" | "planned" | "na"
+const columns = ["Architecture", "Thinking", "Tool calls", "Vision", "Draft head"];
+const families = [
+  {
+    name: "Qwen3.5 / 3.6 / 3.8",
+    example: "Qwen/Qwen3.8-27B",
+    cells: [
+      ["built", "GDN hybrid", "Gated DeltaNet and attention, MoE in the larger sizes; the recurrent state is checkpointed in the prefix store."],
+      ["built", "<think>", "<think> blocks; enable_thinking and reasoning_effort go through the template."],
+      ["built", "qwen3_coder", "qwen3_coder parser."],
+      ["built", "Qwen3-VL", "Qwen3-VL tower with DeepStack, carried unchanged by Qwen3.5 and 3.8."],
+      ["built", "mtp.* bundled", "The bundled mtp.* head, used with --draft-model bundled."],
+    ],
+  },
+  {
+    name: "Qwen3.8 Flash-Next",
+    example: "Qwen/Qwen3.8-Flash-Next",
+    cells: [
+      ["planned", "Flash-Next MoE", "Flash-Next MoE with experts streamed from SSD; the model class and expert streaming are the next release's work."],
+      ["planned", "<think>", "<think> blocks; enable_thinking and reasoning_effort go through the template."],
+      ["planned", "qwen3_coder", "qwen3_coder parser."],
+      ["planned", "Flash-Next tower", "The tower the checkpoint carries is not vendored yet."],
+      ["planned", "mtp.* bundled", "Bundled mtp.* head, one hybrid layer with its own experts; needs the model class first."],
+    ],
+  },
+  {
+    name: "Gemma 4",
+    example: "google/gemma-4-12B-it, E-series",
+    cells: [
+      ["built", "sliding window", "Sliding window with full layers; window layers are checkpointed in the prefix store."],
+      ["built", "channel", "Channel marker; enable_thinking goes through the template."],
+      ["built", "gemma4", "gemma4 parser."],
+      ["built", "E-series tower", "E-series tower. The 12B's encoder-free images need a bidirectional mask in the text model and are refused with that reason."],
+      ["na", "", ""],
+    ],
+  },
+  {
+    name: "Mistral Small 3.x",
+    example: "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    cells: [
+      ["built", "dense attention", "Plain attention, dense."],
+      ["na", "", ""],
+      ["built", "mistral", "mistral parser; several calls without an end marker are cut at the header."],
+      ["built", "Pixtral", "Pixtral tower; the HF layout and mlx-vlm's conversions both load."],
+      ["na", "", ""],
+    ],
+  },
+  {
+    name: "gpt-oss",
+    example: "openai/gpt-oss-20b",
+    cells: [
+      ["built", "attention sinks", "Attention sinks, MoE; sink layers stay unquantized, since there is no quantized SDPA for them."],
+      ["built", "Harmony", "Harmony channels; reasoning_effort goes into the system prompt."],
+      ["built", "harmony", "harmony parser; a tool recipient is a call, the analysis channel is reasoning."],
+      ["na", "", ""],
+      ["na", "", ""],
+    ],
+  },
+  {
+    name: "Muse Glimmer",
+    example: "meta-models/Muse-Glimmer-30B",
+    cells: [
+      ["built", "window + NoPE", "Sliding window with NoPE full layers, dense."],
+      ["built", "to=self", "to=self channel; the template has no switch, so thinking off is refused and reasoning_effort steers."],
+      ["built", "ATEM", "ATEM parser."],
+      ["built", "Muse tower", "Muse tower."],
+      ["na", "", ""],
+    ],
+  },
+  {
+    name: "GLM-4.7",
+    example: "zai-org/GLM-4.7-Flash",
+    cells: [
+      ["built", "MLA, MoE", "MLA with a latent KV cache, MoE; latent layers stay unquantized."],
+      ["built", "<think>", "<think> blocks; enable_thinking goes through the template."],
+      ["built", "glm47", "glm47 parser."],
+      ["na", "", ""],
+      ["built", "NextN bundled", "NextN head (DeepSeek-V3's form too); exercised on a tiny model, the real package is still to be measured."],
+    ],
+  },
+  {
+    name: "Granite 4",
+    example: "ibm-granite/granite-4.0-h-small",
+    cells: [
+      ["built", "Mamba-2 hybrid", "Mamba-2 and attention hybrid, MoE or dense; the recurrent state is checkpointed and restored around a verify."],
+      ["na", "", "Granite 4 never thinks; the inherited <think> pair is not reported as a capability."],
+      ["built", "JSON", "JSON calls; arguments sent as a JSON string are decoded."],
+      ["na", "", ""],
+      ["planned", "external drafter", "An external drafter (h-micro for h-small) is not supported yet."],
+    ],
+  },
+  {
+    name: "Granite Vision 4.1",
+    example: "ibm-granite/granite-vision-4.1-4b",
+    cells: [
+      ["built", "Granite text", "Granite text model, dense or Mamba-2 hybrid by the config."],
+      ["na", "", ""],
+      ["built", "JSON", "JSON calls, as Granite 4."],
+      ["built", "SigLIP AnyRes", "SigLIP tower with AnyRes tiles and DeepStack projectors into several text layers."],
+      ["na", "", ""],
+    ],
+  },
+];
+families.sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+
+---
+
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Models · mlx-beam</title>
+    <meta name="description" content="The model classes the engine handles and the families it was checked with." />
+    <meta name="theme-color" content="#000000" />
+  </head>
+  <body>
+    <Header />
+
+    <main>
+      <section class="doc">
+        <div class="wrap">
+          <h1>Models</h1>
+          <p class="lead">The model classes the engine handles and the families it was checked with.</p>
+          <p>
+            Any architecture mlx-lm loads runs as text; the table lists what the engine adds per family,
+            with one model standing for each. A mark is built, a ring is planned, a dash means the family
+            has no such thing. Hover a mark for what it stands for. Every class has a tiny model in
+            the test suite; measured numbers are published as they are measured, with machine, model and date.
+          </p>
+
+          <table class="models">
+            <colgroup>
+              <col class="c-family" />
+              {columns.map(() => <col class="c-cap" />)}
+            </colgroup>
+            <thead>
+              <tr>
+                <th>Family</th>
+                {columns.map((c) => <th>{c}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {families.map((f) => (
+                <tr>
+                  <td class="family"><span class="fname">{f.name}</span><span class="example">{f.example}</span></td>
+                  {f.cells.map(([state, label, tip]) => (
+                    <td class={`cap ${state}`}>
+                      {state === "na" ? (
+                        tip ? <span class="hint" tabindex="0" data-tip={tip}>—</span> : "—"
+                      ) : (
+                        <span class="hint" tabindex="0" data-tip={label ? `${label} — ${tip}` : tip}><i class="mark" aria-hidden="true"></i></span>
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <p class="note">
+            Tool parsers vendored from mlx-lm cover more families than the table (Kimi, MiniMax, LongCat,
+            pythonic and JSON calls), and think markers are read from the template of any model.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <p>Apache-2.0. Vendored components keep their own licenses.</p>
+        <nav>
+          <a href={repo}>GitHub</a>
+          <a href={`${repo}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>
