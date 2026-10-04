@@ -14,6 +14,12 @@ dest-to-upstream file map) or to a PyPI wheel (wheel + sha256 + a file map).
 Exit status 1 when a file differs that tools/vendor.toml does not list as
 modified, when a listed file is missing or identical, or when the vendored
 tree carries files that are neither upstream's nor listed as local.
+
+Before any diff, the inventory is checked without network: every directory
+under a _vendor/ tree is a part, every part carries a LICENSE, and the
+nearest VENDORED.md has its section (``## <part>``, or for a package-level
+file one mention of each vendored directory). Exit status 1 on a gap.
+    tools/vendor_diff.py --inventory      only that check
 """
 
 import argparse
@@ -159,9 +165,59 @@ def diff_part(name, part, tick, limits):
         return not errors, stale
 
 
+VENDOR_TREES = [
+    ROOT / "mlx_beam" / "_vendor",
+    ROOT / "packages" / "mlx-beam-vision" / "mlx_beam_vision" / "_vendor",
+]
+
+
+def nearest_doc(dest):
+    for d in [dest, *dest.parents]:
+        if (d / "VENDORED.md").exists():
+            return d / "VENDORED.md"
+    return None
+
+
+def inventory(parts):
+    """The gaps NOTICE used to paper over: a vendored tree without a part,
+    a part without its license file, or without its place in VENDORED.md."""
+    dests = {ROOT / p["dest"] for p in parts.values()}
+    problems = []
+    for tree in VENDOR_TREES:
+        for d in sorted(tree.iterdir()):
+            if d.is_dir() and d.name != "__pycache__" and d not in dests:
+                problems.append(f"{d.relative_to(ROOT)}: no part in tools/vendor.toml")
+    for name, part in parts.items():
+        dest = ROOT / part["dest"]
+        if not (dest / "LICENSE").is_file():
+            problems.append(f"{name}: no LICENSE under {part['dest']}")
+        doc = nearest_doc(dest)
+        if doc is None:
+            problems.append(f"{name}: no VENDORED.md above {part['dest']}")
+            continue
+        text = doc.read_text()
+        if doc.parent == ROOT:
+            if f"\n## {name}\n" not in text:
+                problems.append(f"{name}: no '## {name}' section in VENDORED.md")
+            continue
+        for sub in sorted(dest.iterdir()):
+            if (
+                sub.is_dir()
+                and sub.name != "__pycache__"
+                and f"`{sub.name}`" not in text
+            ):
+                problems.append(
+                    f"{name}: {sub.name}/ not mentioned in {doc.relative_to(ROOT)}"
+                )
+    for p in problems:
+        print(f"ERROR inventory: {p}")
+    return not problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--part")
+    ap.add_argument("--inventory", action="store_true", help="only the inventory check")
     ap.add_argument("--clock", action="store_true")
     ap.add_argument("--max-days", type=float, help="with --clock: exit 2 past this age")
     ap.add_argument(
@@ -169,6 +225,10 @@ def main():
     )
     args = ap.parse_args()
     parts = tomllib.loads(CONFIG.read_text())["parts"]
+    if not inventory(parts):
+        sys.exit(1)
+    if args.inventory:
+        return
     if args.part:
         parts = {args.part: parts[args.part]}
     limits = (args.max_days, args.max_commits)

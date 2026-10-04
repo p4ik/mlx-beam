@@ -493,6 +493,296 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
     assert provider.family_for(config) == "mistral3"
 
 
+class FakeTokenizer:
+    """What the builder asks a tokenizer: the chat template the checkpoint
+    carries and the tokens it knows."""
+
+    chat_template = "<template>"
+    unk_token_id = 0
+    vocab = {"[IMG]": 10, "[IMG_BREAK]": 11, "[IMG_END]": 12, "<|image_pad|>": 62}
+
+    def convert_ids_to_tokens(self, i):
+        return {v: k for k, v in self.vocab.items()}[i]
+
+    def convert_tokens_to_ids(self, t):
+        return self.vocab.get(t, self.unk_token_id)
+
+
+class _Kwargs(dict):
+    """Stands in for a transformers kwargs TypedDict: `__annotations__`
+    names the keys a class accepts."""
+
+
+def _image_processor_class(name, **defaults):
+    kw = type(f"{name}Kwargs", (), {"__annotations__": {k: object for k in defaults}})
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    return type(name, (), {**defaults, "valid_kwargs": kw, "__init__": __init__})
+
+
+class FakePixtralProcessor:
+    """PixtralProcessor's signature: two attributes, the rest settings."""
+
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        patch_size=16,
+        spatial_merge_size=1,
+        chat_template=None,
+        image_token="[IMG]",
+        image_break_token="[IMG_BREAK]",
+        image_end_token="[IMG_END]",
+        **kwargs,
+    ):
+        self.image_processor = image_processor
+        self.tokenizer = tokenizer
+        self.chat_template = chat_template
+        self.settings = dict(
+            patch_size=patch_size,
+            spatial_merge_size=spatial_merge_size,
+            image_token=image_token,
+            image_break_token=image_break_token,
+            image_end_token=image_end_token,
+        )
+
+    @classmethod
+    def get_attributes(cls):
+        return ["image_processor", "tokenizer"]
+
+
+class FakeQwenProcessor:
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        chat_template=None,
+    ):
+        self.image_processor = image_processor
+        self.video_processor = video_processor
+        self.tokenizer = tokenizer
+        self.chat_template = chat_template
+
+    @classmethod
+    def get_attributes(cls):
+        return ["image_processor", "tokenizer", "video_processor"]
+
+
+PixtralImages = _image_processor_class(
+    "PixtralImageProcessor",
+    size={"longest_edge": 1024},
+    patch_size={"height": 16, "width": 16},
+    image_mean=[0.48, 0.46, 0.41],
+    image_std=[0.27, 0.26, 0.28],
+    do_resize=True,
+)
+QwenImages = _image_processor_class(
+    "Qwen2VLImageProcessor",
+    size={"shortest_edge": 56 * 56, "longest_edge": 28 * 28 * 1280},
+    patch_size=14,
+    temporal_patch_size=2,
+    merge_size=2,
+    image_mean=[0.48, 0.46, 0.41],
+)
+QwenVideos = _image_processor_class(
+    "Qwen3VLVideoProcessor",
+    patch_size=16,
+    temporal_patch_size=2,
+    merge_size=2,
+    max_frames=768,
+)
+
+
+def _built_from(monkeypatch, classes, config, tmp_path):
+    import transformers
+    from mlx_beam_vision import frontend
+
+    monkeypatch.setattr(frontend, "classes_for", lambda model_type: classes)
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda path, trust_remote_code=False: FakeTokenizer()),
+    )
+    return frontend.build_processor(tmp_path, config)
+
+
+def test_a_processor_is_built_from_the_model_before_the_class_defaults(
+    tmp_path, monkeypatch
+):
+    """mlx-community's Devstral ships no preprocessor_config.json. The
+    builder takes transformers' classes for the model type and fills them
+    from config.json: the image size and patch size shaped like the
+    class's size dicts, the merge size, the image token the config's id
+    names; mean, std and the break/end tokens stay the class's defaults.
+    The provenance says which is which."""
+    config = {
+        "model_type": "mistral3",
+        "image_token_index": 10,
+        "spatial_merge_size": 2,
+        "vision_config": {"image_size": 1540, "patch_size": 14, "hidden_size": 1024},
+    }
+    processor, info = _built_from(
+        monkeypatch, (FakePixtralProcessor, PixtralImages, None), config, tmp_path
+    )
+    assert processor.image_processor.kwargs == {
+        "size": {"longest_edge": 1540},
+        "patch_size": {"height": 14, "width": 14},
+    }
+    assert processor.settings == dict(
+        patch_size=14,
+        spatial_merge_size=2,
+        image_token="[IMG]",
+        image_break_token="[IMG_BREAK]",
+        image_end_token="[IMG_END]",
+    )
+    assert processor.chat_template == "<template>"
+    assert info["source"] == "built" and info["class"] == "FakePixtralProcessor"
+    assert info["from_model"] == {
+        "image_token": "config.json.image_token_id",
+        "patch_size": "vision_config.patch_size",
+        "size": "vision_config.image_size",
+        "spatial_merge_size": "config.json.spatial_merge_size",
+    }
+    assert info["defaults"] == {
+        "PixtralImageProcessor": ["do_resize", "image_mean", "image_std"]
+    }
+
+
+def test_the_builder_keeps_a_size_rule_the_model_has_no_value_for(
+    tmp_path, monkeypatch
+):
+    """Qwen's processors size by pixel bounds (two keys, nothing in the
+    model to take) and need a video processor beside the image one; both
+    take the patch, temporal patch and merge sizes from vision_config."""
+    config = {
+        "model_type": "qwen3_5",
+        "image_token_id": 62,
+        "vision_config": {
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+        },
+    }
+    processor, info = _built_from(
+        monkeypatch, (FakeQwenProcessor, QwenImages, QwenVideos), config, tmp_path
+    )
+    want = {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}
+    assert processor.image_processor.kwargs == want
+    assert processor.video_processor.kwargs == want
+    assert "size" not in info["from_model"]
+    assert info["defaults"]["Qwen2VLImageProcessor"] == ["image_mean", "size"]
+    assert info["defaults"]["Qwen3VLVideoProcessor"] == ["max_frames"]
+
+
+def test_the_builder_refuses_a_token_default_the_tokenizer_lacks(tmp_path, monkeypatch):
+    class OtherTokens(FakePixtralProcessor):
+        def __init__(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+            image_break_token="[ROW]",
+        ):
+            pass
+
+    config = {"model_type": "mistral3", "vision_config": {"patch_size": 14}}
+    with pytest.raises(ValueError, match="does not know"):
+        _built_from(monkeypatch, (OtherTokens, PixtralImages, None), config, tmp_path)
+
+
+def test_load_processor_builds_only_when_the_checkpoint_ships_no_file(
+    tmp_path, monkeypatch
+):
+    """AutoProcessor fails two ways on such a checkpoint - a bare tokenizer
+    back (Devstral) or "Can't load image processor" (Qwen3.5) - and both
+    go to the builder; the same failures with the file present are
+    errors, and without a config the old refusal stands."""
+    import transformers
+    from mlx_beam_vision import frontend
+
+    class Bare:
+        pass
+
+    config = {
+        "model_type": "mistral3",
+        "image_token_index": 10,
+        "vision_config": {"patch_size": 14},
+    }
+    monkeypatch.setattr(
+        frontend, "classes_for", lambda t: (FakePixtralProcessor, PixtralImages, None)
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda path, trust_remote_code=False: FakeTokenizer()),
+    )
+    for failure in (
+        lambda: Bare(),
+        lambda: (_ for _ in ()).throw(OSError("Can't load image processor")),
+    ):
+        monkeypatch.setattr(
+            transformers.AutoProcessor,
+            "from_pretrained",
+            staticmethod(lambda path, trust_remote_code=False, f=failure: f()),
+        )
+        processor, info = frontend.load_processor(tmp_path, config)
+        assert isinstance(processor, FakePixtralProcessor) and info["source"] == "built"
+    with pytest.raises(ValueError, match="no image processor"):
+        frontend.load_processor(tmp_path, None)
+    (tmp_path / "preprocessor_config.json").write_text("{}")
+    with pytest.raises(OSError):
+        frontend.load_processor(tmp_path, config)
+
+
+def test_a_quantized_tower_loads_with_the_bits_its_tensors_imply(tmp_path):
+    """An 8-bit conversion packs the tower's linears too (weight as uint32
+    words, scales and biases beside it) and may leave some of them in
+    floating point; the loader swaps exactly the packed ones for their
+    quantized form, with bits and group size read off the tensors, and
+    the features match the quantized source. The health says so."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    mx.random.seed(2)
+    source = tower()
+    nn.quantize(
+        source.model,
+        group_size=32,
+        bits=8,
+        # A mixed conversion: the last merger linear stays floating point.
+        class_predicate=lambda p, m: isinstance(m, nn.Linear)
+        and p != "merger.linear_fc2",
+    )
+    mx.eval(source.model.parameters())
+    weights = dict(tree_flatten(source.model.parameters()))
+    assert "blocks.0.attn.qkv.scales" in weights
+    assert "merger.linear_fc2.scales" not in weights
+    stored = {
+        f"model.visual.{k}": (
+            v.transpose(0, 4, 1, 2, 3) if k == "patch_embed.proj.weight" else v
+        )
+        for k, v in weights.items()
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+    config = {**TOWER_CONFIG, "quantization": {"group_size": 32, "bits": 8}}
+    t = qwen3_vl.Tower(config, tmp_path, dtype=mx.float32)
+    assert t.quantized and t.describe()["quantized"]
+    qkv = t.model.blocks[0].attn.qkv
+    assert isinstance(qkv, nn.QuantizedLinear) and (qkv.bits, qkv.group_size) == (8, 32)
+    assert isinstance(t.model.merger.linear_fc2, nn.Linear)
+    assert not isinstance(t.model.merger.linear_fc2, nn.QuantizedLinear)
+    pv, grid = mx.array(pixels((1, 4, 4))), mx.array([(1, 4, 4)])
+    want = source.encode(pv, grid)[0].features
+    assert mx.allclose(t.encode(pv, grid)[0].features, want, atol=1e-5)
+    # The same checkpoint in floating point is close, not equal: the test
+    # would pass trivially if the packed tensors were silently cast.
+    plain = tower()
+    assert not mx.allclose(plain.encode(pv, grid)[0].features, want, atol=1e-5)
+
+
 def test_mistral3_loads_the_hf_layout_and_mlx_vlms(tmp_path):
     """HF keeps Pixtral's blocks right under `vision_tower` (and everything
     under `model.`); mlx-vlm's conversions add a `vision_model` level. Both

@@ -4,7 +4,7 @@ import "../styles/global.css";
 import Header from "../components/Header.astro";
 
 const repo = "https://github.com/p4ik/mlx-beam";
-const install = `uv tool install mlx-beam\nbeam doctor`;
+const install = `uv tool install mlx-beam\nbeam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --draft-model bundled`;
 
 // The same list as the README's "Features": present tense only for what
 // is built, planned things say so. Extras are packages or optional installs.
@@ -41,47 +41,6 @@ const featureGroups = [
         "text": "beam serve takes mlx-lm's flag names; beam doctor checks the machine.",
         "state": "built",
         "built": true
-      }
-    ]
-  },
-  {
-    "group": "Models",
-    "rows": [
-      {
-        "name": "Model classes",
-        "text": "Dense, MoE, hybrid-recurrent, sliding window, sinks, MLA, MRoPE.",
-        "state": "built",
-        "built": true
-      },
-      {
-        "name": "Package layout",
-        "text": "Manifest with KV profile and draft-head quantization; plain MLX loads too.",
-        "state": "built",
-        "built": true
-      },
-      {
-        "name": "Vision [Extra]",
-        "text": "Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite.",
-        "state": "built",
-        "built": true
-      },
-      {
-        "name": "Audio [Extra]",
-        "text": "Audio input for models that take it, as its own package.",
-        "state": "planned",
-        "built": false
-      },
-      {
-        "name": "Images [Extra]",
-        "text": "Image generation and editing through the Images API.",
-        "state": "planned",
-        "built": false
-      },
-      {
-        "name": "GGUF [Extra]",
-        "text": "GGUF checkpoints load behind a guard.",
-        "state": "planned",
-        "built": false
       }
     ]
   },
@@ -152,10 +111,45 @@ const featureGroups = [
         "text": "Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults.",
         "state": "built",
         "built": true
+      }
+    ]
+  },
+  {
+    "group": "Extras",
+    "rows": [
+      {
+        "name": "Vision",
+        "text": "Image input through the mlx-beam-vision package; families on the models page.",
+        "state": "built",
+        "built": true
       },
       {
-        "name": "Structured [Extra]",
+        "name": "Audio",
+        "text": "Audio input for models that take it, as its own package.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "Convert",
+        "text": "Quantizes into the package layout: mixed-precision weights, KV profile, draft head and tower.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "Structured",
         "text": "JSON schema and grammar-constrained decoding.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "GGUF",
+        "text": "GGUF checkpoints load behind a guard.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "Images",
+        "text": "Image generation and editing through the Images API.",
         "state": "planned",
         "built": false
       }
@@ -213,14 +207,14 @@ const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
             <pre><code>{install}</code></pre>
             <button type="button" data-copy>Copy</button>
           </div>
-          <p class="note"><code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
+          <p class="note">The server answers on port 8000; <code>--draft-model bundled</code> uses the draft head the checkpoint ships. <code>beam doctor</code> reports the Python, MLX, device and memory it sees.</p>
         </div>
       </section>
 
       <section id="what">
         <div class="wrap">
           <h2>Features</h2>
-          <p class="prose">Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.</p>
+          <p class="prose">Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core; the core runs without any of them.</p>
           <div class="features">
             {featureGroups.map((g) => (
               <section class="fgroup">

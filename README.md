@@ -8,10 +8,10 @@
 
 ```bash
 uv tool install mlx-beam
-beam doctor
+beam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --draft-model bundled
 ```
 
-Inside a uv project: `uv add mlx-beam`, then `uv run beam doctor`.
+Inside a uv project: `uv add mlx-beam`, then `uv run beam serve ...`.
 
 `beam doctor` reports the Python, MLX, device and memory it sees (`--json` for scripts) and exits non-zero when MLX is missing or fails to load.
 
@@ -27,7 +27,7 @@ An OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/res
 
 ## Features
 
-Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.
+Everything the engine does, with where each piece stands.
 
 | Feature | What it does | State |
 |---|---|---|
@@ -36,12 +36,6 @@ Everything the engine does, with where each piece stands. Extras are packages or
 | **Health and metrics** | `/health` shows each capability with evidence; `/metrics` serves counters. | built |
 | **Access control** | An API key is required off loopback; Host check and CORS allowlist. | built |
 | **CLI** | `beam serve` takes mlx-lm's flag names; `beam doctor` checks the machine. | built |
-| **Model classes** | Dense, MoE, hybrid-recurrent, sliding window, sinks, MLA, MRoPE. | built |
-| **Package layout** | Manifest with KV profile and draft-head quantization; plain MLX loads too. | built |
-| **Vision [Extra]** | Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite. | built |
-| **Audio [Extra]** | Audio input for models that take it, as its own package. | planned |
-| **Images [Extra]** | Image generation and editing through the Images API. | planned |
-| **GGUF [Extra]** | GGUF checkpoints load behind a guard. | planned |
 | **Continuous batching** | Short requests are answered beside a long prefill, capped by a valve. | built |
 | **Prefix cache** | The KV of a shared prefix is reused, for recurrent and window layers too. | built |
 | **Prefix cache SSD tier** | A second tier on SSD lets entries outlive eviction from RAM and restarts. | planned |
@@ -52,7 +46,17 @@ Everything the engine does, with where each piece stands. Extras are packages or
 | **Reasoning control** | Thinking on or off, a budget per request, effort levels, marker families. | built |
 | **Tool calling** | Parsers per model family and a repair ladder that reports every step. | built |
 | **Sampling controls** | Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults. | built |
-| **Structured [Extra]** | JSON schema and grammar-constrained decoding. | planned |
+
+Extras are packages or optional installs beside the core; the core runs without any of them.
+
+| Extra | What it does | State |
+|---|---|---|
+| **Vision** | Image input through the `mlx-beam-vision` package; families on the models page. | built |
+| **Audio** | Audio input for models that take it, as its own package. | planned |
+| **Convert** | Quantizes into the package layout: mixed-precision weights, KV profile, draft head and tower. | planned |
+| **Structured** | JSON schema and grammar-constrained decoding. | planned |
+| **GGUF** | GGUF checkpoints load behind a guard. | planned |
+| **Images** | Image generation and editing through the Images API. | planned |
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with. Which model families the engine handles with what - architecture, thinking, tool calls, vision, draft head - is on the [models page](https://p4ik.github.io/mlx-beam/models/).
 

@@ -17,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_beam_vision._vendor.mlx_vlm.gemma4.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.gemma4.vision import VisionModel
-from mlx_beam_vision.families import Encoded, Loaded, cast, list_count, list_select
+from mlx_beam_vision.families import Encoded, Loaded, list_count, list_select
 
 NAME = "gemma4"
 PARTS = ("vision_tower", "embed_vision")
@@ -57,25 +57,24 @@ class Tower:
             self.config.hidden_size, text_hidden, self.config.rms_norm_eps
         )
         self.loaded_from: list[str] = []
+        self.quantized = False
+        self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
 
     def load(self, model_path: Path) -> None:
-        loaded = Loaded(model_path, PARTS)
+        loaded = Loaded(model_path, PARTS, self.checkpoint)
         weights = loaded.part("vision_tower")
         if not self.config.use_clipped_linears:
             weights = {
                 k: v for k, v in weights.items() if not any(c in k for c in CLIP_KEYS)
             }
         weights = {k: v for k, v in weights.items() if "rotary_emb" not in k}
-        self.model.load_weights(
-            cast(self.model.sanitize(weights), self.dtype), strict=True
-        )
-        self.embedder.load_weights(
-            cast(loaded.part("embed_vision"), self.dtype), strict=True
-        )
+        loaded.fit(self.model, self.model.sanitize(weights), self.dtype)
+        loaded.fit(self.embedder, loaded.part("embed_vision"), self.dtype)
         mx.eval(self.model.parameters(), self.embedder.parameters())
         self.loaded_from = loaded.shards
+        self.quantized = loaded.quantized
 
     def encode(self, images: list[mx.array], positions: list | None) -> list[Encoded]:
         """One tower pass per image (their sizes differ); `positions` are
@@ -103,6 +102,7 @@ class Tower:
             "pooling_kernel_size": self.config.pooling_kernel_size,
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
+            "quantized": self.quantized,
         }
 
 

@@ -21,7 +21,7 @@ from mlx_beam_vision._vendor.mlx_vlm.granite4_vision.downsampling import (
     WindowQFormerDownsampler,
 )
 from mlx_beam_vision._vendor.mlx_vlm.granite4_vision.vision import VisionModel
-from mlx_beam_vision.families import Encoded, Loaded, cast, list_count, list_select
+from mlx_beam_vision.families import Encoded, Loaded, list_count, list_select
 
 NAME = "granite4_vision"
 PARTS = ("vision_tower", "layerwise_projectors", "spatial_projectors", "image_newline")
@@ -84,29 +84,25 @@ class Tower:
         # bring it, a random one would be a silent wrong answer.
         self.image_newline: mx.array | None = None
         self.loaded_from: list[str] = []
+        self.quantized = False
+        self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
 
     # -- weights ---------------------------------------------------------------
 
     def load(self, model_path: Path) -> None:
-        loaded = Loaded(model_path, PARTS)
+        loaded = Loaded(model_path, PARTS, self.checkpoint)
         tower = {
             k: v
             for k, v in loaded.part("vision_tower").items()
             if "position_ids" not in k
         }
-        self.model.load_weights(
-            cast(self.model.sanitize(tower), self.dtype), strict=True
-        )
+        loaded.fit(self.model, self.model.sanitize(tower), self.dtype)
         for i, proj in enumerate(self.layerwise_projectors):
-            proj.load_weights(
-                cast(loaded.part(f"layerwise_projectors.{i}"), self.dtype), strict=True
-            )
+            loaded.fit(proj, loaded.part(f"layerwise_projectors.{i}"), self.dtype)
         for i, proj in enumerate(self.spatial_projectors):
-            proj.load_weights(
-                cast(loaded.part(f"spatial_projectors.{i}"), self.dtype), strict=True
-            )
+            loaded.fit(proj, loaded.part(f"spatial_projectors.{i}"), self.dtype)
         if self.config.use_image_newline_parameter:
             newline = loaded.tensor("image_newline")
             if newline is None:
@@ -122,6 +118,7 @@ class Tower:
             *([self.image_newline] if self.image_newline is not None else []),
         )
         self.loaded_from = loaded.shards
+        self.quantized = loaded.quantized
 
     # -- one image -------------------------------------------------------------
 
@@ -224,6 +221,7 @@ class Tower:
             "spatial_layers": list(self.config.spatial_target_layers or []),
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
+            "quantized": self.quantized,
         }
 
 

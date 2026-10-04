@@ -1,6 +1,9 @@
 mlx-beam-vision
 Copyright 2026 the mlx-beam contributors
 
-This product includes software developed as part of mlx-vlm
-(https://github.com/Blaizzy/mlx-vlm), MIT License; see
-mlx_beam_vision/_vendor/VENDORED.md and mlx_beam_vision/_vendor/mlx_vlm/LICENSE.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This product includes third-party components under their own licenses.
+Each lives under mlx_beam_vision/_vendor/<name>/ with its license file, and
+mlx_beam_vision/_vendor/VENDORED.md lists every vendored part with its
+upstream, commit, license and local changes.

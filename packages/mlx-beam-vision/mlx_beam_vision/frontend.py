@@ -91,10 +91,21 @@ class VisionFrontend:
 
     name = "mlx-beam-vision"
 
-    def __init__(self, processor, tower, family: str, cache_bytes: int = 512 << 20):
+    def __init__(
+        self,
+        processor,
+        tower,
+        family: str,
+        cache_bytes: int = 512 << 20,
+        processor_info: dict | None = None,
+    ):
         self.processor = processor
         self.tower = tower
         self.family = family
+        self.processor_info = processor_info or {
+            "source": "checkpoint",
+            "class": type(processor).__name__,
+        }
         self.cache = FeatureCache(cache_bytes)
         self.chat_template: str | None = None
         self.images_encoded = 0
@@ -237,7 +248,9 @@ class VisionFrontend:
             "provider": self.name,
             "family": self.family,
             "tower": self.tower.describe(),
-            "processor": type(self.processor).__name__,
+            # The checkpoint's own, or built from the model when it ships no
+            # preprocessor_config.json - then with where each setting came from.
+            "processor": self.processor_info,
             "chat_template": (
                 "server" if self.chat_template is not None else "processor"
             ),
@@ -249,18 +262,210 @@ class VisionFrontend:
         }
 
 
-def load_processor(model_path: Path, trust_remote_code: bool = False):
+def load_processor(
+    model_path: Path, config: dict | None = None, trust_remote_code: bool = False
+) -> tuple[object, dict]:
+    """The checkpoint's processor and where it came from. A checkpoint that
+    ships no preprocessor_config.json (mlx-community's conversions leave it
+    out) gets one built from what it does carry - see `build_processor`;
+    without a config to build from, that checkpoint is refused here rather
+    than with a KeyError on the first image."""
     from transformers import AutoProcessor
 
-    processor = AutoProcessor.from_pretrained(
+    shipped = any(
+        (model_path / name).is_file()
+        for name in ("preprocessor_config.json", "processor_config.json")
+    )
+    try:
+        processor = AutoProcessor.from_pretrained(
+            str(model_path), trust_remote_code=trust_remote_code
+        )
+    except OSError:
+        # "Can't load image processor": AutoProcessor knows the model type
+        # and looked for the file; a missing directory would have failed
+        # when the text model loaded.
+        if shipped:
+            raise
+        processor = None
+    if processor is not None and getattr(processor, "image_processor", None):
+        return processor, {"source": "checkpoint", "class": type(processor).__name__}
+    if config is None or shipped:
+        what = "AutoProcessor" if processor is None else type(processor).__name__
+        raise ValueError(
+            f"{what} has no image processor; the checkpoint ships no "
+            "preprocessor_config.json, so images cannot be prepared"
+        )
+    return build_processor(model_path, config, trust_remote_code)
+
+
+def classes_for(model_type: str):
+    """transformers' own (processor, image processor, video processor or
+    None) for a model type; the image backend is torchvision when it is
+    installed, PIL otherwise, as AutoImageProcessor picks it."""
+    from transformers.models.auto.image_processing_auto import (
+        IMAGE_PROCESSOR_MAPPING_NAMES,
+        get_image_processor_class_from_name,
+    )
+    from transformers.models.auto.processing_auto import (
+        PROCESSOR_MAPPING_NAMES,
+        processor_class_from_name,
+    )
+    from transformers.models.auto.video_processing_auto import (
+        VIDEO_PROCESSOR_MAPPING_NAMES,
+        video_processor_class_from_name,
+    )
+    from transformers.utils import is_torchvision_available
+
+    proc = PROCESSOR_MAPPING_NAMES.get(model_type)
+    names = IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type)
+    if not proc or not names:
+        raise ValueError(
+            f"the checkpoint ships no preprocessor_config.json and transformers "
+            f"has no processor for model type {model_type!r}, so images cannot "
+            "be prepared"
+        )
+    if isinstance(names, dict):
+        backend = "torchvision" if is_torchvision_available() else "pil"
+        image = names.get(backend) or next(n for n in names.values() if n)
+    else:
+        image = names if isinstance(names, str) else next(n for n in names if n)
+    video = VIDEO_PROCESSOR_MAPPING_NAMES.get(model_type)
+    return (
+        processor_class_from_name(proc),
+        get_image_processor_class_from_name(image),
+        video_processor_class_from_name(video) if video else None,
+    )
+
+
+class ModelValues:
+    """What a checkpoint says about its own preprocessing, looked up by the
+    names transformers' classes use: a key is read from vision_config, then
+    config.json's top level, under its own name or the one the config uses
+    for it (`merge_size` is `spatial_merge_size` there, `size` is
+    `image_size`). Every hit is recorded with its origin."""
+
+    ALIASES = {"merge_size": "spatial_merge_size", "size": "image_size"}
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.vision = config.get("vision_config") or {}
+        self.origin: dict[str, str] = {}
+
+    def find(self, key: str):
+        for name in (key, self.ALIASES.get(key)):
+            if name is None:
+                continue
+            for where, table in (
+                ("vision_config", self.vision),
+                ("config.json", self.config),
+            ):
+                if name in table and not isinstance(table[name], (dict, list)):
+                    self.origin[key] = f"{where}.{name}"
+                    return table[name]
+        return None
+
+    def fill(self, cls, keys, defaults: dict) -> dict:
+        """The kwargs for `cls`: the model's value for every key it has one
+        for, shaped like the class's default when that is a size dict
+        (`{"longest_edge": 1024}` takes the model's image_size; a
+        `{"height", "width"}` pair takes its patch size); the rest stays the
+        class's default and is listed as such."""
+        out = {}
+        for key in keys:
+            value = self.find(key)
+            default = defaults.get(key)
+            if value is None:
+                continue
+            if isinstance(default, dict) and not isinstance(value, dict):
+                if len(default) == 1 or set(default) == {"height", "width"}:
+                    value = {k: value for k in default}
+                else:
+                    self.origin.pop(key, None)
+                    continue
+            out[key] = value
+        return out
+
+
+def _defaults(cls) -> dict:
+    """The class's own defaults for the keys its kwargs TypedDict names."""
+    kwargs_type = getattr(cls, "valid_kwargs", None)
+    keys = list(getattr(kwargs_type, "__annotations__", {}))
+    return {k: getattr(cls, k) for k in keys if hasattr(cls, k)}
+
+
+def build_processor(model_path: Path, config: dict, trust_remote_code: bool = False):
+    """A processor for a checkpoint without preprocessor_config.json, from
+    the model first and the class's defaults only where the model says
+    nothing: the classes are transformers' own for the model type, the
+    tokenizer and chat template the checkpoint's, sizes and merges from
+    config.json, the image token the one config.json's id names (a token
+    default the tokenizer does not know is refused). The second value says
+    where each setting came from; it reaches /health.vision.processor."""
+    import inspect
+
+    from transformers import AutoTokenizer
+
+    model_type = str(config.get("model_type", ""))
+    processor_cls, image_cls, video_cls = classes_for(model_type)
+    tokenizer = AutoTokenizer.from_pretrained(
         str(model_path), trust_remote_code=trust_remote_code
     )
-    # A checkpoint without preprocessor_config.json gets a bare tokenizer
-    # back from AutoProcessor: that is no image path, and saying so here
-    # beats a KeyError on the first image.
-    if getattr(processor, "image_processor", None) is None:
-        raise ValueError(
-            f"{type(processor).__name__} has no image processor; the checkpoint "
-            "ships no preprocessor_config.json, so images cannot be prepared"
-        )
-    return processor
+    values = ModelValues(config)
+    parts = {}
+    defaults_used: dict[str, list[str]] = {}
+    for name, cls in (("image_processor", image_cls), ("video_processor", video_cls)):
+        if cls is None:
+            continue
+        defaults = _defaults(cls)
+        kwargs = values.fill(cls, defaults, defaults)
+        parts[name] = cls(**kwargs)
+        defaults_used[cls.__name__] = sorted(k for k in defaults if k not in kwargs)
+    attributes = set(processor_cls.get_attributes())
+    parts = {k: v for k, v in parts.items() if k in attributes}
+    extra = {}
+    for name, param in inspect.signature(processor_cls.__init__).parameters.items():
+        if name in attributes or name in ("self", "chat_template", "args", "kwargs"):
+            continue
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        default = param.default if param.default is not param.empty else None
+        if name.endswith("_token") and isinstance(default, str):
+            token_id = (
+                config.get(f"{name}_id") or config.get(f"{name}_index")
+                if name == "image_token"
+                else None
+            )
+            if token_id is not None:
+                extra[name] = tokenizer.convert_ids_to_tokens(int(token_id))
+                values.origin[name] = "config.json.image_token_id"
+            elif tokenizer.convert_tokens_to_ids(default) in (
+                None,
+                tokenizer.unk_token_id,
+            ):
+                raise ValueError(
+                    f"{processor_cls.__name__} expects the token {default!r}, "
+                    "which the checkpoint's tokenizer does not know"
+                )
+            continue
+        value = values.fill(processor_cls, [name], {name: default}).get(name)
+        if value is not None:
+            extra[name] = value
+    processor = processor_cls(
+        **parts, tokenizer=tokenizer, chat_template=tokenizer.chat_template, **extra
+    )
+    provenance = {
+        "source": "built",
+        "class": processor_cls.__name__,
+        "from_model": dict(sorted(values.origin.items())),
+        "defaults": defaults_used,
+    }
+    logger.info(
+        "no preprocessor_config.json: %s built from the model (%s); %s",
+        processor_cls.__name__,
+        ", ".join(f"{k} from {v}" for k, v in sorted(values.origin.items())),
+        "; ".join(
+            f"{cls} defaults for {', '.join(keys)}"
+            for cls, keys in defaults_used.items()
+        ),
+    )
+    return processor, provenance

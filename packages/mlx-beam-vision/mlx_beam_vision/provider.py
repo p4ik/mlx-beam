@@ -42,5 +42,5 @@ def load(model, model_path, config: dict, tokenizer, *, trust_remote_code=False)
     if family is None:
         raise ValueError(f"no tower family for model type {kind!r}")
     tower = families.module_for(family).Tower(config, Path(model_path))
-    processor = load_processor(Path(model_path), trust_remote_code)
-    return VisionFrontend(processor, tower, family)
+    processor, info = load_processor(Path(model_path), config, trust_remote_code)
+    return VisionFrontend(processor, tower, family, processor_info=info)

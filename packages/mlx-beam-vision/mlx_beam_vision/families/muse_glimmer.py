@@ -20,7 +20,6 @@ from mlx_beam_vision._vendor.mlx_vlm.muse_glimmer.vision import VisionModel
 from mlx_beam_vision.families import (
     Encoded,
     Loaded,
-    cast,
     grid_count,
     grid_inputs,
     grid_select,
@@ -65,29 +64,28 @@ class Tower:
             bias=False,
         )
         self.loaded_from: list[str] = []
+        self.quantized = False
+        self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
 
     def load(self, model_path: Path) -> None:
-        loaded = Loaded(model_path, PARTS)
+        loaded = Loaded(model_path, PARTS, self.checkpoint)
         tower = {
             k: v
             for k, v in loaded.part("vision_tower").items()
             if "rotary_emb.inv_freq" not in k
         }
-        self.model.load_weights(cast(tower, self.dtype), strict=True)
-        self.vision_adapter.load_weights(
-            cast(loaded.part("vision_adapter"), self.dtype), strict=True
-        )
-        self.vision_projection.load_weights(
-            cast(loaded.part("vision_projection"), self.dtype), strict=True
-        )
+        loaded.fit(self.model, tower, self.dtype)
+        loaded.fit(self.vision_adapter, loaded.part("vision_adapter"), self.dtype)
+        loaded.fit(self.vision_projection, loaded.part("vision_projection"), self.dtype)
         mx.eval(
             self.model.parameters(),
             self.vision_adapter.parameters(),
             self.vision_projection.parameters(),
         )
         self.loaded_from = loaded.shards
+        self.quantized = loaded.quantized
 
     def encode(self, pixel_values: mx.array, grid_thw: mx.array) -> list[Encoded]:
         features = self.model(pixel_values.astype(self.dtype), grid_thw)
@@ -106,6 +104,7 @@ class Tower:
             "merge_size": self.config.merge_size,
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
+            "quantized": self.quantized,
         }
 
 
