@@ -31,20 +31,17 @@ Everything the engine does, with where each piece stands. Extras are packages or
 
 | Feature | What it does | State |
 |---|---|---|
-| *Server and APIs* | | |
 | **OpenAI API** | Chat completions, completions, Responses and models, with streaming. | built |
 | **Anthropic API** | Messages with thinking blocks and tool use, on the same token path. | built |
 | **Health and metrics** | `/health` shows each capability with evidence; `/metrics` serves counters. | built |
 | **Access control** | An API key is required off loopback; Host check and CORS allowlist. | built |
 | **CLI** | `beam serve` takes mlx-lm's flag names; `beam doctor` checks the machine. | built |
-| *Models* | | |
 | **Model classes** | Dense, MoE, hybrid-recurrent, sliding window, sinks, MLA, MRoPE. | built |
 | **Package layout** | Manifest with KV profile and draft-head quantization; plain MLX loads too. | built |
 | **Vision [Extra]** | Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite. | built |
 | **Audio [Extra]** | Audio input for models that take it, as its own package. | planned |
 | **Images [Extra]** | Image generation and editing through the Images API. | planned |
 | **GGUF [Extra]** | GGUF checkpoints load behind a guard. | planned |
-| *Engine* | | |
 | **Continuous batching** | Short requests are answered beside a long prefill, capped by a valve. | built |
 | **Prefix cache** | The KV of a shared prefix is reused, for recurrent and window layers too. | built |
 | **Prefix cache SSD tier** | A second tier on SSD lets entries outlive eviction from RAM and restarts. | planned |
@@ -52,7 +49,6 @@ Everything the engine does, with where each piece stands. Extras are packages or
 | **Multi-token prediction** | An own draft head predicts ahead, verified exactly, one request at a time. | built |
 | **Batched MTP** | Several requests speculate at once. | planned |
 | **Expert streaming** | Models larger than memory run with experts streamed from SSD. | planned |
-| *Request control* | | |
 | **Reasoning control** | Thinking on or off, a budget per request, effort levels, marker families. | built |
 | **Tool calling** | Parsers per model family and a repair ladder that reports every step. | built |
 | **Sampling controls** | Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults. | built |
