@@ -43,9 +43,10 @@ class FakeFrontend:
 
     name = "fake"
 
-    def __init__(self, tokenizer, deepstack=True):
+    def __init__(self, tokenizer, deepstack=True, block=False):
         self._tok = tokenizer
         self.deepstack = deepstack
+        self.block = block
         self.builds = 0
 
     def build(self, messages, images, template_kwargs):
@@ -75,6 +76,7 @@ class FakeFrontend:
                             feats,
                             image.digest,
                             extras if self.deepstack else {},
+                            block=self.block,
                         )
                     )
                     tokens += [PAD] * K
@@ -103,6 +105,12 @@ def reference(model, tokens, spans, n, positions=None):
     h = embed(ids)
     for s in spans:
         h[0, s.start : s.end, :] = s.features.astype(h.dtype)
+    if any(s.block for s in spans):
+        blocks = mx.full((1, len(tokens)), -1, dtype=mx.int32)
+        for s in spans:
+            if s.block:
+                blocks[0, s.start : s.end] = s.start
+        kwargs["block_ids"] = blocks
 
     def hook(i, x):
         for s in spans:
@@ -113,9 +121,11 @@ def reference(model, tokens, spans, n, positions=None):
                 )
         return x
 
-    out = lm_head(
-        inner(ids, cache=cache, input_embeddings=h, layer_hook=hook, **kwargs)
-    )
+    import inspect
+
+    if "layer_hook" in inspect.signature(inner.__call__).parameters:
+        kwargs["layer_hook"] = hook
+    out = lm_head(inner(ids, cache=cache, input_embeddings=h, **kwargs))
     result = []
     y = mx.argmax(out[0, -1])
     for _ in range(n):
@@ -184,6 +194,70 @@ def test_prefill_in_slices_and_beside_a_text_row():
         ]
     assert out_a == reference(model, built.tokens, built.spans, 6)
     assert out_b == solo_b
+
+
+def test_a_block_span_is_prefilled_whole_with_the_model_s_block_ids():
+    """Gemma 4's encoder-free models: an image's tokens attend to each
+    other both ways in the sliding layers. The frontend marks the span,
+    the prefill hands the trunk the block ids and never cuts the span
+    across chunks (a chunk reaching into it grows to its end) - the
+    direct forward's tokens either way, and other tokens than the model
+    gives without the mask. A trunk without `block_ids` refuses such a
+    span before the worker sees it."""
+    from mlx_beam._vendor.mlx_lm.models import gemma4_text
+    from mlx_beam.engine import InvalidRequest
+    from tests.test_engine import GEMMA4_SHARED, _tiny
+
+    model = _tiny(
+        gemma4_text,
+        **dict(GEMMA4_SHARED, hidden_size=H, use_bidirectional_attention="vision"),
+    )
+    front = FakeFrontend(StubTokenizer(), deepstack=False, block=True)
+    req, built = request(front, [png(4)], text="w3 w5 w7 w9 w11")
+    assert built.spans[0].block and built.spans[0].start > 4
+    want = reference(model, built.tokens, built.spans, 6)
+    calls = []
+    original = gemma4_text.Gemma4TextModel.__call__
+
+    def counting(self, inputs, *args, **kwargs):
+        calls.append((inputs.shape[1], kwargs.get("block_ids") is not None))
+        return original(self, inputs, *args, **kwargs)
+
+    with Engine(model, prefill_step_size=4, prefill_slice=4) as engine:
+        assert engine.image_capabilities["block_mask"]
+        gemma4_text.Gemma4TextModel.__call__ = counting
+        try:
+            assert [e.token for e in engine.submit(req)] == want
+        finally:
+            gemma4_text.Gemma4TextModel.__call__ = original
+    # Chunks of four, but the one reaching into the span at 7..10 grows to
+    # its end: 4, 6 (with block ids), then the rest.
+    prefill = [c for c in calls if c[0] > 1]
+    assert prefill[:2] == [(4, False), (6, True)]
+    with Engine(model) as engine:
+        assert [e.token for e in engine.submit(req)] == want
+    # The mask's effect, on the hidden states: the block's first token
+    # sees the block's last one (both ways), the text before it is as
+    # without the mask.
+    inner, _, embed = trunk(model)
+    span = built.spans[0]
+    ids = mx.array([built.tokens])
+    h = embed(ids)
+    h[0, span.start : span.end, :] = span.features.astype(h.dtype)
+    blocks = mx.full((1, len(built.tokens)), -1, dtype=mx.int32)
+    blocks[0, span.start : span.end] = span.start
+    masked = inner(
+        ids,
+        cache=make_request_cache(model, KVPolicy()),
+        input_embeddings=h,
+        block_ids=blocks,
+    )
+    causal = inner(ids, cache=make_request_cache(model, KVPolicy()), input_embeddings=h)
+    assert not mx.allclose(masked[0, span.start], causal[0, span.start], atol=1e-5)
+    assert mx.allclose(masked[0, span.start - 1], causal[0, span.start - 1], atol=1e-5)
+    with Engine(tiny_qwen35()) as engine:
+        with pytest.raises(InvalidRequest, match="block ids"):
+            engine.submit(req)
 
 
 def test_the_store_keys_on_the_image_digest():
@@ -349,6 +423,7 @@ def test_a_frontend_the_text_model_cannot_serve_is_refused_at_load():
             "input_embeddings": True,
             "layer_hook": False,
             "position_ids": False,
+            "block_mask": False,
         }
         span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32))})
         with pytest.raises(InvalidRequest, match="layer hook"):
@@ -392,6 +467,7 @@ def test_qwen3_vl_wrapper_takes_deepstack_extras():
             "input_embeddings": True,
             "layer_hook": True,
             "position_ids": True,
+            "block_mask": False,
         }
         span = ImageSpan(1, 3, mx.ones((2, 32)), "a" * 64, {1: mx.ones((2, 32)) * 0.1})
         out = list(
@@ -551,6 +627,7 @@ def test_a_granite_vision_checkpoint_loads_through_the_model_loader(
         "input_embeddings": True,
         "layer_hook": True,
         "position_ids": False,
+        "block_mask": False,
     }
     x = mx.array([[3, 7, 11, 13]])
     assert mx.array_equal(loaded(x), inner(x))
@@ -800,20 +877,45 @@ def test_a_provider_stating_its_needs_is_refused_before_its_tower_loads():
         modalities._registered.remove(Provider)
 
 
-def test_unequal_prefill_rows_with_spans_are_a_loud_error():
-    """The engine cuts every prefill call to the shortest segment; a call
-    with rows of unequal length and an image span in them is a bug, and
-    raises instead of dropping the images."""
+def test_unequal_prefill_rows_with_spans_are_right_padded():
+    """The engine cuts every prefill call to the shortest row, except over
+    a block span; then a shorter row is right-padded for the call, as
+    upstream pads text rows, and its cache trimmed again. The padded
+    row's keys equal its own solo prefill's, the image row's too."""
     from mlx_beam.engine.priming import PrimingPromptBatch
 
     model = tiny_qwen35()
     front = FakeFrontend(StubTokenizer())
     _, built = request(front, [png(7)])
+    short = [3, 7, 11, 13, 5]
     cls = PrimingPromptBatch.bound(lambda uid: built.spans if uid == 1 else ())
-    caches = [make_request_cache(model, KVPolicy()) for _ in range(2)]
-    batch = cls(model, [1, 2], caches, prefill_step_size=64)
-    with pytest.raises(ValueError, match="unequal length"):
-        batch.prompt([built.tokens, built.tokens[:-2]])
+
+    def state_after(uids, rows):
+        caches = [make_request_cache(model, KVPolicy()) for _ in uids]
+        batch = cls(model, uids, caches, prefill_step_size=64)
+        batch.prompt(rows)
+        out = [[] for _ in rows]
+        for c in batch.prompt_cache:
+            keys = getattr(c, "keys", None)
+            if keys is not None:
+                # A right-padded row ends up left-padded after finalize:
+                # its real keys are the last len(row) positions either way.
+                n = keys.shape[2]
+                for i, r in enumerate(rows):
+                    out[i].append(keys[i, :, n - len(r) :, :])
+            else:  # the hybrid's recurrent state, one array per row
+                for i in range(len(rows)):
+                    out[i].extend(a[i] for a in c.cache if a is not None)
+        return out
+
+    both = state_after([1, 2], [built.tokens, short])
+    solo_image = state_after([1], [built.tokens])[0]
+    solo_text = state_after([2], [short])[0]
+    assert len(both[0]) == len(solo_image) > 1
+    for a, b in zip(both[0], solo_image, strict=True):
+        assert mx.allclose(a, b, atol=1e-5)
+    for a, b in zip(both[1], solo_text, strict=True):
+        assert mx.allclose(a, b, atol=1e-5)
 
 
 @pytest.mark.parametrize("stream", [False, True])

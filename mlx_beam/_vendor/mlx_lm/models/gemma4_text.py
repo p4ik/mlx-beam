@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    scaled_dot_product_attention,
+    with_image_blocks,
+)
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -46,6 +51,9 @@ class ModelArgs(BaseModelArgs):
     moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
     tie_word_embeddings: bool = True
+    # "vision" on the larger Gemma 4 models: an image's tokens attend both
+    # ways within their block in the sliding layers (with_image_blocks).
+    use_bidirectional_attention: Optional[str] = None
 
     def __post_init__(self):
         if self.rope_parameters is None:
@@ -502,7 +510,11 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
-    def _make_masks(self, h, cache):
+    def _make_masks(self, h, cache, block_ids=None):
+        blocks = (
+            block_ids is not None
+            and self.config.use_bidirectional_attention == "vision"
+        )
         mask = {}
         masks = []
         for l, c in zip(self.layers, cache):
@@ -511,8 +523,15 @@ class Gemma4TextModel(nn.Module):
                     mask["full_attention"] = create_attention_mask(h, c)
                 elif l.layer_type == "sliding_attention":
                     mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                        h, c, window_size=self.window_size, return_array=blocks
                     )
+                    if blocks:
+                        mask["sliding_attention"] = with_image_blocks(
+                            mask["sliding_attention"],
+                            h.shape[1],
+                            self.window_size,
+                            block_ids,
+                        )
             masks.append(mask[l.layer_type])
         return masks
 
@@ -522,6 +541,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        block_ids: Optional[mx.array] = None,
     ):
         # Make the initial hidden state
         if input_embeddings is None:
@@ -550,7 +570,7 @@ class Gemma4TextModel(nn.Module):
 
         # Apply each layer. We save all intermediate kvs and offset and grab
         # the previous one for the shared kv layers.
-        masks = self._make_masks(h, cache)
+        masks = self._make_masks(h, cache, block_ids)
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
@@ -594,12 +614,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        block_ids: Optional[mx.array] = None,
     ):
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            block_ids=block_ids,
         )
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)

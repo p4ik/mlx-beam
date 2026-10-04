@@ -26,6 +26,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   checks that every vendored tree is a listed part with its license file.
 
 ### Fixed
+- Gemma 4's encoder-free models (the 12B and up) came up without vision
+  since 0.1.0a5: their image tokens attend to each other both ways in the
+  text model's sliding layers, and the trunk applied no such mask, so
+  the vision package refused them with that reason. The trunk now takes
+  the block ids of a prefill call and masks the sliding layers as the
+  reference does (full layers stay causal); the prefill keeps an image's
+  span in one call, growing past the slice when it must, and right-pads
+  the other rows for that call. The family's patch embedder replaces the
+  tower; `/health.vision.family` says `gemma4_unified`.
 - An official Mistral checkpoint (`tekken.json`, no chat template) could
   not be served since 0.1.0a1: the engine rendered through Jinja only,
   and `--use-default-chat-template` would have given ChatML, not

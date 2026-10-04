@@ -47,6 +47,8 @@ modified = [
   "models/qwen3_moe.py",
   "models/qwen3_vl.py",
   "models/qwen3_vl_moe.py",
+  "models/gemma4_text.py",
+  "models/gemma4.py",
 ]
 
 [parts.optiq]

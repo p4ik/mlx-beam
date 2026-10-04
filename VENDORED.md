@@ -187,6 +187,27 @@ drops the tower under either layout (`vision_tower.*` and
 path against a direct forward per text model); the towers themselves in
 `packages/mlx-beam-vision/tests`.
 
+`image blocks` - `models/base.py`, `with_image_blocks`; `models/gemma4_text.py`,
+`ModelArgs.use_bidirectional_attention`, `Gemma4TextModel._make_masks` and
+`__call__`, `Model.__call__`; `models/gemma4.py`, `Model.__call__`: one
+keyword argument, `block_ids` (B, N), the block of every query position
+and -1 for text. On a model whose text config says
+`use_bidirectional_attention: "vision"` (Gemma 4 12B and up, the
+encoder-free ones) a sliding layer's mask becomes transformers'
+AND(window, OR(causal, same block)) - an image's tokens attend to each
+other both ways; the full layers stay causal, as upstream's
+`create_masks_for_vision_model` has it. A key before the chunk belongs to
+no block: the engine prefills a block whole (`PrimingPromptBatch`,
+`width_for_blocks`). Tests: `tests/test_vision_core.py`
+(`test_a_block_span_is_prefilled_whole_with_the_model_s_block_ids`).
+
+`block width` - `generate.py`, `BatchGenerator._next`: after the width of
+a prefill call is settled (shortest segment, step, slice, valve), the
+prompt batch may widen it (`width_for_blocks`) so that no row's block
+span is cut; rows with less left are right-padded for that call, as
+upstream pads every call. Tests: `tests/test_vision_core.py`
+(`test_unequal_prefill_rows_with_spans_are_right_padded`).
+
 `emptied batch` - `generate.py`, `GenerationBatch.filter`: an emptied
 batch drops its current tokens and logprobs; upstream keeps them, and
 `extend()` concatenates every later batch onto them (a verify cycle takes
