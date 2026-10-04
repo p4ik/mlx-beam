@@ -66,7 +66,7 @@ Everything the engine does, with where each piece stands. Present tense only for
 | **Sampling controls** | Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults. | built |
 | **Structured [Extra]** | JSON schema and grammar-constrained decoding. | planned |
 
-The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
+The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with. Which model families the engine handles with what - architecture, thinking, tool calls, vision, draft head - is on the [models page](https://p4ik.github.io/mlx-beam/models/).
 
 ## Why it exists
 
