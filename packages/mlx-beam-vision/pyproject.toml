@@ -33,6 +33,9 @@ dependencies = [
   "torchvision",
   "pillow>=10",
   "numpy",
+  # The image chunks of a tekken checkpoint (Pixtral) are prepared by
+  # mistral-common itself; the core carries the text part.
+  "mistral-common[image]>=1.8.4",
 ]
 
 [project.optional-dependencies]

@@ -10,7 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from mlx_beam_vision import provider
+from mlx_beam_vision import frontend, provider
 from mlx_beam_vision.families import qwen3_vl
 from mlx_beam_vision.frontend import VisionFrontend
 
@@ -491,6 +491,48 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
         1
     ].features.shape == (1, 32)
     assert provider.family_for(config) == "mistral3"
+
+    # The same tower behind mistral-common: the backend renders the ids
+    # and the pixel values itself, the images reach it as data URLs, and
+    # images of two sizes come back one array each - the frontend pads
+    # them to one batch with the real sizes beside, as the tower takes
+    # them. No generation prompt in Mistral's format: the assistant
+    # starts where the prompt ends.
+    class MistralCommonBackend:
+        chat_template = None
+
+        def __init__(self):
+            self.seen = []
+
+        def apply_chat_template(self, messages, tokenize=True, return_dict=True, **kw):
+            self.seen.append(messages)
+            pixels = np.random.RandomState(0).randn(2, 3, 64, 64).astype(np.float32)
+            return {
+                "input_ids": [2, 6, 3, 62, 62, 63, 60, 62, 60, 7],
+                "pixel_values": [pixels[0], pixels[1][:, :32, :32]],
+                "image_sizes": [[64, 32], [32, 32]],
+            }
+
+    class Wrapper:  # mlx-lm's wrapper around the backend, as the engine hands it in
+        def __init__(self, inner):
+            self._tokenizer = inner
+
+    backend = MistralCommonBackend()
+    assert frontend.mistral_common_backend(Wrapper(backend)) is backend
+    assert frontend.mistral_common_backend(Wrapper(Proc())) is None
+    native = VisionFrontend(None, t, "mistral3", renderer=backend)
+    built_native = native.build(messages, [png(5), png(6)], {})
+    assert [(s.start, s.end) for s in built_native.spans] == [(3, 5), (7, 8)]
+    assert built_native.assistant_start == len(built_native.tokens) == 10
+    parts = backend.seen[0][0]["content"]
+    assert [p["type"] for p in parts] == ["text", "image_url", "image_url"]
+    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    for span, want in zip(built_native.spans, built.spans, strict=True):
+        assert mx.allclose(span.features, want.features, atol=1e-5)
+    assert native.describe()["processor"] == {
+        "source": "mistral-common",
+        "class": "MistralCommonBackend",
+    }
 
 
 class FakeTokenizer:

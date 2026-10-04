@@ -6,6 +6,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Added
+- Checkpoints that ship `tekken.json` instead of a chat template (every
+  official Mistral release) render through mistral-common: system
+  prompt, tools, tool calls and results, and the images of a Pixtral
+  tower as the model was trained with. The tool-call parser comes from
+  the vocabulary; `/health.template.source` says `mistral-common`. A
+  checkpoint that carries a template beside tekken.json renders through
+  mistral-common too, the template left aside. mistral-common is a
+  dependency of the core, its image part one of the vision package.
+
 ### Changed
 - The site and the README list the extras (vision, audio, convert,
   structured, GGUF, images) as a feature group of their own, with the
@@ -16,6 +26,10 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   checks that every vendored tree is a listed part with its license file.
 
 ### Fixed
+- An official Mistral checkpoint (`tekken.json`, no chat template) could
+  not be served since 0.1.0a1: the engine rendered through Jinja only,
+  and `--use-default-chat-template` would have given ChatML, not
+  Mistral's format. See mistral-common under Added.
 - The vision package refused any checkpoint whose tower, projector or
   adapter weights are quantized (every 8-bit conversion of Granite Vision
   and Muse Glimmer): the server came up without vision and image requests

@@ -35,14 +35,16 @@ def probe_developer(tokenizer) -> str:
     render = getattr(tokenizer, "apply_chat_template", None)
     if render is None:
         return "as system"
+    # Compared as ids: a renderer without template text (mistral-common)
+    # only renders ids, and warns when asked for text.
     try:
-        as_developer = render(_PROBE, add_generation_prompt=True, tokenize=False)
+        as_developer = render(_PROBE, add_generation_prompt=True, tokenize=True)
     except Exception:  # noqa: BLE001 - the template's refusal is the verdict
         return "as system"
     as_system = render(
         [{"role": "system", "content": "probe"}, _PROBE[1]],
         add_generation_prompt=True,
-        tokenize=False,
+        tokenize=True,
     )
     if as_developer == as_system:
         return "native"

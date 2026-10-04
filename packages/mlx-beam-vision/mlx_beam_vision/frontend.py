@@ -6,6 +6,7 @@ engine's prefill embeds. Nothing here touches the language model."""
 
 from __future__ import annotations
 
+import base64
 import io
 import logging
 import threading
@@ -20,6 +21,20 @@ from mlx_beam.engine.request import ImageSpan
 from mlx_beam.modalities import Built, Image
 
 logger = logging.getLogger("beam.vision")
+
+MISTRAL_COMMON = "mistral-common"
+
+
+def mistral_common_backend(tokenizer):
+    """The MistralCommonBackend behind the engine's tokenizer, or None: it
+    renders ids and pixel values itself, so no processor is loaded for it.
+    The engine wraps the backend (mlx-lm's TokenizerWrapper); the wrapper
+    forces `return_dict=False`, so the backend is taken out of it."""
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    if type(inner).__name__ == "MistralCommonBackend":
+        return inner
+    return None
+
 
 # The largest image decoded, in pixels. The tower runs in the request's
 # thread, outside the engine's prefill valve, and PIL's own guard starts
@@ -98,14 +113,20 @@ class VisionFrontend:
         family: str,
         cache_bytes: int = 512 << 20,
         processor_info: dict | None = None,
+        renderer=None,
     ):
         self.processor = processor
         self.tower = tower
         self.family = family
-        self.processor_info = processor_info or {
-            "source": "checkpoint",
-            "class": type(processor).__name__,
-        }
+        # A tekken checkpoint has no processor: mistral-common (transformers'
+        # MistralCommonBackend, handed in as `renderer`) turns the messages
+        # with their images into ids and pixel values in one call.
+        self.renderer = renderer
+        self.processor_info = processor_info or (
+            {"source": MISTRAL_COMMON, "class": type(renderer).__name__}
+            if renderer is not None
+            else {"source": "checkpoint", "class": type(processor).__name__}
+        )
         self.cache = FeatureCache(cache_bytes)
         self.chat_template: str | None = None
         self.images_encoded = 0
@@ -134,19 +155,24 @@ class VisionFrontend:
 
     def build(self, messages, images: Sequence[Image], template_kwargs: dict) -> Built:
         kwargs = dict(template_kwargs)
-        if self.chat_template is not None:
-            kwargs["chat_template"] = self.chat_template
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, **kwargs
-        )
-        pil = open_images(images)
-        processed = self.processor(
-            text=[text],
-            images=pil or None,
-            return_tensors="np",
-            **self._text_kwargs(text),
-        )
-        ids = [int(t) for t in processed["input_ids"][0]]
+        if self.renderer is not None:
+            ids, processed = self._render_mistral_common(messages, images, kwargs)
+            assistant_start = len(ids)
+        else:
+            if self.chat_template is not None:
+                kwargs["chat_template"] = self.chat_template
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, **kwargs
+            )
+            pil = open_images(images)
+            processed = self.processor(
+                text=[text],
+                images=pil or None,
+                return_tensors="np",
+                **self._text_kwargs(text),
+            )
+            ids = [int(t) for t in processed["input_ids"][0]]
+            assistant_start = None
         encoded = self._encode(images, processed)
         counts = [int(enc.features.shape[0]) for enc in encoded]
         family = families.module_for(self.family)
@@ -181,10 +207,71 @@ class VisionFrontend:
         return Built(
             ids,
             spans,
-            self._assistant_start(messages, kwargs, text, ids),
+            (
+                assistant_start
+                if assistant_start is not None
+                else self._assistant_start(messages, kwargs, text, ids)
+            ),
             positions=positions,
             rope_delta=delta,
         )
+
+    def _render_mistral_common(self, messages, images: Sequence[Image], kwargs):
+        """The prompt's ids and pixel values from mistral-common: the image
+        placeholders the engine left in the messages become the images
+        themselves (as data URLs, the form the backend takes), and the
+        backend expands them into `[IMG]` runs and prepares the pixels the
+        way the model was trained with. There is no generation prompt in
+        Mistral's format: the assistant's turn starts right after the last
+        marker, so the prompt ends where the assistant begins. Images of
+        several sizes come back one array each; the tower takes them
+        padded to one size with the real sizes beside."""
+        import numpy as np
+
+        open_images(images)  # the size guard and readability check, as for a processor
+        queue = list(images)
+        with_images = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image":
+                        img = queue.pop(0)
+                        data = base64.b64encode(img.data).decode("ascii")
+                        parts.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{img.media_type};base64,{data}"
+                                },
+                            }
+                        )
+                    else:
+                        parts.append(part)
+                m = {**m, "content": parts}
+            with_images.append(m)
+        if queue:
+            raise ValueError("more images than image parts in the messages")
+        out = self.renderer.apply_chat_template(
+            with_images, tokenize=True, return_dict=True, **kwargs
+        )
+        ids = [int(t) for t in out["input_ids"]]
+        pixels = [
+            np.asarray(p, dtype=np.float32) for p in out.get("pixel_values") or []
+        ]
+        if not pixels:
+            return ids, {
+                "pixel_values": np.zeros((0, 3, 0, 0), np.float32),
+                "image_sizes": [],
+            }
+        height = max(p.shape[1] for p in pixels)
+        width = max(p.shape[2] for p in pixels)
+        padded = np.zeros((len(pixels), pixels[0].shape[0], height, width), np.float32)
+        for i, p in enumerate(pixels):
+            padded[i, :, : p.shape[1], : p.shape[2]] = p
+        sizes = [[int(h), int(w)] for h, w in out["image_sizes"]]
+        return ids, {"pixel_values": padded, "image_sizes": sizes}
 
     def _assistant_start(self, messages, kwargs: dict, text, ids: list[int]) -> int:
         """Where the generation prompt begins in `ids`: the template

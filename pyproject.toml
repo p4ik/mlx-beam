@@ -32,6 +32,10 @@ dependencies = [
   "regex",
   "sentencepiece",
   "protobuf",
+  # Renders the prompt of a checkpoint that ships tekken.json instead of a
+  # chat template (every official Mistral release), as transformers'
+  # MistralCommonBackend; the vision package adds its [image] part.
+  "mistral-common>=1.8.4",
 ]
 
 [project.optional-dependencies]
