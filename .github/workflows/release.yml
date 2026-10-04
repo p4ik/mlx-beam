@@ -172,7 +172,11 @@ jobs:
             *) pre=;;
           esac
           # The tag's own section of the changelog, up to the next heading.
-          awk -v v="$version" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > notes.md
+          # GitHub renders every line break in release notes, so the changelog's
+          # wrapped entries are joined into one line each (an indented line
+          # continues the entry above it).
+          awk -v v="$version" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md \
+            | perl -0pe 's/\n {2,}/ /g' > notes.md
           gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" --notes-file notes.md $pre
       - name: Rolling dev release for pushes to main
@@ -195,7 +199,8 @@ jobs:
             echo
             echo "Since the last tag ([Unreleased] in CHANGELOG.md):"
             echo
-            awk 'index($0, "## [Unreleased]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md
+            awk 'index($0, "## [Unreleased]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md \
+              | perl -0pe 's/\n {2,}/ /g'
           } > notes.md
           gh release delete dev --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
           gh release create dev dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \

@@ -6,6 +6,16 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a9] - 2026-10-04
+
+### Added
+- A models page on the site: one row per model family with what the
+  engine does for it (architecture, thinking, tool calls, vision, draft
+  head), each mark explained on hover. The landing page and the README
+  list every feature with its state; the configuration page shows the
+  lead of each description with the full text on hover, one parameter per
+  row.
+
 ### Fixed
 - A model that thinks but cannot be told not to - its chat template has
   no switch and its answer cannot be opened in the prompt either (Muse)
