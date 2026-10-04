@@ -12,3 +12,6 @@ docs/site/node_modules/
 docs/site/dist/
 docs/site/.astro/
 .DS_Store
+
+# uv sync writes it in every clone; the project pins through pyproject, not a lock
+uv.lock
