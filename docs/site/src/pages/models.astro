@@ -46,10 +46,10 @@ const families = [
     name: "Mistral Small 3.x",
     example: "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
     cells: [
-      ["built", "dense attention", "Plain attention, dense."],
+      ["built", "dense attention", "Plain attention, dense. The official checkpoints ship tekken.json instead of a chat template and render through mistral-common."],
       ["na", "", ""],
-      ["built", "mistral", "mistral parser; several calls without an end marker are cut at the header."],
-      ["built", "Pixtral", "Pixtral tower; the HF layout and mlx-vlm's conversions both load."],
+      ["built", "mistral", "mistral parser; several calls without an end marker are cut at the header. With mistral-common the tools go into the prompt as the model was trained with."],
+      ["built", "Pixtral", "Pixtral tower; the HF layout and mlx-vlm's conversions both load. With mistral-common the images are prepared by the tokenizer itself."],
       ["na", "", ""],
     ],
   },

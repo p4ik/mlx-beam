@@ -569,8 +569,8 @@ def probe_port(host: str, port: int) -> None:
 def serve(args) -> int:
     import logging
 
-    from mlx_beam import modalities
-    from mlx_beam._vendor.mlx_lm.utils import hf_repo_to_path, load
+    from mlx_beam import modalities, renderer
+    from mlx_beam._vendor.mlx_lm.utils import _download, hf_repo_to_path, load
     from mlx_beam.api.access import Access
     from mlx_beam.api.defaults import RequestDefaults
     from mlx_beam.engine import Engine, EngineDead
@@ -609,11 +609,17 @@ def serve(args) -> int:
                 "in the Host header; name the machine with --allowed-hosts"
             )
     log.info("loading %s", args.model)
+    # The files come first (a download when the model is a repo id): the
+    # renderer is a tokenizer argument, so it is decided before the load.
+    rendering = renderer.choose(_download(args.model), template)
+    if rendering.note:
+        log.info("template: %s", rendering.note)
     # Handed to the tokenizer at load: the tool markers are inferred from
     # the template that will actually render (the think markers come from
     # the vocabulary). Custom tokenizer code needs the same consent the
     # model's does.
     tokenizer_config = {"chat_template": template} if template else {}
+    tokenizer_config.update(rendering.tokenizer_kwargs)
     if args.trust_remote_code:
         tokenizer_config["trust_remote_code"] = True
     model, tokenizer = load(
@@ -622,6 +628,13 @@ def serve(args) -> int:
         trust_remote_code=args.trust_remote_code,
     )
     template_source = "flag" if template else "model"
+    if rendering.name == renderer.MISTRAL_COMMON:
+        template_source = renderer.MISTRAL_COMMON
+        parser = renderer.install_tool_parser(tokenizer)
+        log.info(
+            "template: mistral-common renders the prompt; tool calls %s",
+            f"parsed by {parser}" if parser else "not in the vocabulary",
+        )
     if args.use_default_chat_template and not tokenizer.has_chat_template:
         tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
         tokenizer.has_chat_template = True
@@ -679,7 +692,7 @@ def serve(args) -> int:
         tokenizer,
         trust_remote_code=args.trust_remote_code,
     )
-    if frontend is not None and template_source != "model":
+    if frontend is not None and template_source in ("flag", "default"):
         # The flag's template renders image requests too, not only text.
         frontend.chat_template = tokenizer.chat_template
     served = Served(

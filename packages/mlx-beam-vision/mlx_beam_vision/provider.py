@@ -10,7 +10,11 @@ from pathlib import Path
 
 from mlx_beam_vision import families
 from mlx_beam_vision.families import FAMILIES, UNSERVED
-from mlx_beam_vision.frontend import VisionFrontend, load_processor
+from mlx_beam_vision.frontend import (
+    VisionFrontend,
+    load_processor,
+    mistral_common_backend,
+)
 
 logger = logging.getLogger("beam.vision")
 
@@ -42,5 +46,8 @@ def load(model, model_path, config: dict, tokenizer, *, trust_remote_code=False)
     if family is None:
         raise ValueError(f"no tower family for model type {kind!r}")
     tower = families.module_for(family).Tower(config, Path(model_path))
+    backend = mistral_common_backend(tokenizer)
+    if backend is not None:
+        return VisionFrontend(None, tower, family, renderer=backend)
     processor, info = load_processor(Path(model_path), config, trust_remote_code)
     return VisionFrontend(processor, tower, family, processor_info=info)
