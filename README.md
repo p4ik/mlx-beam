@@ -2,7 +2,7 @@
 
 **B.E.A.M. — Batched Engine for Apple Metal.** Light and modular inference engine, built on [MLX](https://github.com/ml-explore/mlx).
 
-> **Work in progress.** See the status table below and the [changelog](https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md).
+> **Work in progress.** See the feature table below and the [changelog](https://github.com/p4ik/mlx-beam/blob/main/CHANGELOG.md).
 
 ## Install
 
@@ -23,19 +23,11 @@ beam serve --model p4ik/Qwen3.8-27B-MLX-OptiQ-5bit --port 8000 \
   --kv-bits 8
 ```
 
-That is an OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`), Anthropic's Messages API next to it (`/v1/messages`, `/v1/messages/count_tokens`; point `ANTHROPIC_BASE_URL` at it), plus `/health` and `/metrics` (Prometheus), the first of which reports what was actually built: the KV layout per layer, the batching and cache settings, the Metal allocator's `memory` counters (`active`, `peak`, `cache` — RSS does not see these), and every request default with where it came from (flag, the model's `generation_config.json`, or mlx-lm's own). `POST /health/reset-peak` starts a fresh peak window for a measurement.
-
-Flags follow mlx-lm's names where mlx-lm has one (`--temp`, `--top-p`, `--kv-bits`, `--prompt-cache-size`, `--chat-template`, …). Token limits say what they count: `--max-context` (prompt plus generated, a hard cap), `--max-prompt-tokens` (prompt, a hard cap), `--max-completion-tokens` (generated, the default a request may override), `--max-reasoning-tokens` (the think block; closed by force at the budget) and `--min-response-tokens` (what the answer keeps after the block). `beam serve --help` lists them all with their units, and the [configuration page](https://p4ik.github.io/mlx-beam/configuration/) has the same tables next to the request fields and what a checkpoint may bring along.
-
-`--draft-model bundled` turns on speculative decoding with the draft head the checkpoint ships (Qwen3.5/3.6/3.8 packs carry one): a request decoding alone gets up to `--max-draft-tokens` + 1 tokens per model call (the drafts and the token the model samples after them; a regulator picks the depth per cycle from measured acceptance and cost, and parks the head when it loses), each one the model's own - its argmax over the verify forward for a greedy request, its own draw for a sampled one (the draw is keyed by position, so a seeded request gives the same tokens with and without the draft head). Logit bias, penalties and the thinking budget apply per verify position as in plain decoding. The head is primed over the prompt in the prefill and keeps its history across turns through the prefix cache. The output equals plain decoding up to kernel rounding at another width (bit-identical in bf16 in every measured case); `--exact-verify` closes that gap. Several requests at once decode plainly; `/health.speculative` shows cycles, drafted and accepted tokens.
-
-Access follows the bind. On a loopback address (`127.0.0.1`, `::1`, `localhost` - the default) the server asks for nothing. Any other `--host` refuses to start without `--api-key <key>` (sent as `Authorization: Bearer <key>` or `x-api-key`; `/health` and `/metrics` sit behind it too) or `--skip-api-key`, an open server on purpose, said so at start. The `Host` header must name the machine as the server knows it - `localhost`, the bind address, or what `--allowed-hosts` adds - or the request gets 403, which is what keeps a page in a browser from reaching the server through a rebound name. CORS admits no origin until `--allowed-origins` names it. `/health.api.auth` says which mode is on.
-
-Requests may use the names other servers taught clients: `max_tokens`, `thinking_token_budget`, `reasoning: {effort, max_tokens}`, `enable_thinking`, `reasoning_effort`. The model's thinking is returned in `reasoning` (`--reasoning-field` switches to `reasoning_content`, both, or none), counted in `usage.completion_tokens_details.reasoning_tokens`, and flagged there when a limit cut it (`thinking_truncated`, `response_truncated`). A tool call the model wrote badly goes through a repair ladder - mended JSON, values coerced to the declared schema - with every step reported in the call's `repair_actions`, and comes back as text when no step makes it valid.
+An OpenAI-compatible server (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) with Anthropic's Messages API beside it (`/v1/messages`; point `ANTHROPIC_BASE_URL` at it), `/health` reporting what was actually built and `/metrics` as plain-text counters. Flags follow mlx-lm's names where mlx-lm has one; `beam serve --help` lists them, and the [configuration page](https://p4ik.github.io/mlx-beam/configuration/) has the same tables next to the request fields and what a checkpoint brings along. Off loopback the server wants `--api-key`. `--draft-model bundled` turns on speculative decoding with the draft head a checkpoint ships.
 
 ## Features
 
-Everything the engine does, with where each piece stands. Present tense only for what is built; planned things say so. Extras are packages or optional installs beside the core.
+Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.
 
 | Feature | What it does | State |
 |---|---|---|
