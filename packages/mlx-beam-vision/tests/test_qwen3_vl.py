@@ -493,6 +493,52 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
     assert provider.family_for(config) == "mistral3"
 
 
+def test_a_quantized_tower_loads_with_the_bits_its_tensors_imply(tmp_path):
+    """An 8-bit conversion packs the tower's linears too (weight as uint32
+    words, scales and biases beside it) and may leave some of them in
+    floating point; the loader swaps exactly the packed ones for their
+    quantized form, with bits and group size read off the tensors, and
+    the features match the quantized source. The health says so."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    mx.random.seed(2)
+    source = tower()
+    nn.quantize(
+        source.model,
+        group_size=32,
+        bits=8,
+        # A mixed conversion: the last merger linear stays floating point.
+        class_predicate=lambda p, m: isinstance(m, nn.Linear)
+        and p != "merger.linear_fc2",
+    )
+    mx.eval(source.model.parameters())
+    weights = dict(tree_flatten(source.model.parameters()))
+    assert "blocks.0.attn.qkv.scales" in weights
+    assert "merger.linear_fc2.scales" not in weights
+    stored = {
+        f"model.visual.{k}": (
+            v.transpose(0, 4, 1, 2, 3) if k == "patch_embed.proj.weight" else v
+        )
+        for k, v in weights.items()
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+    config = {**TOWER_CONFIG, "quantization": {"group_size": 32, "bits": 8}}
+    t = qwen3_vl.Tower(config, tmp_path, dtype=mx.float32)
+    assert t.quantized and t.describe()["quantized"]
+    qkv = t.model.blocks[0].attn.qkv
+    assert isinstance(qkv, nn.QuantizedLinear) and (qkv.bits, qkv.group_size) == (8, 32)
+    assert isinstance(t.model.merger.linear_fc2, nn.Linear)
+    assert not isinstance(t.model.merger.linear_fc2, nn.QuantizedLinear)
+    pv, grid = mx.array(pixels((1, 4, 4))), mx.array([(1, 4, 4)])
+    want = source.encode(pv, grid)[0].features
+    assert mx.allclose(t.encode(pv, grid)[0].features, want, atol=1e-5)
+    # The same checkpoint in floating point is close, not equal: the test
+    # would pass trivially if the packed tensors were silently cast.
+    plain = tower()
+    assert not mx.allclose(plain.encode(pv, grid)[0].features, want, atol=1e-5)
+
+
 def test_mistral3_loads_the_hf_layout_and_mlx_vlms(tmp_path):
     """HF keeps Pixtral's blocks right under `vision_tower` (and everything
     under `model.`); mlx-vlm's conversions add a `vision_model` level. Both

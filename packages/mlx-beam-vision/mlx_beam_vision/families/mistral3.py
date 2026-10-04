@@ -17,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.config import VisionConfig
 from mlx_beam_vision._vendor.mlx_vlm.pixtral.vision import VisionModel
-from mlx_beam_vision.families import Encoded, Loaded, cast
+from mlx_beam_vision.families import Encoded, Loaded
 
 NAME = "mistral3"
 # `vision_encoder` is the older Pixtral layout.
@@ -112,20 +112,21 @@ class Tower:
             bool(config.get("multimodal_projector_bias", False)),
         )
         self.loaded_from: list[str] = []
+        self.quantized = False
+        self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
 
     def load(self, model_path: Path) -> None:
-        loaded = Loaded(model_path, PARTS)
+        loaded = Loaded(model_path, PARTS, self.checkpoint)
         weights = self.model.sanitize(
             tower_keys(loaded.part("vision_tower", "vision_encoder"))
         )
-        self.model.load_weights(cast(weights, self.dtype), strict=True)
-        self.projector.load_weights(
-            cast(loaded.part("multi_modal_projector"), self.dtype), strict=True
-        )
+        loaded.fit(self.model, weights, self.dtype)
+        loaded.fit(self.projector, loaded.part("multi_modal_projector"), self.dtype)
         mx.eval(self.model.parameters(), self.projector.parameters())
         self.loaded_from = loaded.shards
+        self.quantized = loaded.quantized
 
     def encode(
         self, pixel_values: mx.array, image_sizes: list[tuple[int, int]]
@@ -157,6 +158,7 @@ class Tower:
             "spatial_merge_size": self.merge,
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
+            "quantized": self.quantized,
         }
 
 

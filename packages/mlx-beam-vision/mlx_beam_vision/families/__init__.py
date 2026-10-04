@@ -4,8 +4,8 @@ pixel inputs (`pixel_inputs`) become the features of one image -
 projected to the text model's width, with the per-layer extras a family
 adds ahead of certain text layers (DeepStack) when it has them. What the
 five share - reading the tower's shards, the prefix a layout uses, the
-refusal of quantized towers, the cast, the split of a stacked output per
-image - lives here."""
+fit of a module to its tensors (quantized or not), the cast, the split of
+a stacked output per image - lives here."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 from types import ModuleType
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_beam_vision.weights import load_prefixed
 
 
@@ -77,9 +78,13 @@ mlx-vlm's conversions do not."""
 class Loaded:
     """The tensors of the named parts (`vision_tower`, `embed_vision`, ...)
     under either root, the root stripped, and the shards they came from
-    (`/health.vision.tower.loaded_from`). A quantized tower is refused."""
+    (`/health.vision.tower.loaded_from`). `quantized` says whether any of
+    them come packed (a `.scales` beside the weight); `fit` loads them
+    either way."""
 
-    def __init__(self, model_path: Path, parts: Iterable[str]):
+    def __init__(
+        self, model_path: Path, parts: Iterable[str], config: dict | None = None
+    ):
         parts = tuple(parts)
         prefixes = tuple(f"{root}{part}" for root in ROOTS for part in parts)
         raw, self.shards = load_prefixed(model_path, prefixes)
@@ -88,9 +93,12 @@ class Loaded:
                 f"{model_path}: no tensors under {parts}; the checkpoint ships "
                 "no vision tower the index knows"
             )
-        if any(k.endswith(".scales") for k in raw):
-            raise ValueError("a quantized vision tower is not supported yet")
         self.weights = {k.removeprefix("model."): v for k, v in raw.items()}
+        self.quantized = any(k.endswith(".scales") for k in raw)
+        config = config or {}
+        self.quantization = (
+            config.get("quantization") or config.get("quantization_config") or {}
+        )
 
     def part(self, *names: str) -> dict[str, mx.array]:
         """The tensors under the first of `names` that has any, that name
@@ -108,9 +116,39 @@ class Loaded:
     def tensor(self, name: str) -> mx.array | None:
         return self.weights.get(name)
 
+    def fit(self, module: nn.Module, weights: dict[str, mx.array], dtype) -> None:
+        """`module` takes `weights` (names relative to it), strictly. A
+        layer whose tensors come packed is swapped for its quantized form
+        first, with the bits and group size the tensors themselves imply:
+        a packed weight holds `in * bits / 32` words per row and its scales
+        `in / group_size`, and the layer knows `in`. The mode (affine or
+        mxfp4) is the checkpoint-wide one from config.json's quantization;
+        no checkpoint writes it per layer."""
+        if self.quantized:
+            mode = self.quantization.get("mode", "affine")
+
+            def predicate(path: str, m: nn.Module):
+                if not hasattr(m, "to_quantized") or f"{path}.scales" not in weights:
+                    return False
+                width = m.weight.shape[-1]
+                packed, scales = weights[f"{path}.weight"], weights[f"{path}.scales"]
+                return {
+                    "bits": packed.shape[-1] * 32 // width,
+                    "group_size": width // scales.shape[-1],
+                    "mode": mode,
+                }
+
+            nn.quantize(module, class_predicate=predicate)
+        module.load_weights(cast(weights, dtype), strict=True)
+
 
 def cast(weights: dict[str, mx.array], dtype) -> list[tuple[str, mx.array]]:
-    return [(k, v.astype(dtype)) for k, v in weights.items()]
+    """Floating tensors to `dtype`; packed ones (uint32 words, uint8 scales
+    of mxfp4) stay what they are."""
+    return [
+        (k, v.astype(dtype) if mx.issubdtype(v.dtype, mx.floating) else v)
+        for k, v in weights.items()
+    ]
 
 
 def split_by_grid(features: mx.array, grid_thw: mx.array, merge: int) -> list[mx.array]:
