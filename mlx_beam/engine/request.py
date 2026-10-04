@@ -46,13 +46,18 @@ class ImageSpan:
     computed, optional features added at the image positions ahead of
     certain text layers (DeepStack: {layer index: features}, applied
     before that layer runs), and the image's digest - the prefix cache
-    keys on it, so the same placeholders with another image never meet."""
+    keys on it, so the same placeholders with another image never meet.
+    `block` says the image's tokens attend to each other both ways in the
+    text model's sliding layers (Gemma 4's encoder-free models): the
+    prefill then keeps the span in one call and hands the model the
+    block ids."""
 
     start: int
     end: int
     features: Any
     digest: str
     deepstack: Any = field(default_factory=dict)
+    block: bool = False
 
     @property
     def extras(self) -> dict:

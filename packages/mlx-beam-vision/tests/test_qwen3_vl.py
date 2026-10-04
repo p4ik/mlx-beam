@@ -336,10 +336,21 @@ def test_provider_dispatches_by_model_type():
     assert not provider.supports({"model_type": "llama", "vision_config": {}})
     # A type the package knows and cannot serve is claimed and refused
     # with the reason, so the health says why instead of a wrong tower.
+    from mlx_beam_vision import families
+
+    families.UNSERVED["fake_vlm"] = "no tower for it here"
+    try:
+        unserved = {"model_type": "fake_vlm", "vision_config": {"x": 1}}
+        assert provider.supports(unserved) and provider.family_for(unserved) is None
+        with pytest.raises(ValueError, match="no tower for it"):
+            provider.load(None, ".", unserved, None)
+    finally:
+        del families.UNSERVED["fake_vlm"]
+    # Gemma 4's encoder-free models: a family of their own, whose spans
+    # are blocks the trunk must mask.
     unified = {"model_type": "gemma4_unified", "vision_config": {"x": 1}}
-    assert provider.supports(unified) and provider.family_for(unified) is None
-    with pytest.raises(ValueError, match="bidirectionally"):
-        provider.load(None, ".", unified, None)
+    assert provider.family_for(unified) == "gemma4_unified"
+    assert provider.needs(unified) == ("input_embeddings", "block_mask")
     # What the tower will ask of the prefill, from the config alone.
     assert provider.needs(TOWER_CONFIG) == (
         "input_embeddings",
@@ -879,6 +890,144 @@ def test_mistral3_loads_the_hf_layout_and_mlx_vlms(tmp_path):
         t = mistral3.Tower(config, path, dtype=mx.float32)
         assert t.loaded_from == ["model.safetensors"]
         assert mx.allclose(t.encode(pv, [(64, 64)])[0].features, want, atol=1e-5)
+
+
+def test_gemma4_unified_embeds_patches_and_marks_its_spans_as_blocks(tmp_path):
+    """The encoder-free family on a tiny config: the embedder against a
+    numpy reading of transformers' Gemma4UnifiedVisionEmbedder (patch
+    norms, the factorized position embedding summed per axis, the
+    scaleless RMSNorm before the projection), padded patches dropped per
+    image; both checkpoint layouts load, mlx-vlm's with the projection
+    quantized as the 8-bit conversions ship it; the frontend's spans are
+    blocks and the family asks the trunk for the block mask."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_beam_vision.families import gemma4_unified
+
+    patch, mm, pos_size, text_hidden = 4, 32, 8, 12
+    config = {
+        "model_type": "gemma4_unified",
+        "image_token_id": 62,
+        "vision_config": {
+            "model_patch_size": patch,
+            "mm_embed_dim": mm,
+            "mm_posemb_size": pos_size,
+            "output_proj_dims": mm,
+            "rms_norm_eps": 1e-6,
+        },
+        "text_config": {"hidden_size": text_hidden},
+    }
+    mx.random.seed(3)
+    t = gemma4_unified.Tower(config, None, dtype=mx.float32)
+    # Random parameters everywhere, so the norms and tables matter.
+    for module in (t.embedder, t.projection):
+        module.load_weights(
+            [
+                (k, mx.random.normal(v.shape) * 0.5)
+                for k, v in tree_flatten(module.parameters())
+            ]
+        )
+    mx.eval(t.embedder.parameters(), t.projection.parameters())
+    rs = np.random.RandomState(0)
+    # Two images: 6 real patches and 3, padded to the budget of 6.
+    pv = rs.randn(2, 6, patch * patch * 3).astype(np.float32)
+    pos = np.array(
+        [
+            [[0, 0], [1, 0], [2, 0], [0, 1], [1, 1], [2, 1]],
+            [[0, 0], [1, 0], [2, 0], [-1, -1], [-1, -1], [-1, -1]],
+        ]
+    )
+    encoded = t.encode(mx.array(pv), mx.array(pos))
+    assert [e.features.shape for e in encoded] == [(6, text_hidden), (3, text_hidden)]
+
+    def ln(x, w, b, eps=1e-5):
+        m = x.mean(-1, keepdims=True)
+        v = ((x - m) ** 2).mean(-1, keepdims=True)
+        return (x - m) / np.sqrt(v + eps) * w + b
+
+    e = {k: np.asarray(v) for k, v in tree_flatten(t.embedder.parameters())}
+    proj = np.asarray(t.projection.embedding_projection.weight)
+    for i, enc in enumerate(encoded):
+        n = enc.features.shape[0]
+        h = ln(pv[i, :n], e["patch_ln1.weight"], e["patch_ln1.bias"])
+        h = h @ e["patch_dense.weight"].T + e["patch_dense.bias"]
+        h = ln(h, e["patch_ln2.weight"], e["patch_ln2.bias"])
+        h = (
+            h
+            + e["pos_embedding"][pos[i, :n, 0], 0]
+            + e["pos_embedding"][pos[i, :n, 1], 1]
+        )
+        h = ln(h, e["pos_norm.weight"], e["pos_norm.bias"])
+        h = h / np.sqrt((h**2).mean(-1, keepdims=True) + 1e-6)
+        assert np.allclose(np.asarray(enc.features), h @ proj.T, atol=1e-4)
+
+    # Both layouts; the mlx-vlm one with the projection quantized.
+    embedder = dict(tree_flatten(t.embedder.parameters()))
+    projection = dict(tree_flatten(t.projection.parameters()))
+    quantized = gemma4_unified.Projection(mm, text_hidden, 1e-6)
+    quantized.load_weights(list(projection.items()))
+    nn.quantize(quantized, group_size=32, bits=8)
+    mx.eval(quantized.parameters())
+    layouts = {
+        "hf": {
+            **{f"model.embed_vision.{k}": v for k, v in embedder.items()},
+            **{
+                f"model.embed_vision.multimodal_embedder.{k}": v
+                for k, v in projection.items()
+            },
+        },
+        "mlx-vlm": {
+            **{f"vision_embedder.{k}": v for k, v in embedder.items()},
+            **{f"embed_vision.{k}": v for k, v in tree_flatten(quantized.parameters())},
+        },
+    }
+    want = [np.asarray(e.features) for e in encoded]
+    for name, weights in layouts.items():
+        path = tmp_path / name
+        path.mkdir()
+        mx.save_safetensors(str(path / "model.safetensors"), weights)
+        loaded = gemma4_unified.Tower(
+            {**config, "quantization": {"group_size": 32, "bits": 8}},
+            path,
+            dtype=mx.float32,
+        )
+        assert loaded.quantized == (name == "mlx-vlm")
+        got = loaded.encode(mx.array(pv), mx.array(pos))
+        tol = 1e-5 if name == "hf" else 0.3  # the 8-bit projection
+        for a, b in zip(got, want, strict=True):
+            assert np.allclose(np.asarray(a.features), b, atol=tol)
+
+    # The frontend: soft-token runs become block spans.
+    class Proc:
+        def apply_chat_template(self, messages, **kw):
+            return messages
+
+        def __call__(self, text, images=None, return_tensors="np"):
+            ids = [2, 6, 3, 61, 62, 62, 62, 62, 62, 62, 60, 61, 62, 62, 62, 60, 7]
+            return {
+                "input_ids": np.array([ids]),
+                "pixel_values": pv,
+                "image_position_ids": pos,
+            }
+
+    front = VisionFrontend(Proc(), t, "gemma4_unified")
+    assert front.needs == ("input_embeddings", "block_mask")
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "w3"},
+                {"type": "image"},
+                {"type": "image"},
+            ],
+        }
+    ]
+    built = front.build(messages, [png(8), png(9)], {})
+    assert [(s.start, s.end, s.block) for s in built.spans] == [
+        (4, 10, True),
+        (12, 15, True),
+    ]
+    assert provider.needs(config) == ("input_embeddings", "block_mask")
 
 
 def test_gemma4_family_pools_and_projects_per_image():

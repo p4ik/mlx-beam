@@ -1995,6 +1995,13 @@ class BatchGenerator:
             self._starved += 1
         else:
             self._starved = 0
+        # A span whose tokens attend to each other both ways (an image on
+        # Gemma 4's encoder-free models) cannot be cut: the call grows to
+        # its end, past the slice and the valve's width by at most the
+        # span, and rows with less left are right-padded for this call.
+        widen = getattr(self._prompt_batch, "width_for_blocks", None)
+        if widen is not None:
+            width = widen(width)
 
         prompts = []
         for i, seq in enumerate(self._currently_processing):

@@ -462,6 +462,11 @@ class Engine:
                     "this model has no layer hook; the frontend's per-layer "
                     "image features cannot be applied"
                 )
+            if not can["block_mask"] and any(s.block for s in request.spans):
+                raise InvalidRequest(
+                    "this model takes no block ids; the image's tokens cannot "
+                    "attend to each other"
+                )
         if (
             request.positions is not None
             and not self.image_capabilities["position_ids"]

@@ -57,6 +57,25 @@ def create_attention_mask(
     return "causal"
 
 
+def with_image_blocks(mask, N: int, window_size: int, block_ids):
+    """A sliding layer's mask with Gemma 4's rule for images (transformers,
+    create_masks_for_vision_model): AND(window, OR(causal, same block)) -
+    the tokens of one image attend to each other both ways. `mask` is the
+    layer's causal window mask as an array, (N, L) or (B, 1, N, L);
+    `block_ids` (B, N) the block of every query, -1 for text. A key before
+    the chunk belongs to no block: the engine prefills a block whole."""
+    L = mask.shape[-1]
+    B = block_ids.shape[0]
+    keys = mx.concatenate(
+        [mx.full((B, L - N), -1, dtype=block_ids.dtype), block_ids], axis=1
+    )
+    same = (block_ids[:, :, None] == keys[:, None, :]) & (block_ids[:, :, None] >= 0)
+    q = mx.arange(L - N, L)[:, None]
+    k = mx.arange(L)[None]
+    within = k > q - window_size
+    return mask | (same & within)[:, None]
+
+
 def create_ssm_mask(h, cache=None):
     if cache and hasattr(cache, "make_mask"):
         return cache.make_mask(h.shape[1])

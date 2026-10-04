@@ -14,7 +14,11 @@ import inspect
 
 import mlx.core as mx
 
-from mlx_beam._vendor.mlx_lm.generate import PromptProcessingBatch, _cache_arrays
+from mlx_beam._vendor.mlx_lm.generate import (
+    PromptProcessingBatch,
+    _cache_arrays,
+    _right_pad_prompts,
+)
 from mlx_beam.engine.proposer import trunk
 
 
@@ -25,22 +29,30 @@ def _inner_takes(inner, name: str) -> bool:
         return False
 
 
-IMAGE_NEEDS = ("input_embeddings", "layer_hook", "position_ids")
+# What a frontend may need of the trunk -> the keyword the trunk takes for it.
+IMAGE_NEEDS = {
+    "input_embeddings": "input_embeddings",
+    "layer_hook": "layer_hook",
+    "position_ids": "position_ids",
+    "block_mask": "block_ids",
+}
 
 
 def image_capabilities(model) -> dict[str, bool]:
     """What the model's text trunk takes of what an image frontend hands
     the prefill: `input_embeddings` (features in place of the placeholder
     tokens' embeddings, every frontend), `layer_hook` (per-layer extras
-    ahead of certain layers, DeepStack) and `position_ids` (the prompt's
-    multimodal positions, Qwen's MRoPE). Read from the signature, not the
-    config: a text model that lacks one cannot serve that frontend, and
-    the engine refuses the request before the worker sees it."""
+    ahead of certain layers, DeepStack), `position_ids` (the prompt's
+    multimodal positions, Qwen's MRoPE) and `block_mask` (an image's
+    tokens attending both ways within their block, Gemma 4's encoder-free
+    models - the trunk takes `block_ids`). Read from the signature, not
+    the config: a text model that lacks one cannot serve that frontend,
+    and the engine refuses the request before the worker sees it."""
     try:
         inner, _, _ = trunk(model)
     except ValueError:
         return {name: False for name in IMAGE_NEEDS}
-    return {name: _inner_takes(inner, name) for name in IMAGE_NEEDS}
+    return {name: _inner_takes(inner, kw) for name, kw in IMAGE_NEEDS.items()}
 
 
 class PrimingPromptBatch(PromptProcessingBatch):
@@ -72,6 +84,7 @@ class PrimingPromptBatch(PromptProcessingBatch):
         self._embeds_kw = _inner_takes(self._inner, "input_embeddings")
         self._hook_kw = _inner_takes(self._inner, "layer_hook")
         self._positions_kw = _inner_takes(self._inner, "position_ids")
+        self._blocks_kw = _inner_takes(self._inner, "block_ids")
         super().__init__(model, *args, **kwargs)
 
     @property
@@ -117,6 +130,37 @@ class PrimingPromptBatch(PromptProcessingBatch):
                 rows.append(g[:, lo : lo + n].astype(mx.int32))
         return mx.stack(rows, axis=1)
 
+    def width_for_blocks(self, width: int) -> int:
+        """For the scheduler: the width of its next call, grown so that no
+        row's block span is cut by it (the span's end at the latest, from
+        where the row stands)."""
+        return self._whole_blocks([len(t) for t in self.tokens], 0, width)
+
+    def _whole_blocks(self, starts: list[int], done: int, n: int) -> int:
+        """The chunk length that cuts no block span: a span whose tokens
+        attend to each other both ways has to be prefilled in one call
+        (its keys must all be there for its queries), so a chunk reaching
+        into one grows to the span's end."""
+        grown = n
+        for i, uid in enumerate(self.uids):
+            lo = starts[i] + done
+            for span in self.spans_of(uid):
+                if span.block and span.start < lo + grown < span.end:
+                    grown = span.end - lo
+        return grown
+
+    def _block_ids(self, overlaps: list[tuple], n: int):
+        """(B, n) block ids for the chunk, -1 for text; None without a
+        block span in it. A block is numbered by its span's start, which
+        no two spans of a row share."""
+        if not any(span.block for _, _, _, span, _ in overlaps):
+            return None
+        ids = mx.full((len(self.uids), n), -1, dtype=mx.int32)
+        for i, a, b, span, _ in overlaps:
+            if span.block:
+                ids[i, a:b] = span.start
+        return ids
+
     def _hook(self, overlaps: list[tuple]):
         """What DeepStack adds at the image positions ahead of a layer: the
         span's extra features for that layer, where it has them."""
@@ -139,29 +183,33 @@ class PrimingPromptBatch(PromptProcessingBatch):
         if len(self.uids) != len(tokens):
             raise ValueError("The batch length doesn't match the number of inputs")
         starts = [len(t) for t in self.tokens]
-        lengths = {len(t) for t in tokens}
-        if not tokens or len(lengths) != 1:
-            # Rows of unequal length need padding, which the embedded path
-            # does not do; the engine cuts every prefill call to the
-            # shortest segment, so this is a text-only call - or a bug,
-            # and then a loud one rather than images silently dropped.
-            if self._overlaps(starts, 0, max(lengths, default=0)):
-                raise ValueError(
-                    "image spans in a prefill call with rows of unequal length"
-                )
-            if any(self.positions_of(uid) is not None for uid in self.uids):
-                raise ValueError(
-                    "multimodal positions in a prefill call with rows of "
-                    "unequal length"
-                )
+        lengths = [len(t) for t in tokens]
+        widest = max(lengths, default=0)
+        padding = [widest - n for n in lengths]
+        if not tokens or (
+            max(padding) > 0
+            and not self._overlaps(starts, 0, widest)
+            and all(self.positions_of(uid) is None for uid in self.uids)
+        ):
+            # Text only: upstream's padded prefill.
             return super().prompt(tokens)
         for sti, ti in zip(self.tokens, tokens, strict=True):
             sti += ti
         rows = tokens
-        tokens = mx.array(tokens)
+        padded = max(padding) > 0
+        if padded:
+            # The scheduler cuts every call to the shortest row, except
+            # over a block span: then the shorter rows are right-padded, as
+            # upstream pads, and their caches trimmed again at the end.
+            tokens = _right_pad_prompts(tokens, max_length=widest)
+            for c in self.prompt_cache:
+                c.prepare(lengths=lengths, right_padding=padding)
+        else:
+            tokens = mx.array(tokens)
         done = 0
         while tokens.shape[1] > 0:
             n = min(self.prefill_step_size, tokens.shape[1])
+            n = min(self._whole_blocks(starts, done, n), tokens.shape[1])
             chunk = tokens[:, :n]
             overlaps = self._overlaps(starts, done, n)
             kwargs = {}
@@ -188,6 +236,14 @@ class PrimingPromptBatch(PromptProcessingBatch):
                             "frontend's per-layer image features cannot be applied"
                         )
                     kwargs["layer_hook"] = hook
+                blocks = self._block_ids(overlaps, n)
+                if blocks is not None:
+                    if not self._blocks_kw:
+                        raise ValueError(
+                            f"{type(self.model).__name__} takes no block ids; the "
+                            "image's tokens cannot attend to each other"
+                        )
+                    kwargs["block_ids"] = blocks
             positions = self._positions(starts, done, n)
             if positions is not None:
                 if not self._positions_kw:
@@ -200,15 +256,22 @@ class PrimingPromptBatch(PromptProcessingBatch):
             mx.eval(hidden, *_cache_arrays(self.prompt_cache))
             if proposer is not None:
                 for i, uid in enumerate(self.uids):
-                    proposer.prime(
-                        uid,
-                        hidden[i : i + 1],
-                        rows[i][done : done + n],
-                        starts[i] + done,
-                    )
+                    real = rows[i][done : done + n]
+                    if real:
+                        proposer.prime(
+                            uid,
+                            hidden[i : i + 1, : len(real)],
+                            real,
+                            starts[i] + done,
+                        )
             mx.clear_cache()
             tokens = tokens[:, n:]
             done += n
+        if padded:
+            for c in self.prompt_cache:
+                c.finalize()
+            mx.eval(*_cache_arrays(self.prompt_cache))
+            mx.clear_cache()
 
     def generate(self, tokens):
         proposer = self._proposer

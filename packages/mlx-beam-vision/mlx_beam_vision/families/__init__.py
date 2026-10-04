@@ -37,19 +37,14 @@ FAMILIES: dict[str, str] = {
     "qwen3_5_moe": "qwen3_vl",
     "mistral3": "mistral3",
     "gemma4": "gemma4",
+    "gemma4_unified": "gemma4_unified",
     "muse_glimmer": "muse_glimmer",
     "granite4_vision": "granite4_vision",
 }
 
 # Model types with images this package knows and does not serve, and why;
 # the reason reaches /health.vision.refused instead of a wrong tower.
-UNSERVED: dict[str, str] = {
-    "gemma4_unified": (
-        "encoder-free vision (vision_embedder) whose image tokens attend "
-        "bidirectionally within their block in the text model's sliding "
-        "layers; the text trunk applies no such mask yet"
-    ),
-}
+UNSERVED: dict[str, str] = {}
 
 
 def module_for(family: str) -> ModuleType:
@@ -67,6 +62,9 @@ def needs(family: str, config: dict) -> tuple[str, ...]:
     if hasattr(module, "positions"):
         # The family's text model rotates with several position axes.
         out.append("position_ids")
+    if getattr(module, "BLOCKS", False):
+        # An image's tokens attend to each other both ways in the trunk.
+        out.append("block_mask")
     return tuple(out)
 
 

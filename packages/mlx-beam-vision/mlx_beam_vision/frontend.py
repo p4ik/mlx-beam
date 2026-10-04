@@ -137,11 +137,14 @@ class VisionFrontend:
         """What the prefill must take of the text model for this tower's
         spans: the features at the placeholder positions always, the
         per-layer extras when the family adds them (DeepStack)."""
+        module = families.module_for(self.family)
         out = ["input_embeddings"]
         if getattr(self.tower, "per_layer", False):
             out.append("layer_hook")
-        if hasattr(families.module_for(self.family), "positions"):
+        if hasattr(module, "positions"):
             out.append("position_ids")
+        if getattr(module, "BLOCKS", False):
+            out.append("block_mask")
         return tuple(out)
 
     def _text_kwargs(self, text: str) -> dict:
@@ -185,6 +188,7 @@ class VisionFrontend:
                 self.tower.config.spatial_merge_size,
             )
         spans = []
+        block = bool(getattr(family, "BLOCKS", False))
         for runs, image, enc in zip(
             _spans_from(ids, self.tower.image_token_id, counts),
             images,
@@ -201,6 +205,7 @@ class VisionFrontend:
                         enc.features[off : off + n],
                         image.digest,
                         {k: d[off : off + n] for k, d in enc.deepstack.items()},
+                        block=block,
                     )
                 )
                 off += n

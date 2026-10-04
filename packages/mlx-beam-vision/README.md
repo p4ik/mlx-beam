@@ -17,13 +17,13 @@ see `mlx_beam_vision/_vendor/VENDORED.md`):
 |---|---|---|
 | `qwen3_vl` | Qwen3-VL, Qwen3.5, Qwen3.8 | DeepStack applied: the tower's intermediate features are added after the text model's first layers; the text model's multimodal positions (MRoPE: time, height, width per image token) are built from the processor's grids and applied through prefill, cache and decoding |
 | `mistral3` | Mistral Small 3.x (Pixtral tower) | the image's rows are separate spans (`[IMG_BREAK]` between them) |
-| `gemma4` | Gemma 4 E2B, E4B | image only; audio is not served yet. The 12B (`gemma4_unified`, encoder-free, its image tokens attending bidirectionally in the text model) is refused with that reason until the text trunk takes such a mask |
+| `gemma4` | Gemma 4 E2B, E4B | image only; audio is not served yet |
+| `gemma4_unified` | Gemma 4 12B and up | encoder-free: the checkpoint's own patch embedder (after transformers' `Gemma4UnifiedVisionEmbedder`, no mlx-vlm part) in place of a tower; an image's tokens attend to each other both ways in the text model's sliding layers, which the engine's prefill masks and keeps in one call |
 | `muse_glimmer` | Muse Glimmer | the projector's norm matches the text model's input norm |
 | `granite4_vision` | Granite Vision 4.1 | AnyRes tiles, window Q-Former projectors; nothing at the embedding, every projector's features added ahead of its text layer |
 
-Not yet: audio and video input, quantized towers (the towers load at model
-precision; a package that ships a quantized tower is refused with a
-message). An image above 32 megapixels is refused before it is decoded.
+Not yet: audio and video input. A quantized tower, projector or adapter
+loads as such. An image above 32 megapixels is refused before it is decoded.
 
 The package installs torch and torchvision: the processors transformers
 ships for these families (the template rendering and the image-to-patches
