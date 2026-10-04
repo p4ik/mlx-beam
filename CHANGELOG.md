@@ -6,6 +6,30 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Changed
+- The site and the README list the extras (vision, audio, convert,
+  structured, GGUF, images) as a feature group of their own, with the
+  state of each; the install block serves a model right away.
+- `NOTICE` names no vendored component any more: `VENDORED.md` is the
+  one list of what is vendored, with upstream, commit, license and local
+  changes, and ships in the wheel beside `LICENSE` and `NOTICE`. The CI
+  checks that every vendored tree is a listed part with its license file.
+
+### Fixed
+- The vision package refused any checkpoint whose tower, projector or
+  adapter weights are quantized (every 8-bit conversion of Granite Vision
+  and Muse Glimmer): the server came up without vision and image requests
+  got a 400. Quantized layers are now loaded as such, with the bits and
+  group size the tensors themselves imply; `/health.vision.tower.quantized`
+  says so.
+- A checkpoint that ships no `preprocessor_config.json` (the conversions
+  under `mlx-community` leave it out) was refused at load since 0.1.0a7.
+  The processor is now built from the model: transformers' own classes
+  for the model type, patch and image sizes, merge size and the image
+  token from `config.json` and the tokenizer, the class defaults only
+  for what the model does not say (mean, std, pixel bounds);
+  `/health.vision.processor` lists where each value came from.
+
 ## [0.1.0a9] - 2026-10-04
 
 ### Added
