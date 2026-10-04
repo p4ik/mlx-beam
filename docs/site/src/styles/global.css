@@ -1,5 +1,6 @@
 :root {
   --black: #000000;
+  --soot: #110000;
   --ember: #330000;
   --oxide: #660000;
   --red: #aa0000;
@@ -127,13 +128,13 @@ a:hover {
 /* hero: the wall the beam lights from below */
 .hero {
   position: relative;
-  padding: 3.5rem 0 2.25rem;
+  padding: 5rem 0 3rem;
   background: radial-gradient(60% 55% at 50% 100%, rgba(102, 0, 0, 0.28), transparent 70%);
 }
 
 h1 {
-  margin: 0 0 0.8rem;
-  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  margin: 0 0 1rem;
+  font-size: clamp(2.6rem, 6vw, 4.2rem);
   line-height: 1.02;
   font-weight: 700;
   font-stretch: 112%;
@@ -144,7 +145,7 @@ h1 {
 
 .lead {
   margin: 0;
-  font-size: 1.08rem;
+  font-size: 1.15rem;
   font-weight: 600;
   font-stretch: 106%;
   line-height: 1.5;
@@ -169,7 +170,7 @@ h1 {
 .beam {
   position: relative;
   height: 2px;
-  margin: 0 0 2rem;
+  margin: 0 0 3.5rem;
   animation: ignite 0.9s ease-out both;
 }
 
@@ -255,12 +256,12 @@ h1 {
 
 /* sections */
 section {
-  padding: 0 0 2rem;
+  padding: 0 0 4rem;
 }
 
 h2 {
-  margin: 0 0 0.6rem;
-  font-size: 1.2rem;
+  margin: 0 0 1rem;
+  font-size: 1.5rem;
   font-weight: 600;
   font-stretch: 108%;
   letter-spacing: -0.01em;
@@ -280,14 +281,21 @@ h2 {
 }
 
 /* install: the one block with a surface; the button sits beside the short second line */
+/* the one surface of the page: ember ground, oxide rim, a lit edge at the left */
+.terminal,
+.panel {
+  border: 1px solid var(--oxide);
+  border-left: 3px solid var(--beam);
+  border-radius: 6px;
+  background: var(--soot);
+  box-shadow: -6px 0 18px -8px rgba(255, 51, 0, 0.55);
+}
+
 .terminal {
   position: relative;
   width: fit-content;
   max-width: 100%;
-  border: 1px solid var(--oxide);
-  border-radius: 6px;
-  background: #120000;
-  padding: 1rem 1.25rem;
+  padding: 1rem 1.4rem;
 }
 
 .terminal pre {
@@ -355,46 +363,185 @@ dd {
 
 
 /* the feature table: name, what it does, state in its own column */
-table.features {
-  max-width: none;
-  table-layout: fixed;
-  margin-top: -1rem;
+/* features: a heading per group, its entries on one panel below; each entry is a name line with its state and a line of text */
+.features {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2rem;
+  margin-top: 1.5rem;
 }
 
-table.features col.c-name { width: 27%; }
-table.features col.c-text { width: 61%; }
-table.features col.c-state { width: 12%; }
+/* the group is a section too, but the generic section spacing is the list's job */
+.fgroup {
+  padding: 0;
+}
 
-table.features tr.group th {
-  padding: 2.2rem 0 0.4rem;
-  font-size: 0.9rem;
+.fgroup header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0 0.25rem 0.6rem;
+}
+
+.fgroup h3 {
+  margin: 0;
+  font-size: 1.05rem;
   font-weight: 600;
-  letter-spacing: 0.02em;
-  color: var(--text-soft);
+  font-stretch: 106%;
+}
+
+.fgroup .count {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+ul.panel {
+  list-style: none;
+  margin: 0;
+  padding: 0.2rem 1.5rem 0.2rem;
+}
+
+.panel li {
+  padding: 0.7rem 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.panel li:first-child {
   border-top: 0;
 }
 
-table.features th {
-  text-align: left;
-  font-weight: 500;
+.fhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.fname {
+  font-weight: 600;
+  font-size: 0.97rem;
+}
+
+.fstate .mark {
+  margin: 0 0 0 0.55rem;
+}
+
+/* the mark sits after the word at the right edge, so the marks line up down the column */
+.fstate {
+  text-align: right;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  color: var(--text-soft);
+}
+
+.ftext {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  color: var(--text-soft);
+}
+
+/* the model a family is represented by, after its name */
+.fgroup h3 .example {
+  margin-left: 0.6rem;
+  font-weight: 400;
+  font-stretch: 100%;
   font-size: 0.85rem;
   color: var(--text-dim);
-  padding: 0 0.75rem 0.5rem 0;
 }
 
-table.features td {
-  padding-right: 0.75rem;
-  vertical-align: top;
-  font-size: 0.93rem;
-  line-height: 1.35;
+/* a line the family has no use for: dimmed, no mark */
+.panel li.na .fname,
+.panel li.na .ftext,
+.panel li.na .fstate {
+  color: var(--text-dim);
 }
 
-table.features td.name {
-  font-weight: 600;
+/* the model table: one row per family, a mark and a short label per capability */
+.doc table.models {
+  margin-top: 1.5rem;
 }
 
-table.features td.state {
+.doc table.models col.c-family { width: 40%; }
+
+.doc table.models th {
   width: auto;
+}
+
+.doc td.family {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc td.family .fname {
+  font-size: 0.95rem;
+}
+
+.doc td.family .example {
+  margin-left: 0.6rem;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+.doc table.models td {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.doc td.cap {
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.doc td.cap .hint {
+  text-decoration: none;
+}
+
+.doc td.cap .mark {
+  margin: 0 0 0 0.3rem;
+}
+
+.doc td.cap.built .mark {
+  background: var(--beam);
+  box-shadow: 0 0 10px rgba(255, 51, 0, 0.85), 0 0 2px var(--flare);
+}
+
+.doc td.cap.planned .mark {
+  border: 1.5px solid rgba(170, 0, 0, 0.85);
+}
+
+.doc td.cap.planned,
+.doc td.cap.na {
+  color: var(--text-dim);
+}
+
+.doc td.cap .hint::after {
+  white-space: normal;
+  width: 20rem;
+  left: 0;
+  right: auto;
+}
+
+.doc td.cap:last-child .hint::after,
+.doc td.cap:nth-last-child(2) .hint::after {
+  left: auto;
+  right: 0;
+}
+
+/* what is only planned steps back half a shade; the state says the rest */
+.panel li.planned .fname {
+  color: var(--text-soft);
+}
+
+.panel li.planned .ftext,
+.panel li.planned .fstate {
+  color: var(--text-dim);
 }
 
 /* status: built things carry light, planned ones only the outline */
@@ -425,16 +572,18 @@ td.state {
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  margin-right: 0.6rem;
+  margin-right: 0.55rem;
   vertical-align: 0;
 }
 
-.mark.built {
+.mark.built,
+.panel li.built .mark {
   background: var(--beam);
-  box-shadow: 0 0 9px rgba(255, 51, 0, 0.75);
+  box-shadow: 0 0 10px rgba(255, 51, 0, 0.85), 0 0 2px var(--flare);
 }
 
-.mark.planned {
+.mark.planned,
+.panel li.planned .mark {
   border: 1.5px solid rgba(170, 0, 0, 0.85);
 }
 
@@ -488,10 +637,11 @@ footer nav {
 }
 
 .doc h3 {
-  margin: 1.75rem 0 0.5rem;
+  margin: 2rem 0 0.6rem 0.25rem;
   font-size: 1.05rem;
   font-weight: 600;
-  color: var(--text-soft);
+  font-stretch: 106%;
+  color: var(--text);
 }
 
 .doc p,
@@ -505,25 +655,106 @@ footer nav {
   color: var(--text);
 }
 
+/* a reference table sits on the page's one surface, like the feature panels */
 .doc table {
   max-width: none;
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 1px solid var(--oxide);
+  border-left: 3px solid var(--beam);
+  border-radius: 6px;
+  background: var(--soot);
+  box-shadow: -6px 0 18px -8px rgba(255, 51, 0, 0.55);
   font-size: 0.93rem;
   margin: 0.5rem 0 1rem;
 }
 
 .doc th {
   text-align: left;
-  padding: 0.5rem 0.75rem 0.5rem 0;
+  padding: 0.75rem 0.75rem 0.5rem;
   color: var(--text-dim);
   font-weight: 500;
-  border-bottom: 1px solid rgba(102, 0, 0, 0.55);
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .doc td {
-  padding: 0.55rem 0.75rem 0.55rem 0;
+  padding: 0.6rem 0.75rem;
   vertical-align: top;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--text-soft);
+}
+
+.doc tbody tr:first-child td {
+  border-top: 0;
+}
+
+.doc tr:last-child td {
+  border-bottom: 0;
 }
 
 .doc td:first-child {
-  white-space: nowrap;
+  color: var(--text);
+}
+
+.doc th:last-child,
+.doc td:last-child {
+  padding-right: 1rem;
+}
+
+/* the same column widths on every table of the page */
+.doc table {
+  table-layout: fixed;
+}
+
+.doc table:not(.models):has(th:nth-child(4)) th:nth-child(1) { width: 23%; }
+.doc table:not(.models):has(th:nth-child(4)) th:nth-child(2) { width: 17%; }
+.doc table:not(.models):has(th:nth-child(4)) th:nth-child(3) { width: 10%; }
+
+.doc table:not(:has(th:nth-child(4))) th:nth-child(1) { width: 26%; }
+.doc table:not(:has(th:nth-child(4))) th:nth-child(2) { width: 22%; }
+
+.doc td {
+  overflow-wrap: anywhere;
+}
+
+/* a shortened description: the whole text opens below it on hover or focus */
+/* the cell, not the word, anchors the note: it never leaves the column */
+.doc td:has(.hint) {
+  position: relative;
+}
+
+.doc .hint {
+  text-decoration: underline dotted rgba(255, 255, 255, 0.35);
+  text-underline-offset: 0.2em;
+  cursor: help;
+  outline: none;
+}
+
+.doc .hint::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 0.75rem;
+  right: 0.75rem;
+  top: calc(100% - 0.2rem);
+  z-index: 2;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--oxide);
+  border-left: 3px solid var(--beam);
+  border-radius: 6px;
+  background: var(--soot);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  color: var(--text-soft);
+  font-size: 0.88rem;
+  line-height: 1.45;
+  text-decoration: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease-out;
+}
+
+.doc .hint:hover::after,
+.doc .hint:focus::after {
+  opacity: 1;
 }

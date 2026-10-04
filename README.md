@@ -40,31 +40,31 @@ Everything the engine does, with where each piece stands. Present tense only for
 | Feature | What it does | State |
 |---|---|---|
 | *Server and APIs* | | |
-| **OpenAI API** | Chat completions, completions, Responses, models; streaming. | built |
-| **Anthropic API** | Messages with thinking blocks and tool use, same token path. | built |
-| **Health and metrics** | `/health` with evidence per capability, `/metrics` as plain-text counters. | built |
-| **Access control** | API key off loopback, Host check, CORS allowlist. | built |
-| **CLI** | `beam serve` with mlx-lm's flag names, `beam doctor`. | built |
+| **OpenAI API** | Chat completions, completions, Responses and models, with streaming. | built |
+| **Anthropic API** | Messages with thinking blocks and tool use, on the same token path. | built |
+| **Health and metrics** | `/health` shows each capability with evidence; `/metrics` serves counters. | built |
+| **Access control** | An API key is required off loopback; Host check and CORS allowlist. | built |
+| **CLI** | `beam serve` takes mlx-lm's flag names; `beam doctor` checks the machine. | built |
 | *Models* | | |
 | **Model classes** | Dense, MoE, hybrid-recurrent, sliding window, sinks, MLA, MRoPE. | built |
-| **Package layout** | Manifest with KV profile and draft-head quantization; plain MLX too. | built |
-| **vision [extra]** | Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite. | built |
-| **audio [extra]** | Audio input for models that take it; own package. | planned |
-| **gguf [extra]** | GGUF checkpoints behind a guard. | planned |
-| **images [extra]** | Image generation and editing through the Images API. | planned |
+| **Package layout** | Manifest with KV profile and draft-head quantization; plain MLX loads too. | built |
+| **Vision [Extra]** | Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite. | built |
+| **Audio [Extra]** | Audio input for models that take it, as its own package. | planned |
+| **Images [Extra]** | Image generation and editing through the Images API. | planned |
+| **GGUF [Extra]** | GGUF checkpoints load behind a guard. | planned |
 | *Engine* | | |
-| **Continuous batching** | Short requests answer beside a long prefill; prefill valve. | built |
-| **Prefix cache** | Reuses the KV of a shared prefix; recurrent and window layers too. | built |
-| **Prefix cache SSD tier** | Second tier on SSD: entries outlive eviction from RAM and restarts. | planned |
-| **Mixed-precision KV cache** | Bits per layer from the conversion; quantized after or during prefill. | built |
-| **Multi-token prediction** | Own draft head, exact verify, depth regulator; one request at a time. | built |
-| **Batched MTP** | Several requests speculating at once. | planned |
-| **Expert streaming** | Models larger than memory, experts streamed from SSD. | planned |
+| **Continuous batching** | Short requests are answered beside a long prefill, capped by a valve. | built |
+| **Prefix cache** | The KV of a shared prefix is reused, for recurrent and window layers too. | built |
+| **Prefix cache SSD tier** | A second tier on SSD lets entries outlive eviction from RAM and restarts. | planned |
+| **Mixed-precision KV cache** | Bits per layer come from the conversion; quantized after or during prefill. | built |
+| **Multi-token prediction** | An own draft head predicts ahead, verified exactly, one request at a time. | built |
+| **Batched MTP** | Several requests speculate at once. | planned |
+| **Expert streaming** | Models larger than memory run with experts streamed from SSD. | planned |
 | *Request control* | | |
-| **Reasoning control** | Thinking field, budget, effort translation, marker families. | built |
-| **Tool calling** | Parsers per model family, repair ladder with every step reported. | built |
-| **Sampling controls** | Temperature, top-p/k, min-p, penalties, logit bias, seeds, defaults. | built |
-| **structured [extra]** | Structured output: JSON schema and grammar-constrained decoding. | planned |
+| **Reasoning control** | Thinking on or off, a budget per request, effort levels, marker families. | built |
+| **Tool calling** | Parsers per model family and a repair ladder that reports every step. | built |
+| **Sampling controls** | Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults. | built |
+| **Structured [Extra]** | JSON schema and grammar-constrained decoding. | planned |
 
 The engine reads standard MLX checkpoints. A checkpoint in the B.E.A.M. package layout (`extras/manifest.json` next to the shards; see the model cards under [huggingface.co/p4ik](https://huggingface.co/p4ik)) also tells it how its draft head was quantized and which KV prefill mode its profile was measured with.
 

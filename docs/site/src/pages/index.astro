@@ -14,31 +14,31 @@ const featureGroups = [
     "rows": [
       {
         "name": "OpenAI API",
-        "text": "Chat completions, completions, Responses, models; streaming.",
+        "text": "Chat completions, completions, Responses and models, with streaming.",
         "state": "built",
         "built": true
       },
       {
         "name": "Anthropic API",
-        "text": "Messages with thinking blocks and tool use, same token path.",
+        "text": "Messages with thinking blocks and tool use, on the same token path.",
         "state": "built",
         "built": true
       },
       {
         "name": "Health and metrics",
-        "text": "/health with evidence per capability, /metrics as plain-text counters.",
+        "text": "/health shows each capability with evidence; /metrics serves counters.",
         "state": "built",
         "built": true
       },
       {
         "name": "Access control",
-        "text": "API key off loopback, Host check, CORS allowlist.",
+        "text": "An API key is required off loopback; Host check and CORS allowlist.",
         "state": "built",
         "built": true
       },
       {
         "name": "CLI",
-        "text": "beam serve with mlx-lm's flag names, beam doctor.",
+        "text": "beam serve takes mlx-lm's flag names; beam doctor checks the machine.",
         "state": "built",
         "built": true
       }
@@ -55,31 +55,31 @@ const featureGroups = [
       },
       {
         "name": "Package layout",
-        "text": "Manifest with KV profile and draft-head quantization; plain MLX too.",
+        "text": "Manifest with KV profile and draft-head quantization; plain MLX loads too.",
         "state": "built",
         "built": true
       },
       {
-        "name": "vision [extra]",
+        "name": "Vision [Extra]",
         "text": "Qwen3-VL/3.5/3.6/3.8, Mistral 3, Gemma 4, Muse Glimmer, Granite.",
         "state": "built",
         "built": true
       },
       {
-        "name": "audio [extra]",
-        "text": "Audio input for models that take it; own package.",
+        "name": "Audio [Extra]",
+        "text": "Audio input for models that take it, as its own package.",
         "state": "planned",
         "built": false
       },
       {
-        "name": "gguf [extra]",
-        "text": "GGUF checkpoints behind a guard.",
-        "state": "planned",
-        "built": false
-      },
-      {
-        "name": "images [extra]",
+        "name": "Images [Extra]",
         "text": "Image generation and editing through the Images API.",
+        "state": "planned",
+        "built": false
+      },
+      {
+        "name": "GGUF [Extra]",
+        "text": "GGUF checkpoints load behind a guard.",
         "state": "planned",
         "built": false
       }
@@ -90,43 +90,43 @@ const featureGroups = [
     "rows": [
       {
         "name": "Continuous batching",
-        "text": "Short requests answer beside a long prefill; prefill valve.",
+        "text": "Short requests are answered beside a long prefill, capped by a valve.",
         "state": "built",
         "built": true
       },
       {
         "name": "Prefix cache",
-        "text": "Reuses the KV of a shared prefix; recurrent and window layers too.",
+        "text": "The KV of a shared prefix is reused, for recurrent and window layers too.",
         "state": "built",
         "built": true
       },
       {
         "name": "Prefix cache SSD tier",
-        "text": "Second tier on SSD: entries outlive eviction from RAM and restarts.",
+        "text": "A second tier on SSD lets entries outlive eviction from RAM and restarts.",
         "state": "planned",
         "built": false
       },
       {
         "name": "Mixed-precision KV cache",
-        "text": "Bits per layer from the conversion; quantized after or during prefill.",
+        "text": "Bits per layer come from the conversion; quantized after or during prefill.",
         "state": "built",
         "built": true
       },
       {
         "name": "Multi-token prediction",
-        "text": "Own draft head, exact verify, depth regulator; one request at a time.",
+        "text": "An own draft head predicts ahead, verified exactly, one request at a time.",
         "state": "built",
         "built": true
       },
       {
         "name": "Batched MTP",
-        "text": "Several requests speculating at once.",
+        "text": "Several requests speculate at once.",
         "state": "planned",
         "built": false
       },
       {
         "name": "Expert streaming",
-        "text": "Models larger than memory, experts streamed from SSD.",
+        "text": "Models larger than memory run with experts streamed from SSD.",
         "state": "planned",
         "built": false
       }
@@ -137,25 +137,25 @@ const featureGroups = [
     "rows": [
       {
         "name": "Reasoning control",
-        "text": "Thinking field, budget, effort translation, marker families.",
+        "text": "Thinking on or off, a budget per request, effort levels, marker families.",
         "state": "built",
         "built": true
       },
       {
         "name": "Tool calling",
-        "text": "Parsers per model family, repair ladder with every step reported.",
+        "text": "Parsers per model family and a repair ladder that reports every step.",
         "state": "built",
         "built": true
       },
       {
         "name": "Sampling controls",
-        "text": "Temperature, top-p/k, min-p, penalties, logit bias, seeds, defaults.",
+        "text": "Temperature, top-p/k, min-p, penalties, logit bias, seeds and defaults.",
         "state": "built",
         "built": true
       },
       {
-        "name": "structured [extra]",
-        "text": "Structured output: JSON schema and grammar-constrained decoding.",
+        "name": "Structured [Extra]",
+        "text": "JSON schema and grammar-constrained decoding.",
         "state": "planned",
         "built": false
       }
@@ -221,23 +221,27 @@ const features = ["Robust prefix cache", "Expert streaming", "No bloat"];
         <div class="wrap">
           <h2>Features</h2>
           <p class="prose">Everything the engine does, with where each piece stands. Extras are packages or optional installs beside the core.</p>
-          <table class="features">
-            <colgroup><col class="c-name" /><col class="c-text" /><col class="c-state" /></colgroup>
-            <tbody>
-              {featureGroups.map((g) => (
-                <>
-                  <tr class="group"><th colspan="3">{g.group}</th></tr>
+          <div class="features">
+            {featureGroups.map((g) => (
+              <section class="fgroup">
+                <header>
+                  <h3>{g.group}</h3>
+                  <span class="count">{g.rows.filter((r) => r.built).length} of {g.rows.length} built</span>
+                </header>
+                <ul class="panel">
                   {g.rows.map((r) => (
-                    <tr>
-                      <td class="name">{r.name}</td>
-                      <td>{r.text}</td>
-                      <td class="state"><span class={`mark ${r.built ? "built" : "planned"}`}></span>{r.state}</td>
-                    </tr>
+                    <li class={r.built ? "built" : "planned"}>
+                      <span class="fhead">
+                        <span class="fname">{r.name}</span>
+                        <span class="fstate">{r.state}<i class="mark" aria-hidden="true"></i></span>
+                      </span>
+                      <span class="ftext">{r.text}</span>
+                    </li>
                   ))}
-                </>
-              ))}
-            </tbody>
-          </table>
+                </ul>
+              </section>
+            ))}
+          </div>
           <p class="note">Measured numbers are published as they are measured, with machine, model and date.</p>
         </div>
       </section>
