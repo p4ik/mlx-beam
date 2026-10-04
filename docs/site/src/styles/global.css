@@ -298,10 +298,11 @@ h2 {
   padding: 1rem 1.4rem;
 }
 
+/* wraps at spaces only, so a flag or a repo id never breaks in the middle */
 .terminal pre {
   margin: 0;
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  overflow-wrap: normal;
   font: 15px/1.75 var(--mono);
   color: rgba(255, 255, 255, 0.92);
 }
@@ -309,7 +310,7 @@ h2 {
 .terminal button {
   position: absolute;
   right: 0.7rem;
-  bottom: 0.7rem;
+  top: 0.7rem;
   font: 500 13px var(--sans);
   color: var(--text-soft);
   background: transparent;
@@ -403,7 +404,12 @@ ul.panel {
   padding: 0.2rem 1.5rem 0.2rem;
 }
 
+/* two columns: name and text on the left, the state on the right - the text wraps before the state column */
 .panel li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 1.5rem;
+  align-items: baseline;
   padding: 0.7rem 0;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
 }
@@ -413,10 +419,7 @@ ul.panel {
 }
 
 .fhead {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
+  display: contents;
 }
 
 .fname {
@@ -430,6 +433,7 @@ ul.panel {
 
 /* the mark sits after the word at the right edge, so the marks line up down the column */
 .fstate {
+  grid-column: 2;
   text-align: right;
   white-space: nowrap;
   font-size: 0.82rem;
@@ -438,6 +442,7 @@ ul.panel {
 }
 
 .ftext {
+  grid-column: 1;
   display: block;
   margin-top: 0.2rem;
   font-size: 0.9rem;
