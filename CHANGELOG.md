@@ -6,6 +6,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a10] - 2026-10-04
+
 ### Added
 - Checkpoints that ship `tekken.json` instead of a chat template (every
   official Mistral release) render through mistral-common: system
