@@ -403,6 +403,20 @@ broadcast error and took the generation thread down. Reached by any
 sliding-window model reusing a cached prefix across turns. Guarded with
 `or l == 0`. Test: `test_rotating_merge_survives_a_zero_length_cache`.
 
+`rotating mask` - `models/cache.py`, `BatchRotatingKVCache.make_mask` and
+`_update_concat`: a call of several tokens puts a rotated ring in
+temporal order and keeps at most `max_size - 1` of its entries, trimming
+`left_padding` by what it drops. The mask took that trim from `_idx`,
+which after a one-token call on a full window (the ring has wrapped) is
+the ring's write position, so it trimmed one entry less than the cache:
+a row with left padding (from `extend` on either side, from `merge`, or
+from a right-padded prefill) lost its oldest key in the window for that
+call, and the later layers' keys of that call with it. Both now take the
+trim from `_concat_trim_size`.
+Tests:
+`test_rotating_mask_trims_what_the_update_trims`,
+`test_a_joined_row_matches_its_solo_run_after_a_one_token_call`.
+
 `labelled channel` - `tokenizer_utils.py`, `_infer_thinking` and
 `TokenizerWrapper.think_label_end`: upstream takes `<|channel>thought` as
 the opener of Gemma 4's think block, two tokens with the label fixed.

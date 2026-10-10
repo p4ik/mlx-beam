@@ -1137,6 +1137,11 @@ class BatchRotatingKVCache(_BaseCache):
             self._idx = self.keys.shape[2]
             self.rotated = False
 
+    def _concat_trim_size(self):
+        # A rotated ring is put in temporal order first: the whole buffer counts.
+        idx = self.keys.shape[2] if self.rotated else self._idx
+        return idx - self.max_size + 1
+
     def _update_concat(self, keys, values):
         if self.keys is None:
             self.keys = keys
@@ -1162,7 +1167,7 @@ class BatchRotatingKVCache(_BaseCache):
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
-            trim_size = self._idx - self.max_size + 1
+            trim_size = self._concat_trim_size()
             if trim_size > 0:
                 self.left_padding -= trim_size
             self.keys = self._trim(trim_size, self.keys, keys)
@@ -1316,7 +1321,8 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
-        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+        trim_size = self._concat_trim_size() if N > 1 else self._idx - self.max_size
+        if trim_size > 0:
             left_padding = left_padding - trim_size
 
         rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
