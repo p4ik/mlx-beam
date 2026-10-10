@@ -66,14 +66,31 @@ def pixels(grid):
     return np.random.RandomState(n).randn(n, 3 * T * PATCH * PATCH).astype(np.float32)
 
 
+IMAGE_TOKEN = "<|image_pad|>"
+
+
+def image_parts(messages):
+    return [
+        p
+        for m in messages
+        if isinstance(m["content"], list)
+        for p in m["content"]
+        if p["type"] == "image"
+    ]
+
+
 class Rendered(str):
     """What the fake template renders: a str for the frontend's BOS check
     and assistant-frame probe (a real processor renders text), carrying
-    the messages the fake tokenizer reads. The generation prompt is the
+    the messages the fake tokenizer reads, one placeholder per image part
+    (`placeholders` overrides the count). The generation prompt is the
     frame `<gen>`, one token (7) in the fake's ids."""
 
-    def __new__(cls, messages, with_bos, generation_prompt=True):
+    def __new__(cls, messages, with_bos, generation_prompt=True, placeholders=None):
         base = "<bos>..." if with_bos else "..."
+        if placeholders is None:
+            placeholders = len(image_parts(messages))
+        base += IMAGE_TOKEN * placeholders
         self = super().__new__(cls, base + ("<gen>" if generation_prompt else ""))
         self.messages = messages
         return self
@@ -82,6 +99,8 @@ class Rendered(str):
 class FakeProcessor:
     """Stands in for transformers' processor: the stub tokenizer's text,
     each image part `image_tokens` placeholders, random pixels."""
+
+    image_token = IMAGE_TOKEN
 
     class Tok:
         bos_token = "<bos>"
@@ -275,8 +294,14 @@ def test_frontend_builds_spans_and_caches_by_digest():
     third = front.build(messages, [a, png(3)], {})
     assert front.images_encoded == 3 and front.tower.encode.grids == [[[1, 2, 6]]]
     assert mx.array_equal(third.spans[0].features, built.spans[0].features)
-    with pytest.raises(ValueError, match="do not match the images"):
+    # More images than image parts is the engine's mistake (it makes both
+    # in one step), caught before the template renders - cold or warm.
+    with pytest.raises(Exception, match="3 images for 2 image parts") as exc:
         front.build(messages, [a, b, png(9)], {})
+    assert exc.type is RuntimeError
+    with pytest.raises(Exception, match="3 images for 2 image parts") as exc:
+        front.build(messages, [a, b, png(3)], {})
+    assert exc.type is RuntimeError
     with pytest.raises(ValueError, match="not a readable image"):
         front.build(messages, [Image(b"nope"), b], {})
 
@@ -471,8 +496,10 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
     assert mx.allclose(out, expected)
 
     class Proc:
+        image_token = "[IMG]"
+
         def apply_chat_template(self, messages, **kw):
-            return messages
+            return "[IMG]" * len(image_parts(messages))
 
         def __call__(self, text, images=None, return_tensors="np"):
             # 2x1 merged tokens as one row of two [IMG] then [IMG_BREAK] (63),
@@ -545,6 +572,12 @@ def test_mistral3_family_merges_and_deals_features_over_broken_runs():
         "source": "mistral-common",
         "class": "MistralCommonBackend",
     }
+    # A tower whose image_token_id is not the processor's placeholder: the
+    # template placed its tokens, the spans find none - the engine's error.
+    t.image_token_id = 61
+    with pytest.raises(Exception, match="image tokens") as exc:
+        front.build(messages, [png(5), png(6)], {})
+    assert exc.type is RuntimeError
 
 
 class FakeTokenizer:
@@ -1066,8 +1099,10 @@ def test_gemma4_unified_embeds_patches_and_marks_its_spans_as_blocks(tmp_path):
 
     # The frontend: soft-token runs become block spans.
     class Proc:
+        image_token = "<|image|>"
+
         def apply_chat_template(self, messages, **kw):
-            return messages
+            return "<|image|>" * len(image_parts(messages))
 
         def __call__(self, text, images=None, return_tensors="np"):
             ids = [2, 6, 3, 61, 62, 62, 62, 62, 62, 62, 60, 61, 62, 62, 62, 60, 7]
@@ -1352,3 +1387,317 @@ def test_granite_engine_path_matches_a_direct_forward():
             )
         ]
     assert out == reference(model, tokens, [span], 5)
+
+
+TWO_PARTS = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "w1"},
+            {"type": "image"},
+            {"type": "image"},
+        ],
+    }
+]
+
+
+def _warnings(caplog):
+    return [
+        r
+        for r in caplog.records
+        if r.name == "beam.vision" and r.levelname == "WARNING"
+    ]
+
+
+def test_a_processor_failure_is_the_client_s_refusal_with_its_traceback_logged(
+    caplog,
+):
+    """Whatever the processor raises is the client's 400 - transformers
+    reports a literal placeholder in the text with a bare StopIteration -
+    but its traceback goes to the log, in case the engine was at fault."""
+    import logging
+
+    class Choking(FakeProcessor):
+        def __call__(self, text, images=None, return_tensors="np", **kw):
+            raise StopIteration()
+
+    front = VisionFrontend(Choking([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with caplog.at_level(logging.WARNING, logger="beam.vision"):
+        with pytest.raises(
+            Exception, match=r"the processor refused the request \(StopIteration"
+        ) as exc:
+            front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is ValueError
+    (record,) = _warnings(caplog)
+    assert record.exc_info[0] is StopIteration
+    assert front.images_encoded == 0
+
+
+def test_a_renderer_failure_is_the_client_s_refusal_too():
+    """mistral-common refuses a message with its own exception type."""
+
+    class TokenizerException(Exception):
+        pass
+
+    class Backend:
+        def apply_chat_template(self, messages, tokenize=True, return_dict=True, **kw):
+            raise TokenizerException("Invalid assistant message")
+
+    # The tower is never reached: the renderer refuses first.
+    front = VisionFrontend(None, object(), "mistral3", renderer=Backend())
+    with pytest.raises(
+        Exception,
+        match=r"the renderer refused the request \(TokenizerException: Invalid",
+    ) as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is ValueError
+
+
+def test_more_images_than_image_parts_are_refused_before_the_renderer():
+    """The engine makes the image part and the image in one step; a count
+    that differs is its own mistake, not the client's - and it is caught
+    before mistral-common renders."""
+
+    class Backend:
+        def __init__(self):
+            self.seen = []
+
+        def apply_chat_template(self, messages, tokenize=True, return_dict=True, **kw):
+            self.seen.append(messages)
+            return {"input_ids": [2, 6, 3, 62, 60, 7], "pixel_values": []}
+
+    backend = Backend()
+    front = VisionFrontend(None, object(), "mistral3", renderer=backend)
+    one_part = [{"role": "user", "content": [{"type": "image"}]}]
+    with pytest.raises(Exception, match="2 images for 1 image parts") as exc:
+        front.build(one_part, [png(1), png(2)], {})
+    assert exc.type is RuntimeError
+    assert backend.seen == []
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [ValueError("shapes do not broadcast"), StopIteration()],
+    ids=["ValueError", "StopIteration"],
+)
+def test_a_tower_failure_is_the_server_s_error_whatever_its_type(raised):
+    """MLX reports a shape error as ValueError, the client's type; a
+    contextmanager generator would hand a StopIteration on as itself.
+    Both come out of the tower as RuntimeError with the original as cause."""
+    front = VisionFrontend(FakeProcessor([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+
+    def failing(pixel_values, grid_thw):
+        raise raised
+
+    front.tower.encode = failing
+    with pytest.raises(Exception, match="the vision tower failed") as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError and exc.value.__cause__ is raised
+
+
+def test_an_image_part_the_template_drops_is_refused_before_the_processor():
+    """A template that renders no placeholder for an image part (Qwen3.5's
+    drops the image of an assistant turn before the last user message when
+    the image comes before a `</think>` in that turn's text): the processor
+    would still take the image and carry its grid, and the mismatch would
+    surface in the engine. It is the client's 400, found in the text."""
+
+    class Swallowing(FakeProcessor):
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kw
+        ):
+            return Rendered(messages, self.with_bos, add_generation_prompt, 1)
+
+        def __call__(self, text, images=None, return_tensors="np", **kw):
+            out = super().__call__(text, images, return_tensors, **kw)
+            ids = list(out["input_ids"][0])
+            t, h, w = self.grids[1]
+            image = TOWER_CONFIG["image_token_id"]
+            last = max(i for i, v in enumerate(ids) if v == image)
+            del ids[last + 1 - t * h * w // MERGE**2 : last + 1]
+            out["input_ids"] = np.array([ids])
+            return out
+
+    proc = Swallowing([(1, 4, 4), (1, 2, 6)])
+    front = VisionFrontend(proc, tower(), "qwen3_vl")
+    with pytest.raises(
+        ValueError, match="the chat template placed 1 image placeholders for 2 images"
+    ):
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert proc.calls == [] and front.images_encoded == 0
+
+
+def test_a_grid_too_many_from_the_processor_is_the_engine_s_error():
+    """The processor's grids for images whose count the text already
+    confirmed: one more is the processor's fault, not the client's."""
+
+    class Padding(FakeProcessor):
+        def __call__(self, text, images=None, return_tensors="np", **kw):
+            out = super().__call__(text, images, return_tensors, **kw)
+            extra = (1, 2, 2)
+            out["pixel_values"] = np.concatenate([out["pixel_values"], pixels(extra)])
+            out["image_grid_thw"] = np.concatenate([out["image_grid_thw"], [extra]])
+            return out
+
+    front = VisionFrontend(Padding([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with pytest.raises(Exception, match="do not match the images") as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError
+
+
+def test_a_tower_token_id_that_is_not_the_placeholder_is_the_engine_s_error():
+    """The template placed its placeholders (counted), the processor
+    expanded them; a tower looking for another id finds none - the
+    positions report it, as the engine's error."""
+    front = VisionFrontend(FakeProcessor([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    front.tower.image_token_id = 63
+    with pytest.raises(Exception, match="the image positions failed") as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert "fewer image placeholders" in str(exc.value.__cause__)
+
+
+def test_the_template_s_own_verdict_passes_unwrapped_and_unlogged(caplog):
+    import logging
+
+    from jinja2.exceptions import TemplateError
+
+    class Strict(FakeProcessor):
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kw
+        ):
+            raise TemplateError("roles must alternate")
+
+    front = VisionFrontend(Strict([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with caplog.at_level(logging.WARNING, logger="beam.vision"):
+        with pytest.raises(TemplateError, match="roles must alternate") as exc:
+            front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is TemplateError and _warnings(caplog) == []
+
+
+def test_a_renderer_s_mismatched_pixel_arrays_are_the_server_s_error():
+    """mistral-common's images come back one array each and are padded to
+    one size for the tower; arrays that do not fit together (a channel
+    count that differs) are the renderer's fault, not the client's."""
+
+    class Backend:
+        def apply_chat_template(self, messages, tokenize=True, return_dict=True, **kw):
+            return {
+                "input_ids": [2, 6, 62, 62, 7],
+                "pixel_values": [np.zeros((3, 4, 4)), np.zeros((2, 4, 4))],
+                "image_sizes": [[4, 4], [4, 4]],
+            }
+
+    front = VisionFrontend(None, object(), "mistral3", renderer=Backend())
+    with pytest.raises(Exception, match="the renderer's output failed") as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError
+    assert isinstance(exc.value.__cause__, ValueError)
+
+
+def test_a_generation_prompt_that_cannot_be_located_is_logged(caplog):
+    """`assistant_start` 0 is the whole prompt: the frame is not located,
+    so the reasoning check and the parser read the whole prompt, and no
+    boundary can be claimed at the generation prompt. The log says why -
+    the template would not render without the generation prompt, what it
+    rendered is no prefix of the prompt, or the frame's ids are not the
+    prompt's tail."""
+    import logging
+
+    class Refusing(FakeProcessor):
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kw
+        ):
+            if not add_generation_prompt:
+                raise ValueError("add_generation_prompt is required")
+            return super().apply_chat_template(
+                messages, tokenize, add_generation_prompt, **kw
+            )
+
+    class Elsewhere(FakeProcessor):
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kw
+        ):
+            rendered = super().apply_chat_template(
+                messages, tokenize, add_generation_prompt, **kw
+            )
+            return rendered if add_generation_prompt else "<other>" + rendered
+
+    class Mismatched(FakeProcessor):
+        class Tok(FakeProcessor.Tok):
+            def encode(self, text, add_special_tokens=True):
+                return (
+                    [8] if text == "<gen>" else super().encode(text, add_special_tokens)
+                )
+
+        tokenizer = Tok()
+
+    cases = (
+        (Refusing, "will not render without the generation prompt (ValueError"),
+        (Elsewhere, "does not start"),
+        (Mismatched, "not the prompt's tail"),
+    )
+    for cls, why in cases:
+        front = VisionFrontend(cls([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="beam.vision"):
+            built = front.build(TWO_PARTS, [png(1), png(2)], {})
+        assert built.assistant_start == 0
+        logged = [r.getMessage() for r in _warnings(caplog)]
+        assert len(logged) == 1 and "assistant_start 0" in logged[0], logged
+        assert why in logged[0], logged
+
+
+def test_a_template_failure_is_the_client_s_refusal_naming_the_template():
+    """A template that fails with another type than its own verdict is
+    still the client's 400, and the message names the template, not the
+    processor."""
+
+    class Broken(FakeProcessor):
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kw
+        ):
+            raise KeyError("bos_token")
+
+    front = VisionFrontend(Broken([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with pytest.raises(
+        Exception, match=r"the template refused the request \(KeyError"
+    ) as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is ValueError and exc.value.__cause__.__class__ is KeyError
+
+
+def test_a_processor_output_without_integer_ids_is_the_server_s_error():
+    """The processor took the request; ids that are no integers are its
+    output's fault, the server's 500 - named as the output, not the tower."""
+
+    class Garbled(FakeProcessor):
+        def __call__(self, text, images=None, return_tensors="np", **kw):
+            out = super().__call__(text, images, return_tensors, **kw)
+            out["input_ids"] = np.full_like(out["input_ids"], np.nan, dtype=float)
+            return out
+
+    front = VisionFrontend(Garbled([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with pytest.raises(Exception, match="the processor's output failed") as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError and isinstance(exc.value.__cause__, ValueError)
+
+
+def test_a_processor_output_without_the_pixel_arrays_is_the_output_s_error():
+    """The family reads the pixel arrays out of the processor's output on
+    the way to the tower; a key missing there is the output's fault, the
+    server's 500 - named as the output, not the tower."""
+
+    class Gridless(FakeProcessor):
+        def __call__(self, text, images=None, return_tensors="np", **kw):
+            out = super().__call__(text, images, return_tensors, **kw)
+            del out["image_grid_thw"]
+            return out
+
+    front = VisionFrontend(Gridless([(1, 4, 4), (1, 2, 6)]), tower(), "qwen3_vl")
+    with pytest.raises(
+        Exception, match=r"the processor's output failed \(KeyError"
+    ) as exc:
+        front.build(TWO_PARTS, [png(1), png(2)], {})
+    assert exc.type is RuntimeError and exc.value.__cause__.__class__ is KeyError
