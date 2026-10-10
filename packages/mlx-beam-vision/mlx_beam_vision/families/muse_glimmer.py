@@ -76,9 +76,13 @@ class Tower:
             for k, v in loaded.part("vision_tower").items()
             if "rotary_emb.inv_freq" not in k
         }
-        loaded.fit(self.model, tower, self.dtype)
-        loaded.fit(self.vision_adapter, loaded.part("vision_adapter"), self.dtype)
-        loaded.fit(self.vision_projection, loaded.part("vision_projection"), self.dtype)
+        self.model = loaded.fit(self.model, tower, self.dtype)
+        self.vision_adapter = loaded.fit(
+            self.vision_adapter, loaded.part("vision_adapter"), self.dtype
+        )
+        self.vision_projection = loaded.fit(
+            self.vision_projection, loaded.part("vision_projection"), self.dtype
+        )
         mx.eval(
             self.model.parameters(),
             self.vision_adapter.parameters(),

@@ -93,7 +93,9 @@ class Tower:
 
     def load(self, model_path: Path) -> None:
         loaded = Loaded(model_path, PARTS, self.checkpoint)
-        loaded.fit(self.model, self.model.sanitize(loaded.part(*PARTS)), self.dtype)
+        self.model = loaded.fit(
+            self.model, self.model.sanitize(loaded.part(*PARTS)), self.dtype
+        )
         mx.eval(self.model.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized

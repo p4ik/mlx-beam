@@ -121,6 +121,11 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   loads it, only the missing one from the model and the class defaults,
   the tokenizer, chat template and top-level values the checkpoint's;
   `/health.vision.processor.built` names the parts that were built.
+- Muse Glimmer's 8-bit conversions were still refused since 0.1.0a5:
+  their projection to the text width is one bare linear, a part of its
+  own, and the loader swapped only the children of a part for their
+  quantized form, never the part itself, so its packed tensors did not
+  fit. A part that is itself a packed layer is now loaded as such.
 
 ## [0.1.0a10] - 2026-10-04
 

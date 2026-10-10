@@ -98,11 +98,15 @@ class Tower:
             for k, v in loaded.part("vision_tower").items()
             if "position_ids" not in k
         }
-        loaded.fit(self.model, self.model.sanitize(tower), self.dtype)
+        self.model = loaded.fit(self.model, self.model.sanitize(tower), self.dtype)
         for i, proj in enumerate(self.layerwise_projectors):
-            loaded.fit(proj, loaded.part(f"layerwise_projectors.{i}"), self.dtype)
+            self.layerwise_projectors[i] = loaded.fit(
+                proj, loaded.part(f"layerwise_projectors.{i}"), self.dtype
+            )
         for i, proj in enumerate(self.spatial_projectors):
-            loaded.fit(proj, loaded.part(f"spatial_projectors.{i}"), self.dtype)
+            self.spatial_projectors[i] = loaded.fit(
+                proj, loaded.part(f"spatial_projectors.{i}"), self.dtype
+            )
         if self.config.use_image_newline_parameter:
             newline = loaded.tensor("image_newline")
             if newline is None:

@@ -114,30 +114,45 @@ class Loaded:
     def tensor(self, name: str) -> mx.array | None:
         return self.weights.get(name)
 
-    def fit(self, module: nn.Module, weights: dict[str, mx.array], dtype) -> None:
-        """`module` takes `weights` (names relative to it), strictly. A
-        layer whose tensors come packed is swapped for its quantized form
-        first, with the bits and group size the tensors themselves imply:
-        a packed weight holds `in * bits / 32` words per row and its scales
-        `in / group_size`, and the layer knows `in`. The mode (affine or
-        mxfp4) is the checkpoint-wide one from config.json's quantization;
-        no checkpoint writes it per layer."""
+    def fit(self, module: nn.Module, weights: dict[str, mx.array], dtype) -> nn.Module:
+        """`module` takes `weights` (names relative to it), strictly, and is
+        handed back: a layer whose tensors come packed is swapped for its
+        quantized form first - a child of `module` in place, `module`
+        itself (a part that is one bare layer) as the return value, so the
+        caller keeps what it gets. The mode (affine or mxfp4) is the
+        checkpoint-wide one from config.json's quantization; no checkpoint
+        writes it per layer."""
         if self.quantized:
             mode = self.quantization.get("mode", "affine")
-
-            def predicate(path: str, m: nn.Module):
-                if not hasattr(m, "to_quantized") or f"{path}.scales" not in weights:
-                    return False
-                width = m.weight.shape[-1]
-                packed, scales = weights[f"{path}.weight"], weights[f"{path}.scales"]
-                return {
-                    "bits": packed.shape[-1] * 32 // width,
-                    "group_size": width // scales.shape[-1],
-                    "mode": mode,
-                }
-
-            nn.quantize(module, class_predicate=predicate)
+            packed = packed_as(module, weights, "", mode)
+            if packed is not None:
+                # nn.quantize swaps leaf modules only, never the root.
+                module = module.to_quantized(**packed)
+            else:
+                nn.quantize(
+                    module,
+                    class_predicate=lambda path, m: packed_as(m, weights, path, mode)
+                    or False,
+                )
         module.load_weights(cast(weights, dtype), strict=True)
+        return module
+
+
+def packed_as(module: nn.Module, weights: dict[str, mx.array], path: str, mode: str):
+    """The `to_quantized` arguments a layer's packed tensors imply, or None
+    when the tensors at `path` (relative to `weights`, "" for the root) are
+    not packed: a packed weight holds `in * bits / 32` words per row and
+    its scales `in / group_size`, and the layer knows `in`."""
+    at = f"{path}." if path else ""
+    if not hasattr(module, "to_quantized") or f"{at}scales" not in weights:
+        return None
+    width = module.weight.shape[-1]
+    packed, scales = weights[f"{at}weight"], weights[f"{at}scales"]
+    return {
+        "bits": packed.shape[-1] * 32 // width,
+        "group_size": width // scales.shape[-1],
+        "mode": mode,
+    }
 
 
 def cast(weights: dict[str, mx.array], dtype) -> list[tuple[str, mx.array]]:

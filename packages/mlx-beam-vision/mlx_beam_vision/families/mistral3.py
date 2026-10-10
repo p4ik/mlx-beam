@@ -122,8 +122,10 @@ class Tower:
         weights = self.model.sanitize(
             tower_keys(loaded.part("vision_tower", "vision_encoder"))
         )
-        loaded.fit(self.model, weights, self.dtype)
-        loaded.fit(self.projector, loaded.part("multi_modal_projector"), self.dtype)
+        self.model = loaded.fit(self.model, weights, self.dtype)
+        self.projector = loaded.fit(
+            self.projector, loaded.part("multi_modal_projector"), self.dtype
+        )
         mx.eval(self.model.parameters(), self.projector.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized

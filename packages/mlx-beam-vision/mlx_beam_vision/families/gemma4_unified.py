@@ -108,8 +108,8 @@ class Tower:
             embedder = {
                 k: v for k, v in embedder.items() if not k.startswith("multimodal_")
             }
-        loaded.fit(self.embedder, embedder, self.dtype)
-        loaded.fit(self.projection, projection, self.dtype)
+        self.embedder = loaded.fit(self.embedder, embedder, self.dtype)
+        self.projection = loaded.fit(self.projection, projection, self.dtype)
         mx.eval(self.embedder.parameters(), self.projection.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
