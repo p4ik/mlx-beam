@@ -5,6 +5,7 @@ and the whole path through mlx-beam's engine against a direct forward."""
 
 import io
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mlx.core as mx
@@ -890,6 +891,72 @@ def test_mistral3_loads_the_hf_layout_and_mlx_vlms(tmp_path):
         t = mistral3.Tower(config, path, dtype=mx.float32)
         assert t.loaded_from == ["model.safetensors"]
         assert mx.allclose(t.encode(pv, [(64, 64)])[0].features, want, atol=1e-5)
+
+
+def test_a_tower_loaded_through_the_registry_encodes_in_another_thread(tmp_path):
+    """The Pixtral tower builds its rotary table while it loads, an array
+    outside parameters(); the tower then encodes in request threads. Loaded
+    the way the server loads it, that table must be evaluated already: the
+    worker builds the pixels and evaluates the features itself."""
+    from mlx.utils import tree_flatten
+    from mlx_beam_vision.families import mistral3
+
+    config = {
+        "model_type": "mistral3",
+        "image_token_id": 62,
+        "vision_config": {
+            "model_type": "pixtral",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "head_dim": 16,
+            "image_size": 64,
+            "patch_size": 16,
+            "num_channels": 3,
+        },
+        "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
+    }
+    mx.random.seed(1)
+    source = mistral3.Tower(config, None, dtype=mx.float32)
+    mx.eval(source.model.parameters(), source.projector.parameters())
+    weights = {
+        **{f"vision_tower.{k}": v for k, v in tree_flatten(source.model.parameters())},
+        **{
+            f"multi_modal_projector.{k}": v
+            for k, v in tree_flatten(source.projector.parameters())
+        },
+    }
+    stored = {
+        k: (v.transpose(0, 3, 1, 2) if "patch_conv.weight" in k else v)
+        for k, v in weights.items()
+    }
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+
+    class MistralCommonBackend:  # the tekken path: no processor is read
+        chat_template = None
+
+    class Wrapper:
+        def __init__(self, inner):
+            self._tokenizer = inner
+
+    modalities.register(provider)
+    try:
+        loaded, reason = modalities.load_frontend(
+            tiny_qwen35(), tmp_path, config, Wrapper(MistralCommonBackend())
+        )
+    finally:
+        modalities._registered.remove(provider)
+    assert reason is None and loaded.tower.loaded_from == ["model.safetensors"]
+
+    def encode():
+        pv = mx.array(np.random.RandomState(0).randn(1, 64, 64, 3).astype(np.float32))
+        features = [e.features for e in loaded.tower.encode(pv, [(64, 64)])]
+        mx.eval(*features)
+        return [f.shape for f in features]
+
+    with ThreadPoolExecutor(1) as pool:
+        assert pool.submit(encode).result() == [(4, 32)]
 
 
 def test_gemma4_unified_embeds_patches_and_marks_its_spans_as_blocks(tmp_path):

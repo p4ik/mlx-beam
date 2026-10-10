@@ -25,6 +25,7 @@ from mlx_beam.engine.proposer import (
 from mlx_beam.engine.request import SamplingParams
 from mlx_beam.engine.speculative import rollback_recurrent
 from mlx_beam.engine.thinking import ReasoningLimits
+from tests.lazy_arrays import Table, computed_in_another_thread, lazy
 from tests.test_engine import TINY_QWEN35_WRAPPED
 from tests.test_vendor_mlx_lm import TINY_HYBRID
 
@@ -617,6 +618,42 @@ def test_proposer_that_drafts_nothing_fails_the_warm_up():
     engine = Engine(tiny_qwen35(), proposer=Silent())
     with pytest.raises(EngineDead, match="drafted nothing"):
         engine.start()
+
+
+def test_a_lazy_array_on_a_headless_proposer_is_evaluated_at_start():
+    """The contract asks for no `head`: a proposer's own tables are
+    evaluated with the model's before the worker starts, so another
+    thread can compute with them."""
+    proposer = FixedDraftProposer([1, 2, 3])
+    proposer.table = Table(lazy())
+    engine = Engine(tiny_qwen35(), proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    with engine:
+        assert engine.alive
+        assert computed_in_another_thread(proposer.table.values) == [
+            1.0,
+            3.0,
+            5.0,
+            7.0,
+        ]
+
+
+def test_a_lazy_array_on_the_proposer_head_is_evaluated_at_start():
+    """A head's rotary table lives beside its parameters, the way a rope
+    module keeps its frequencies: evaluated with the head."""
+    proposer = FixedDraftProposer([1, 2, 3])
+    proposer.head = nn.Linear(2, 2)
+    proposer.head.table = Table(lazy())
+    engine = Engine(tiny_qwen35(), proposer=proposer, max_draft_tokens=3)
+    engine.warmup_tokens = [1]
+    with engine:
+        assert engine.alive
+        assert computed_in_another_thread(proposer.head.table.values) == [
+            1.0,
+            3.0,
+            5.0,
+            7.0,
+        ]
 
 
 # -- the bundled head ------------------------------------------------------
