@@ -293,6 +293,7 @@ def parse_messages_request(
         max_reasoning_tokens=max_reasoning,
         template_kwargs=template_kwargs,
         images=images or [],
+        surface="messages",
     )
     return MessagesRequest(chat=chat, stream=chat.stream)
 

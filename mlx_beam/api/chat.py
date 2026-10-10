@@ -83,6 +83,9 @@ class ChatRequest:
     # built (GenerationRequest.positions); None and 0 for text.
     positions: Any = None
     rope_delta: int = 0
+    # The API the request came in on (chat, messages, responses): a refusal
+    # names that surface's own fields.
+    surface: str = "chat"
 
 
 def _number(body, key, default, lo=None, hi=None, kind=float):
@@ -469,7 +472,7 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     if not req.images:
         req.assistant_start = _assistant_start(render, tokens, settled)
     if kwargs.get("enable_thinking") is False:
-        no_switch(tokenizer)
+        no_switch(tokenizer, req.surface)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False and not req.tools:
         # A family whose template has no switch (Harmony, Muse): the answer
@@ -481,20 +484,49 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     return tokens
 
 
-def no_switch(tokenizer) -> None:
+# Per surface: the hint with an effort level, the hint with the bound only,
+# and the field the refusal names. Messages has no effort field.
+_NO_SWITCH_HINTS = {
+    "chat": (
+        "ask for less with reasoning_effort: low or bound it with "
+        "max_reasoning_tokens",
+        "bound it with max_reasoning_tokens",
+        "enable_thinking",
+    ),
+    "messages": (
+        None,
+        "bound it with thinking: {type: enabled, budget_tokens: N} instead",
+        "thinking",
+    ),
+    "responses": (
+        "ask for less with reasoning.effort: low or bound it with "
+        "reasoning.max_tokens",
+        "bound it with reasoning.max_tokens",
+        "reasoning.effort",
+    ),
+}
+
+
+def no_switch(tokenizer, surface: str) -> None:
     """A model that thinks but cannot be told not to: its template has no
     switch and the family's answer cannot be opened in the prompt either
     (Muse keeps reasoning inside a primed answer, measured). The request
-    is refused rather than answered with a block in disguise."""
-    if getattr(tokenizer, "has_thinking", False) and (
-        getattr(tokenizer, "thinking_switch", "template") is None
+    is refused rather than answered with a block in disguise; the hint
+    names the surface's own fields, an effort level only where the
+    template takes a word."""
+    if not getattr(tokenizer, "has_thinking", False) or (
+        getattr(tokenizer, "thinking_switch", "template") is not None
     ):
-        raise ApiError(
-            "this model cannot switch its reasoning off: the chat template "
-            "has no switch for it; ask for less with reasoning_effort: low "
-            "or bound it with max_reasoning_tokens",
-            param="enable_thinking",
-        )
+        return
+    with_effort, bound, param = _NO_SWITCH_HINTS.get(surface, _NO_SWITCH_HINTS["chat"])
+    hint = bound
+    if with_effort and effort_capability(tokenizer).takes_words:
+        hint = with_effort
+    raise ApiError(
+        "this model cannot switch its reasoning off: the chat template "
+        f"has no switch for it; {hint}",
+        param=param,
+    )
 
 
 def _assistant_start(render, tokens: list[int], extra: dict) -> int:
