@@ -112,6 +112,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   a video processor (Qwen3-VL, Qwen3.5, Gemma 4, Muse Glimmer) still
   came up without vision: the loader passed that mapping on as a class
   name. The video processor is now picked like the image processor.
+- A checkpoint whose `processor_config.json` has no block for one of the
+  parts its processor class takes (the files of Gemma 4's encoder-free
+  models - the 12B and up - and of Muse Glimmer have none for the video
+  processor) came up without vision since 0.1.0a5: transformers refuses
+  such a file, and the loader passed that on. The processor is now put
+  together from the file - every part the file describes as transformers
+  loads it, only the missing one from the model and the class defaults,
+  the tokenizer, chat template and top-level values the checkpoint's;
+  `/health.vision.processor.built` names the parts that were built.
 
 ## [0.1.0a10] - 2026-10-04
 

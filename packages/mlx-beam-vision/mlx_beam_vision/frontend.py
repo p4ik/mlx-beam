@@ -467,7 +467,9 @@ def load_processor(
     ships no preprocessor_config.json (mlx-community's conversions leave it
     out) gets one built from what it does carry - see `build_processor`;
     without a config to build from, that checkpoint is refused here rather
-    than with a KeyError on the first image."""
+    than with a KeyError on the first image. A processor_config.json that
+    AutoProcessor refuses for a part it has no block for is put together
+    from the parts it has - see `assemble_processor`."""
     from transformers import AutoProcessor
 
     shipped = any(
@@ -478,12 +480,15 @@ def load_processor(
         processor = AutoProcessor.from_pretrained(
             str(model_path), trust_remote_code=trust_remote_code
         )
-    except OSError:
+    except OSError as e:
         # "Can't load image processor": AutoProcessor knows the model type
         # and looked for the file; a missing directory would have failed
         # when the text model loaded.
         if shipped:
-            raise
+            file = _processor_file(model_path)
+            if config is None or file is None:
+                raise
+            return assemble_processor(model_path, config, file, trust_remote_code, e)
         processor = None
     if processor is not None and getattr(processor, "image_processor", None):
         return processor, {"source": "checkpoint", "class": type(processor).__name__}
@@ -496,11 +501,159 @@ def load_processor(
     return build_processor(model_path, config, trust_remote_code)
 
 
+def _processor_file(model_path: Path) -> dict | None:
+    """processor_config.json when the checkpoint ships one with an
+    image_processor block, else None (no file, no block, not JSON)."""
+    import json
+
+    path = model_path / "processor_config.json"
+    if not path.is_file():
+        return None
+    try:
+        file = json.loads(path.read_text())
+    except ValueError:
+        return None
+    if isinstance(file, dict) and isinstance(file.get("image_processor"), dict):
+        return file
+    return None
+
+
+PART_NAMES = ("image_processor", "video_processor", "feature_extractor")
+"""The parts a processor keeps beside its tokenizer, in the order
+`classes_for` lists their classes after the processor's."""
+
+
+def assemble_processor(
+    model_path: Path, config: dict, file: dict, trust_remote_code: bool, failed: OSError
+):
+    """The processor put together from processor_config.json when
+    AutoProcessor failed on it (`failed`): a file that has no block for one
+    of the parts the class takes (a video processor, say). Every part with
+    a block is loaded the way transformers loads it; only a part without
+    one is built from the model and the class defaults; the tokenizer, the
+    top-level values and the chat template are the checkpoint's. The
+    second value says what was built. Anything that fails here - a part
+    that cannot be built, a class the file names otherwise, no part missing
+    at all - is logged with its traceback and raised as an OSError that
+    names the reason first, with its type, then `failed`'s text, so the
+    health shows both."""
+    try:
+        return _assemble(model_path, config, file, trust_remote_code, failed)
+    except Exception as e:  # noqa: BLE001 - whatever a part or transformers raises
+        logger.warning(
+            "%s: processor_config.json could not be assembled into a processor: %s",
+            model_path,
+            e,
+            exc_info=True,
+        )
+        raise OSError(
+            f"assembling: {type(e).__name__}: {e}; AutoProcessor: {failed}"
+        ) from e
+
+
+def _part_block(file: dict, name: str):
+    """The part's block in processor_config.json; a feature extractor's may
+    stand under `audio_processor`, as transformers reads it."""
+    block = file.get(name)
+    if block is None and name == "feature_extractor":
+        block = file.get("audio_processor")
+    return block
+
+
+def _assemble(
+    model_path: Path, config: dict, file: dict, trust_remote_code: bool, failed
+):
+    from transformers import (
+        AutoFeatureExtractor,
+        AutoImageProcessor,
+        AutoTokenizer,
+        AutoVideoProcessor,
+    )
+
+    # A part with a block in the file is loaded by the Auto class of its
+    # modality, which reads the block and picks class and backend the way
+    # AutoProcessor does; a part under any other name is not assembled.
+    auto = {
+        "image_processor": AutoImageProcessor,
+        "feature_extractor": AutoFeatureExtractor,
+        "video_processor": AutoVideoProcessor,
+    }
+    model_type = str(config.get("model_type", ""))
+    processor_cls, *part_classes = classes_for(model_type)
+    named = file.get("processor_class")
+    if named and named != processor_cls.__name__:
+        raise ValueError(
+            f"processor_config.json names {named}, transformers' processor for "
+            f"model type {model_type!r} is {processor_cls.__name__}"
+        )
+    from_class = dict(zip(PART_NAMES, part_classes, strict=True))
+    values = ModelValues(config)
+    args, built, defaults_used = [], [], {}
+    for name in processor_cls.get_attributes():
+        if name == "tokenizer":
+            args.append(
+                AutoTokenizer.from_pretrained(
+                    str(model_path), trust_remote_code=trust_remote_code
+                )
+            )
+        elif name not in auto:
+            raise ValueError(
+                f"{processor_cls.__name__} takes a {name}, which this loader "
+                "does not assemble"
+            )
+        elif isinstance(_part_block(file, name), dict):
+            args.append(
+                auto[name].from_pretrained(
+                    str(model_path), trust_remote_code=trust_remote_code
+                )
+            )
+        else:
+            cls = from_class[name]
+            if cls is None:
+                raise ValueError(
+                    f"processor_config.json has no {name} block and transformers "
+                    f"has no {name} for model type {model_type!r}"
+                )
+            part, defaults_used[cls.__name__] = part_from_model(cls, values)
+            args.append(part)
+            built.append(name)
+    if not built:
+        # Another processor than the file's could come out, for a reason
+        # nobody named.
+        raise ValueError(
+            "every part the class takes has a block in the file, so "
+            "AutoProcessor's failure is not a missing part"
+        )
+    processor_dict, _ = processor_cls.get_processor_dict(str(model_path))
+    processor = processor_cls.from_args_and_dict(args, processor_dict)
+    logger.warning(
+        "%s: AutoProcessor could not load processor_config.json (%s); %s "
+        "assembled from its parts, %s built from the model (%s)",
+        model_path,
+        failed,
+        processor_cls.__name__,
+        ", ".join(built),
+        ", ".join(f"{k} from {v}" for k, v in sorted(values.origin.items())),
+    )
+    return processor, {
+        "source": "checkpoint",
+        "class": processor_cls.__name__,
+        "built": built,
+        "from_model": dict(sorted(values.origin.items())),
+        "defaults": defaults_used,
+    }
+
+
 def classes_for(model_type: str):
-    """transformers' own (processor, image processor, video processor or
-    None) for a model type; the image class per backend - torchvision when
-    it is installed, PIL otherwise - as AutoImageProcessor picks it, the
-    video class likewise, None without torchvision."""
+    """transformers' own (processor, image processor, video processor,
+    feature extractor) for a model type, None where it has none of a kind;
+    the image class per backend - torchvision when it is installed, PIL
+    otherwise - as AutoImageProcessor picks it, the video class likewise,
+    None without torchvision."""
+    from transformers.models.auto.feature_extraction_auto import (
+        FEATURE_EXTRACTOR_MAPPING_NAMES,
+        feature_extractor_class_from_name,
+    )
     from transformers.models.auto.image_processing_auto import (
         IMAGE_PROCESSOR_MAPPING_NAMES,
         get_image_processor_class_from_name,
@@ -520,15 +673,16 @@ def classes_for(model_type: str):
     image = _class_name(IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
     if not proc or not image:
         raise ValueError(
-            f"the checkpoint ships no preprocessor_config.json and transformers "
-            f"has no processor for model type {model_type!r}, so images cannot "
-            "be prepared"
+            f"transformers has no processor for model type {model_type!r}, so "
+            "images cannot be prepared"
         )
     video = _class_name(VIDEO_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
+    feature = _class_name(FEATURE_EXTRACTOR_MAPPING_NAMES.get(model_type), backend)
     return (
         processor_class_from_name(proc),
         get_image_processor_class_from_name(image),
         video_processor_class_from_name(video) if video else None,
+        feature_extractor_class_from_name(feature) if feature else None,
     )
 
 
@@ -601,6 +755,15 @@ def _defaults(cls) -> dict:
     return {k: getattr(cls, k) for k in keys if hasattr(cls, k)}
 
 
+def part_from_model(cls, values: ModelValues):
+    """One part (an image or video processor) from the model first and the
+    class's defaults where the model says nothing; the second value names
+    the keys left at the defaults."""
+    defaults = _defaults(cls)
+    kwargs = values.fill(cls, defaults, defaults)
+    return cls(**kwargs), sorted(k for k in defaults if k not in kwargs)
+
+
 def build_processor(model_path: Path, config: dict, trust_remote_code: bool = False):
     """A processor for a checkpoint without preprocessor_config.json, from
     the model first and the class's defaults only where the model says
@@ -614,7 +777,7 @@ def build_processor(model_path: Path, config: dict, trust_remote_code: bool = Fa
     from transformers import AutoTokenizer
 
     model_type = str(config.get("model_type", ""))
-    processor_cls, image_cls, video_cls = classes_for(model_type)
+    processor_cls, image_cls, video_cls, _ = classes_for(model_type)
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path), trust_remote_code=trust_remote_code
     )
@@ -624,10 +787,7 @@ def build_processor(model_path: Path, config: dict, trust_remote_code: bool = Fa
     for name, cls in (("image_processor", image_cls), ("video_processor", video_cls)):
         if cls is None:
             continue
-        defaults = _defaults(cls)
-        kwargs = values.fill(cls, defaults, defaults)
-        parts[name] = cls(**kwargs)
-        defaults_used[cls.__name__] = sorted(k for k in defaults if k not in kwargs)
+        parts[name], defaults_used[cls.__name__] = part_from_model(cls, values)
     attributes = set(processor_cls.get_attributes())
     parts = {k: v for k, v in parts.items() if k in attributes}
     extra = {}

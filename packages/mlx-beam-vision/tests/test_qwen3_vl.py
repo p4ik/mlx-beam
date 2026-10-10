@@ -712,7 +712,7 @@ def test_a_processor_is_built_from_the_model_before_the_class_defaults(
         "vision_config": {"image_size": 1540, "patch_size": 14, "hidden_size": 1024},
     }
     processor, info = _built_from(
-        monkeypatch, (FakePixtralProcessor, PixtralImages, None), config, tmp_path
+        monkeypatch, (FakePixtralProcessor, PixtralImages, None, None), config, tmp_path
     )
     assert processor.image_processor.kwargs == {
         "size": {"longest_edge": 1540},
@@ -754,7 +754,7 @@ def test_the_builder_keeps_a_size_rule_the_model_has_no_value_for(
         },
     }
     processor, info = _built_from(
-        monkeypatch, (FakeQwenProcessor, QwenImages, QwenVideos), config, tmp_path
+        monkeypatch, (FakeQwenProcessor, QwenImages, QwenVideos, None), config, tmp_path
     )
     want = {"patch_size": 16, "merge_size": 2, "temporal_patch_size": 2}
     assert processor.image_processor.kwargs == want
@@ -777,7 +777,9 @@ def test_the_builder_refuses_a_token_default_the_tokenizer_lacks(tmp_path, monke
 
     config = {"model_type": "mistral3", "vision_config": {"patch_size": 14}}
     with pytest.raises(ValueError, match="does not know"):
-        _built_from(monkeypatch, (OtherTokens, PixtralImages, None), config, tmp_path)
+        _built_from(
+            monkeypatch, (OtherTokens, PixtralImages, None, None), config, tmp_path
+        )
 
 
 def test_load_processor_builds_only_when_the_checkpoint_ships_no_file(
@@ -799,7 +801,9 @@ def test_load_processor_builds_only_when_the_checkpoint_ships_no_file(
         "vision_config": {"patch_size": 14},
     }
     monkeypatch.setattr(
-        frontend, "classes_for", lambda t: (FakePixtralProcessor, PixtralImages, None)
+        frontend,
+        "classes_for",
+        lambda t: (FakePixtralProcessor, PixtralImages, None, None),
     )
     monkeypatch.setattr(
         transformers.AutoTokenizer,
