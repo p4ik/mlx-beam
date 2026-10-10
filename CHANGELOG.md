@@ -87,6 +87,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   recurrent layers resume from there. One checkpoint more per image
   request for recurrent and sliding-window models, none for plain
   attention without a draft head.
+- `--allowed-origins` only ever decided which pages may read the answers
+  (0.1.0a7 described it as naming the pages that may call the server);
+  the request itself ran for any page, so without a key (on loopback, or
+  with `--skip-api-key`) any page in a browser could start generation. A
+  request whose `Origin` is not on the list is now refused with 403
+  (`origin_not_allowed`), the preflight included; requests without an
+  `Origin` header are unaffected.
+  Clients that send an `Origin` of their own - browser extensions,
+  Electron apps, proxies that forward the browser's header - must be
+  listed; one that sends `Origin: null` (a page opened from a file or in a
+  sandboxed frame) is admitted only by `*`. `null` and empty entries are
+  refused at start.
 
 ## [0.1.0a10] - 2026-10-04
 
