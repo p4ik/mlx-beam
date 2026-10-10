@@ -475,11 +475,11 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
         no_switch(tokenizer, req.surface)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False and not req.tools:
-        # A family whose template has no switch (Harmony, Muse): the answer
-        # is opened in the prompt, so the model writes it without a block.
+        # A family whose template has no switch (Harmony): the answer is
+        # opened in the prompt, so the model writes it without a block.
         # Not with tools on offer: a call needs the channel or recipient
-        # the opener would skip past (Harmony's `commentary`, Muse's
-        # ` to=<tool>`), so there the model keeps the choice.
+        # the opener would skip past (Harmony's `commentary`), so there
+        # the model keeps the choice.
         tokens += list(opener)
     return tokens
 
@@ -643,8 +643,8 @@ def to_generation_request(
         and req.template_kwargs.get("enable_thinking") is False
         and getattr(tokenizer, "answer_opener_tokens", None)
     ):
-        # A family without a template switch (Harmony, Muse), thinking off
-        # with tools on offer: the answer's opener stays out of the prompt
+        # A family without a template switch (Harmony), thinking off with
+        # tools on offer: the answer's opener stays out of the prompt
         # (build_prompt - a call needs the channel it would skip past), so
         # the block is kept out by the budget instead. Zero masks the
         # reasoning label behind the shared opener and leaves the answer's

@@ -520,9 +520,9 @@ def test_without_an_effort_kwarg_the_refusal_names_only_the_bound():
 def test_thinking_off_with_tools_is_a_zero_budget():
     """Without the opener in the prompt the block is kept out by the
     budget: zero masks the reasoning label behind the shared opener
-    (Harmony's `analysis`, Muse's `=self`), the answer's and the tools'
-    channels stay open. Without tools the opener does the job and no
-    budget is set. Muse refuses thinking off altogether (above)."""
+    (Harmony's `analysis`), the answer's and the tools' channels stay
+    open. Without tools the opener does the job and no budget is set.
+    Muse refuses thinking off altogether (above)."""
     for tok in (HARMONY,):
         req = chat.parse_chat_request(
             {
@@ -535,8 +535,7 @@ def test_thinking_off_with_tools_is_a_zero_budget():
         gen = chat.to_generation_request(tok, req)
         assert gen.reasoning is not None and gen.reasoning.max_tokens == 0
         tracker = ThinkingBudget(gen.reasoning)
-        # Harmony: the label after the shared marker; Muse: the opener's own
-        # last token (` to` + `=self`), so ` to=<tool>` stays free.
+        # Harmony: the label after the shared marker.
         label = tuple(getattr(tok, "reasoning_label_tokens", None) or ())[:1]
         assert tracker._block and tracker._cut == tuple(tok.think_start_tokens) + label
         without = chat.parse_chat_request(
