@@ -75,17 +75,18 @@ mlx-vlm's conversions do not."""
 
 class Loaded:
     """The tensors of the named parts (`vision_tower`, `embed_vision`, ...)
-    under either root, the root stripped, and the shards they came from
-    (`/health.vision.tower.loaded_from`). `quantized` says whether any of
-    them come packed (a `.scales` beside the weight); `fit` loads them
-    either way."""
+    under either root, the root stripped, the shards they came from
+    (`/health.vision.tower.loaded_from`) and how those were chosen
+    (`index`: `followed`, `stale` or `none`, `/health.vision.tower.index`).
+    `quantized` says whether any of them come packed (a `.scales` beside
+    the weight); `fit` loads them either way."""
 
     def __init__(
         self, model_path: Path, parts: Iterable[str], config: dict | None = None
     ):
         parts = tuple(parts)
         prefixes = tuple(f"{root}{part}" for root in ROOTS for part in parts)
-        raw, self.shards = load_prefixed(model_path, prefixes)
+        raw, self.shards, self.index = load_prefixed(model_path, prefixes)
         if not raw:
             raise FileNotFoundError(
                 f"{model_path}: no tensors under {parts}; the checkpoint ships "

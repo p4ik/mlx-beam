@@ -87,6 +87,7 @@ class Tower:
         self.dtype = dtype
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -99,6 +100,7 @@ class Tower:
         mx.eval(self.model.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     def encode(self, pixel_values: mx.array, grid_thw: mx.array) -> list[Encoded]:
         """All images of one processor call at once (the tower takes them
@@ -126,6 +128,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 

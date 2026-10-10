@@ -126,6 +126,14 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   own, and the loader swapped only the children of a part for their
   quantized form, never the part itself, so its packed tensors did not
   fit. A part that is itself a packed layer is now loaded as such.
+- A checkpoint whose `model.safetensors.index.json` belongs to another
+  conversion of the model (it names shards that are not there, or none
+  of the tower tensors it names is in the shard it points at) came up
+  without vision since 0.1.0a5: the loader followed the index and found
+  no tower. Such an index is now dropped whole and the tower read from
+  the `model*.safetensors` files whose headers list its tensors;
+  `/health.vision.tower.index` says `followed`, `stale` or `none` (no
+  index).
 
 ## [0.1.0a10] - 2026-10-04
 

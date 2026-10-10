@@ -85,6 +85,7 @@ class Tower:
         self.image_newline: mx.array | None = None
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -123,6 +124,7 @@ class Tower:
         )
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     # -- one image -------------------------------------------------------------
 
@@ -226,6 +228,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 
