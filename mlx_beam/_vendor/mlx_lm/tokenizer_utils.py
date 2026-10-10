@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import abc
+import codecs
 import copy
 import functools
 import importlib
@@ -260,6 +261,40 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         )
         self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
+
+
+class BytePieceStreamingDetokenizer(StreamingDetokenizer):
+    """A streaming detokenizer over the tokenizer's own byte pieces (tekken).
+
+    ``byte_piece(id)`` is the token's bytes; they go through an incremental
+    UTF-8 decoder, so a character spread over tokens waits for its last byte
+    and a byte no sequence can start comes out as U+FFFD at once.
+    """
+
+    def __init__(self, tokenizer, byte_piece):
+        super().__init__()
+        self.byte_piece = byte_piece
+        self.reset()
+
+    def reset(self):
+        self.offset = 0
+        self.text = ""
+        self.tokens = []
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    @property
+    def _unflushed(self):
+        # The bytes of a character still forming; the API reads them to tell
+        # a cut sequence from a real U+FFFD.
+        return self._decoder.getstate()[0]
+
+    def add_token(self, token):
+        self.tokens.append(token)
+        # An id outside the vocabulary raises, as the SPM detokenizer does.
+        self.text += self._decoder.decode(self.byte_piece(token))
+
+    def finalize(self):
+        self.text += self._decoder.decode(b"", final=True)
 
 
 def _infer_thinking(tokenizer):
@@ -927,6 +962,25 @@ def load(
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, **(tokenizer_config_extra or {})
     )
+
+    if type(tokenizer).__name__ == "MistralCommonBackend":
+        # The backend's text comes from tekken's byte pieces; a tokenizer.json
+        # beside tekken.json describes another tokenizer and chose BPE above.
+        from mistral_common.tokens.tokenizers.tekken import (
+            SpecialTokenPolicy,
+            Tekkenizer,
+        )
+
+        tekken = tokenizer.tokenizer.instruct_tokenizer.tokenizer
+        if isinstance(tekken, Tekkenizer):
+            # KEEP: a special token comes out as its text, so [TOOL_CALLS]
+            # reaches the tool parser.
+            detokenizer_class = partial(
+                BytePieceStreamingDetokenizer,
+                byte_piece=lambda i: tekken.id_to_byte_piece(
+                    i, SpecialTokenPolicy.KEEP
+                ),
+            )
 
     tokenizer_config = tokenizer.init_kwargs
 
