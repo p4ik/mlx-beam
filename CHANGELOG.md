@@ -31,6 +31,34 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   same for a call and its result; a call's valid id stays, a result's id
   that answers no call of the turn is mapped whatever its form), and a
   `[CALL_ID]` the model writes is read.
+- Prefilling an image block beside other prompts (Gemma 4's encoder-free
+  models, since 0.1.0a10) went wrong in three ways. A prompt padded for
+  the call over another prompt's block reported the call's width as its
+  own progress and filed its checkpoint under a position it had never
+  reached, so a later prefix hit assembled states of different positions,
+  a text-only prompt beside an image prompt as much as any other. The
+  width of a call over several blocks was settled in one pass over the
+  rows, so a block of an earlier row could still be cut by the growth a
+  later row caused. And the growth to a block's end came after the
+  prefill valve had decided, so under memory pressure exactly the large,
+  uninterruptible call the valve should hold back went through. Progress
+  is now per row; the width is the fixpoint over every block of every
+  row; and the valve decides before the block rules: a call stops at the
+  next block's start, grows to a block's end only when the valve has room
+  for the grown call, and a prompt whose block does not fit beside the
+  others waits outside the batch - in arrival order, a waiting prompt
+  behind a blocked one may pass it - until it fits alone, or is refused
+  after the stall rounds when it never does. `/health.prefill_valve`
+  counts the block stalls and the parked prompts. A prompt boundary
+  inside an image block, and a prefill call that would end inside one,
+  are refused instead of cutting the block silently.
+- A prompt the prefill valve held back while other requests were
+  decoding could be refused with a 400 as soon as the last of them
+  finished, before any prefill call had seen the memory that request
+  frees (since 0.1.0a5): rounds counted towards the refusal while
+  something still decoded or the prefix store was still giving up
+  entries. Only rounds with nothing decoding and the store empty count
+  now.
 
 ## [0.1.0a10] - 2026-10-04
 
