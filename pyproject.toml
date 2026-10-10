@@ -27,7 +27,8 @@ dependencies = [
   # Carried by the vendored mlx-lm (tokenizers, chat templates, tool parsers).
   "transformers>=5.7,<6",
   "huggingface_hub",
-  "jinja2",
+  # transformers renders chat templates on 3.1; TemplateError is read as a verdict.
+  "jinja2>=3.1",
   "numpy",
   "regex",
   "sentencepiece",

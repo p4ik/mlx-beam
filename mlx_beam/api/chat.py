@@ -5,12 +5,15 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import math
 import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
+
+from jinja2.exceptions import TemplateError
 
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import (
@@ -47,6 +50,8 @@ from mlx_beam.engine.request import GenerationRequest, SamplingParams
 from mlx_beam.engine.thinking import ReasoningLimits, budget, close_tail
 from mlx_beam.modalities import Image
 from mlx_beam.renderer import is_mistral_common, mistral_tool_call_ids
+
+logger = logging.getLogger(__name__)
 
 # What a parser falls back to when no server defaults are handed in (tests).
 DEFAULTS = RequestDefaults()
@@ -391,6 +396,30 @@ def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
     return level, thinking
 
 
+def _log_refusal(e: BaseException) -> None:
+    # The type too, since some refusals carry no text; the text cut in the
+    # format, so the client's input never fills a log line.
+    logger.info("image input refused: %s: %.300s", type(e).__name__, e)
+
+
+def _refusal(e: Exception, req: ChatRequest, rejected: str) -> ApiError:
+    """The 400 for a renderer's refusal of the messages. With images only a
+    ValueError or Jinja's TemplateError is one; anything else failed inside
+    the frontend and is the server's: raised here as RuntimeError - its own,
+    or one wrapping the cause, so that no handler ahead of the server's
+    catch-all (the socket's OSError) takes it - answered 500 and logged
+    with the traceback."""
+    if req.images:
+        if isinstance(e, RuntimeError):
+            raise e
+        if not isinstance(e, (ValueError, TemplateError)):
+            raise RuntimeError(
+                f"the image frontend failed ({type(e).__name__}: {e})"
+            ) from e
+        _log_refusal(e)
+    return ApiError(f"{rejected}: {e}", param="messages")
+
+
 def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     """The prompt's token ids; with images, rendered and expanded by the
     modality frontend (which also fills `req.spans`) - through the same
@@ -442,9 +471,9 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     level = kwargs.get(effort_kwarg)
     try:
         tokens = render()
-    except Exception as e:  # noqa: BLE001 - the template's verdict, reported as such
+    except Exception as e:  # noqa: BLE001 - judged in _refusal
         if not (level and is_effort_rejection(e)):
-            raise ApiError(f"{rejected}: {e}", param="messages") from None
+            raise _refusal(e, req, rejected) from None
         # The template rejects this word after all (it answers differently
         # with tools in the context, say): climb the ladder and remember
         # the rung that rendered, so every re-render agrees.
@@ -454,13 +483,15 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
         for candidate in rungs:
             try:
                 tokens = render(**{effort_kwarg: candidate})
-            except Exception as e2:  # noqa: BLE001
+            except Exception as e2:  # noqa: BLE001 - judged in _refusal
                 if not is_effort_rejection(e2):
-                    raise ApiError(f"{rejected}: {e2}", param="messages") from None
+                    raise _refusal(e2, req, rejected) from None
                 continue
             req.template_kwargs[effort_kwarg] = candidate
             break
         if tokens is None:
+            if req.images:
+                _log_refusal(e)
             raise ApiError(
                 f"the chat template accepts none of the {effort_kwarg} levels "
                 f"{', '.join([level, *rungs])}: {e}",
