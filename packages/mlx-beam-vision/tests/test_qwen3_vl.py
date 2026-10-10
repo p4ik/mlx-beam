@@ -1855,3 +1855,550 @@ def test_an_image_turn_resumes_from_the_generation_prompt():
     assert second.prompt_cached == start
     with Engine(model) as cold:
         assert out2 == [e.token for e in cold.submit(generation(turn2)[0])]
+
+
+def _serializable_part(name, base, **defaults):
+    """A part fake transformers can serialize: `from_args_and_dict` logs
+    the processor's repr, which runs every part's `to_dict`; `valid_kwargs`
+    names the keys the builder may fill from the model."""
+    kw = type(f"{name}Kwargs", (), {"__annotations__": {k: object for k in defaults}})
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    return type(name, (base,), {**defaults, "valid_kwargs": kw, "__init__": __init__})
+
+
+@pytest.mark.parametrize("parts", ["three", "four", "audio"])
+def test_a_missing_video_processor_does_not_block_images(
+    tmp_path, monkeypatch, caplog, parts
+):
+    """A processor_config.json that carries the image processor (and the
+    audio feature extractor) but no video block makes AutoProcessor fail
+    on the video processor it cannot find. The loader then puts the
+    processor together itself: every part with a block in the file the
+    way transformers builds it, only the missing one from the model and
+    the class defaults, the top-level values and the chat template from
+    the file (the feature extractor's block under either name transformers
+    reads it from); the health says what was built. A part that cannot be
+    built is the original refusal with the cause behind it, both in the
+    health, the traceback in the log."""
+    import json
+    import logging
+
+    import transformers
+    from transformers.feature_extraction_utils import FeatureExtractionMixin
+    from transformers.image_processing_base import ImageProcessingMixin
+    from transformers.processing_utils import ProcessorMixin
+
+    Images = _serializable_part(
+        "FakeImageProcessor", ImageProcessingMixin, size={"height": 896}, patch_size=14
+    )
+    Videos = _serializable_part(
+        "FakeVideoProcessor", ImageProcessingMixin, patch_size=16, max_frames=768
+    )
+    Audio = _serializable_part(
+        "FakeFeatureExtractor", FeatureExtractionMixin, sampling_rate=16000
+    )
+
+    class ThreeParts(ProcessorMixin):
+        def __init__(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            video_processor=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+            self.chat_template = chat_template
+
+    class FourParts(ProcessorMixin):
+        def __init__(
+            self,
+            feature_extractor=None,
+            image_processor=None,
+            tokenizer=None,
+            video_processor=None,
+            chat_template=None,
+            audio_ms_per_token=40,
+        ):
+            self.feature_extractor = feature_extractor
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+            self.chat_template = chat_template
+            self.audio_ms_per_token = audio_ms_per_token
+
+    processor_cls = ThreeParts if parts == "three" else FourParts
+    blocks = {"four": "feature_extractor", "audio": "audio_processor"}
+    image_block = {
+        "image_processor_type": "FakeImageProcessor",
+        "size": {"height": 448},
+        "patch_size": 14,
+    }
+    audio_block = {
+        "feature_extractor_type": "FakeFeatureExtractor",
+        "sampling_rate": 24000,
+    }
+    file = {"processor_class": processor_cls.__name__, "image_processor": image_block}
+    if parts != "three":
+        file.update({blocks[parts]: audio_block, "audio_ms_per_token": 80})
+    (tmp_path / "processor_config.json").write_text(json.dumps(file))
+    (tmp_path / "chat_template.jinja").write_text("{{ messages }}")
+    config = {"model_type": "gemma4_unified", "vision_config": {"patch_size": 16}}
+
+    def from_file(name, cls):
+        def from_pretrained(path, trust_remote_code=False):
+            file = json.loads((Path(path) / "processor_config.json").read_text())
+            return cls(**(file.get(name) or file["audio_processor"]))
+
+        return staticmethod(from_pretrained)
+
+    def refused(path, trust_remote_code=False):
+        raise OSError("Can't load video processor")
+
+    monkeypatch.setattr(
+        frontend, "classes_for", lambda t: (processor_cls, Images, Videos, Audio)
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda path, trust_remote_code=False: FakeTokenizer()),
+    )
+    monkeypatch.setattr(
+        transformers.AutoProcessor, "from_pretrained", staticmethod(refused)
+    )
+    monkeypatch.setattr(
+        transformers.AutoImageProcessor,
+        "from_pretrained",
+        from_file("image_processor", Images),
+    )
+    monkeypatch.setattr(
+        transformers.AutoFeatureExtractor,
+        "from_pretrained",
+        from_file("feature_extractor", Audio),
+    )
+    caplog.set_level(logging.WARNING, logger="beam.vision")
+    processor, info = frontend.load_processor(tmp_path, config)
+    assert isinstance(processor, processor_cls)
+    # The log keeps AutoProcessor's own failure beside what was assembled.
+    assembled = [
+        r.getMessage() for r in caplog.records if "assembled from" in r.getMessage()
+    ]
+    assert len(assembled) == 1 and "Can't load video processor" in assembled[0]
+    assert processor.image_processor.kwargs == image_block
+    assert isinstance(processor.video_processor, Videos)
+    assert processor.video_processor.kwargs == {"patch_size": 16}
+    assert processor.chat_template == "{{ messages }}"
+    assert info["source"] == "checkpoint" and info["class"] == processor_cls.__name__
+    assert info["built"] == ["video_processor"]
+    if parts != "three":
+        assert processor.feature_extractor.kwargs == audio_block
+        assert processor.audio_ms_per_token == 80
+
+    def no_backend(path, trust_remote_code=False):
+        raise ValueError("no backend for this image processor")
+
+    monkeypatch.setattr(
+        transformers.AutoImageProcessor, "from_pretrained", staticmethod(no_backend)
+    )
+    caplog.set_level(logging.WARNING, logger="beam.vision")
+    with pytest.raises(OSError, match="video processor") as exc:
+        frontend.load_processor(tmp_path, config)
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert "no backend" in str(exc.value.__cause__)
+    assert str(exc.value).startswith("assembling: ValueError: no backend")
+    assert "AutoProcessor: Can't load video processor" in str(exc.value)
+    record = next(r for r in caplog.records if r.name == "beam.vision" and r.exc_info)
+    assert record.exc_info[0] is ValueError
+
+
+MUSE_CONFIG = {
+    "model_type": "muse_glimmer",
+    "image_token_id": 62,
+    "out_hidden_size": 128,
+    # 64, not 48: the projection's input must divide by a group size.
+    "projector_hidden_size": 64,
+    "vision_config": {
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "num_hidden_layers": 2,
+        "patch_size": 14,
+        "patch_temporal": 2,
+        "merge_size": 2,
+        "pos_emb_height": 4,
+        "pos_emb_width": 4,
+    },
+    "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
+}
+
+
+def test_a_quantized_root_module_loads(tmp_path):
+    """An 8-bit conversion packs Muse's projection, a bare linear that is a
+    part of its own: there is no child to swap for a quantized layer, the
+    module itself is the layer. `fit` swaps it and hands the quantized
+    module back; the family keeps what it gets, and the features match
+    the quantized source."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_beam_vision.families import Loaded, muse_glimmer
+
+    mx.random.seed(5)
+    packed = nn.Linear(64, 32, bias=False).to_quantized(group_size=32, bits=8)
+    mx.eval(packed.parameters())
+    stored = {f"vision_projection.{k}": v for k, v in tree_flatten(packed.parameters())}
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    mx.save_safetensors(str(bare / "model.safetensors"), stored)
+    quantization = {"quantization": {"group_size": 32, "bits": 8}}
+    loaded = Loaded(bare, ("vision_projection",), quantization)
+    fitted = loaded.fit(
+        nn.Linear(64, 32, bias=False), loaded.part("vision_projection"), mx.float32
+    )
+    assert isinstance(fitted, nn.QuantizedLinear)
+    assert (fitted.bits, fitted.group_size) == (8, 32)
+    x = mx.random.normal((3, 64))
+    assert mx.allclose(fitted(x), packed(x), atol=1e-5)
+
+    mx.random.seed(3)
+    source = muse_glimmer.Tower(MUSE_CONFIG, None, dtype=mx.float32)
+    nn.quantize(source.vision_adapter, group_size=32, bits=8)
+    source.vision_projection = source.vision_projection.to_quantized(
+        group_size=32, bits=8
+    )
+    mx.eval(
+        source.model.parameters(),
+        source.vision_adapter.parameters(),
+        source.vision_projection.parameters(),
+    )
+    stored = {
+        **{f"vision_tower.{k}": v for k, v in tree_flatten(source.model.parameters())},
+        **{
+            f"vision_adapter.{k}": v
+            for k, v in tree_flatten(source.vision_adapter.parameters())
+        },
+        **{
+            f"vision_projection.{k}": v
+            for k, v in tree_flatten(source.vision_projection.parameters())
+        },
+    }
+    muse = tmp_path / "muse"
+    muse.mkdir()
+    mx.save_safetensors(str(muse / "model.safetensors"), stored)
+    t = muse_glimmer.Tower({**MUSE_CONFIG, **quantization}, muse, dtype=mx.float32)
+    assert t.quantized and isinstance(t.vision_projection, nn.QuantizedLinear)
+    assert isinstance(t.vision_adapter.fc1, nn.QuantizedLinear)
+    grids = [(1, 4, 4), (1, 2, 4)]
+    n = sum(g[0] * g[1] * g[2] for g in grids)
+    pv = mx.array(np.random.RandomState(0).randn(n, 3 * 2 * 14 * 14).astype(np.float32))
+    want = source.encode(pv, mx.array(grids))
+    got = t.encode(pv, mx.array(grids))
+    for a, b in zip(got, want, strict=True):
+        assert mx.allclose(a.features, b.features, atol=1e-5)
+
+
+MISTRAL3_CONFIG = {
+    "model_type": "mistral3",
+    "vision_config": {
+        "model_type": "pixtral",
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "intermediate_size": 64,
+        "num_attention_heads": 2,
+        "head_dim": 16,
+        "image_size": 64,
+        "patch_size": 16,
+        "num_channels": 3,
+    },
+    "text_config": {"hidden_size": 32, "rms_norm_eps": 1e-5},
+    "quantization": {"group_size": 32, "bits": 8},
+}
+
+
+def _mistral3_mini():
+    """A tiny Mistral 3 tower with its projector's three linears packed
+    (norm and tower in floating point), and its tensors in mlx-vlm's
+    layout as a conversion stores them: (tower, projector) by name."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_beam_vision.families import mistral3
+
+    mx.random.seed(1)
+    source = mistral3.Tower(MISTRAL3_CONFIG, None, dtype=mx.float32)
+    nn.quantize(source.projector, group_size=32, bits=8)
+    mx.eval(source.model.parameters(), source.projector.parameters())
+    tower = {
+        f"vision_tower.{k}": (
+            v.transpose(0, 3, 1, 2) if "patch_conv.weight" in k else v
+        )
+        for k, v in tree_flatten(source.model.parameters())
+    }
+    projector = {
+        f"multi_modal_projector.{k}": v
+        for k, v in tree_flatten(source.projector.parameters())
+    }
+    return source, tower, projector
+
+
+def _mistral3_features(t):
+    pv = mx.array(np.random.RandomState(0).randn(1, 64, 64, 3).astype(np.float32))
+    return t.encode(pv, [(64, 64)])[0].features
+
+
+def _write_index(path, weight_map):
+    import json
+
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+
+
+def _spy_on_load(monkeypatch):
+    seen = []
+    real = mx.load
+
+    def load(path, *args, **kwargs):
+        seen.append(Path(path).name)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "load", load)
+    return seen
+
+
+def test_mistral3_projector_loads_partly_quantized(tmp_path):
+    """A conversion that packs the projector's linears and leaves the
+    tower and the projector's norm in floating point loads as such, with
+    the features of the source."""
+    import mlx.nn as nn
+    from mlx_beam_vision.families import mistral3
+
+    source, tower, projector = _mistral3_mini()
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**tower, **projector})
+    t = mistral3.Tower(MISTRAL3_CONFIG, tmp_path, dtype=mx.float32)
+    assert t.quantized and isinstance(t.projector.linear_2, nn.QuantizedLinear)
+    assert isinstance(t.projector.norm, nn.RMSNorm)
+    assert mx.allclose(_mistral3_features(t), _mistral3_features(source), atol=1e-5)
+
+
+SHARD_1, SHARD_2, SHARD_3 = (f"model-0000{i}-of-00003.safetensors" for i in (1, 2, 3))
+
+
+@pytest.mark.parametrize("index", ["missing_shard", "no_names", "no_hits"])
+def test_a_stale_index_is_dropped_for_the_shards_present(tmp_path, monkeypatch, index):
+    """A checkpoint whose index belongs to another conversion - it names
+    shards that are not there, or none of the names it has for the tower
+    is in the shard it points at - is loaded from the files that are
+    there: the headers of `model*.safetensors` say which hold tower
+    tensors, only those are read, the health says the index was stale.
+    What the files hold must still be complete: strict loading refuses a
+    packed layer without its biases."""
+    from mlx_beam_vision.families import mistral3
+
+    source, tower, projector = _mistral3_mini()
+    text = {"language_model.embed_tokens.weight": mx.zeros((4, 8))}
+    # Index names as another conversion writes them: the tower without
+    # the `vision_model` level, `.weight` only.
+    other_names = [
+        k.replace("vision_tower.vision_model.", "vision_tower.")
+        for k in (*tower, *projector)
+        if k.endswith(".weight")
+    ]
+    weight_map = {
+        "missing_shard": {k: "model-00001-of-00006.safetensors" for k in other_names},
+        "no_names": {
+            f"language_model.layers.{i}.weight": s
+            for i, s in enumerate((SHARD_1, SHARD_2, SHARD_3))
+        },
+        "no_hits": {k: SHARD_1 for k in other_names},
+    }[index]
+
+    def checkpoint(name, shard_3):
+        path = tmp_path / name
+        path.mkdir()
+        mx.save_safetensors(str(path / SHARD_1), tower)
+        mx.save_safetensors(str(path / SHARD_2), text)
+        mx.save_safetensors(str(path / SHARD_3), shard_3)
+        _write_index(path, weight_map)
+        return path
+
+    seen = _spy_on_load(monkeypatch)
+    t = mistral3.Tower(
+        MISTRAL3_CONFIG, checkpoint("whole", projector), dtype=mx.float32
+    )
+    assert mx.allclose(_mistral3_features(t), _mistral3_features(source), atol=1e-5)
+    assert t.loaded_from == [SHARD_1, SHARD_3]
+    assert t.describe().get("index") == "stale"
+    assert SHARD_2 not in seen
+    short = {k: v for k, v in projector.items() if not k.endswith("linear_2.biases")}
+    with pytest.raises(ValueError, match="biases"):
+        mistral3.Tower(MISTRAL3_CONFIG, checkpoint("short", short), dtype=mx.float32)
+
+
+def test_a_valid_index_is_followed(tmp_path, monkeypatch):
+    """An index that matches the files is followed as before: the tower
+    comes from the file the index names (a package's own, in a
+    subfolder), the text shard is never opened, the health says so; a
+    single file without an index is read as before, and the health says
+    that too. An index without the tower, and no file holding one either,
+    is the plain refusal - nothing about a stale index."""
+    from mlx_beam_vision.families import mistral3
+
+    source, tower, projector = _mistral3_mini()
+    text = {"language_model.embed_tokens.weight": mx.zeros((4, 8))}
+    text_shard = "model-00001-of-00001.safetensors"
+    packed = tmp_path / "packed"
+    (packed / "optiq").mkdir(parents=True)
+    mx.save_safetensors(
+        str(packed / "optiq" / "optiq_vision.safetensors"), {**tower, **projector}
+    )
+    mx.save_safetensors(str(packed / text_shard), text)
+    _write_index(
+        packed,
+        {
+            **{k: "optiq/optiq_vision.safetensors" for k in (*tower, *projector)},
+            **{k: text_shard for k in text},
+        },
+    )
+    seen = _spy_on_load(monkeypatch)
+    t = mistral3.Tower(MISTRAL3_CONFIG, packed, dtype=mx.float32)
+    assert mx.allclose(_mistral3_features(t), _mistral3_features(source), atol=1e-5)
+    assert t.loaded_from == ["optiq/optiq_vision.safetensors"]
+    assert t.describe().get("index") == "followed"
+    assert text_shard not in seen
+
+    single = tmp_path / "single"
+    single.mkdir()
+    mx.save_safetensors(str(single / "model.safetensors"), {**tower, **projector})
+    t = mistral3.Tower(MISTRAL3_CONFIG, single, dtype=mx.float32)
+    assert t.loaded_from == ["model.safetensors"]
+    assert t.describe().get("index") == "none"
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    mx.save_safetensors(str(bare / text_shard), text)
+    _write_index(bare, {k: text_shard for k in text})
+    with pytest.raises(FileNotFoundError, match="no tensors under") as exc:
+        mistral3.Tower(MISTRAL3_CONFIG, bare, dtype=mx.float32)
+    assert "stale" not in str(exc.value) and "dropped" not in str(exc.value)
+
+
+def _auto_processor_refuses(monkeypatch, what="Can't load video processor"):
+    import transformers
+
+    def refused(path, trust_remote_code=False):
+        raise OSError(what)
+
+    monkeypatch.setattr(
+        transformers.AutoProcessor, "from_pretrained", staticmethod(refused)
+    )
+
+
+def test_a_file_naming_another_processor_class_is_refused_with_the_reason(
+    tmp_path, monkeypatch
+):
+    """processor_config.json names a processor class other than the one
+    transformers has for the model type: nothing is assembled, and the
+    refusal - what reaches /health.vision.refused - carries AutoProcessor's
+    text and the reason."""
+    import json
+
+    from transformers.image_processing_base import ImageProcessingMixin
+    from transformers.processing_utils import ProcessorMixin
+
+    class Expected(ProcessorMixin):
+        def __init__(self, image_processor=None, tokenizer=None, chat_template=None):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+    Images = _serializable_part("FakeImageProcessor", ImageProcessingMixin, size=1)
+    file = {
+        "processor_class": "AnotherProcessor",
+        "image_processor": {"image_processor_type": "FakeImageProcessor"},
+    }
+    (tmp_path / "processor_config.json").write_text(json.dumps(file))
+    monkeypatch.setattr(
+        frontend, "classes_for", lambda t: (Expected, Images, None, None)
+    )
+    _auto_processor_refuses(monkeypatch)
+    with pytest.raises(OSError, match="video processor") as exc:
+        frontend.load_processor(tmp_path, {"model_type": "x", "vision_config": {}})
+    assert "assembling: ValueError: processor_config.json names AnotherProcessor" in (
+        str(exc.value)
+    )
+    assert isinstance(exc.value.__cause__, ValueError)
+
+
+def test_a_file_with_a_block_for_every_part_is_not_assembled(tmp_path, monkeypatch):
+    """AutoProcessor fails on a file that has a block for every part the
+    class takes: the failure is not a missing part, so no other processor
+    is built out of the file, and the refusal says so."""
+    import json
+
+    import transformers
+    from transformers.image_processing_base import ImageProcessingMixin
+    from transformers.processing_utils import ProcessorMixin
+
+    Images = _serializable_part("FakeImageProcessor", ImageProcessingMixin, size=1)
+    Videos = _serializable_part("FakeVideoProcessor", ImageProcessingMixin, size=2)
+
+    class TwoParts(ProcessorMixin):
+        def __init__(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            video_processor=None,
+            chat_template=None,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+            self.chat_template = chat_template
+
+    file = {
+        "processor_class": "TwoParts",
+        "image_processor": {"image_processor_type": "FakeImageProcessor"},
+        "video_processor": {"video_processor_type": "FakeVideoProcessor"},
+    }
+    (tmp_path / "processor_config.json").write_text(json.dumps(file))
+    monkeypatch.setattr(
+        frontend, "classes_for", lambda t: (TwoParts, Images, Videos, None)
+    )
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        staticmethod(lambda path, trust_remote_code=False: FakeTokenizer()),
+    )
+    for auto, cls in (
+        (transformers.AutoImageProcessor, Images),
+        (transformers.AutoVideoProcessor, Videos),
+    ):
+        monkeypatch.setattr(
+            auto,
+            "from_pretrained",
+            staticmethod(lambda path, trust_remote_code=False, cls=cls: cls()),
+        )
+    _auto_processor_refuses(monkeypatch, "Can't instantiate the processor")
+    with pytest.raises(OSError, match="instantiate the processor") as exc:
+        frontend.load_processor(tmp_path, {"model_type": "x", "vision_config": {}})
+    assert "assembling: ValueError: every part the class takes has a block" in str(
+        exc.value
+    )
+
+
+def test_an_unreadable_shard_header_stops_the_scan_with_its_name(tmp_path):
+    """Once the index is dropped, the headers of every `model*.safetensors`
+    file are read; one that cannot be read is refused by name, not skipped
+    - the files behind it might have held the tower."""
+    from mlx_beam_vision.families import mistral3
+
+    _, tower, projector = _mistral3_mini()
+    mx.save_safetensors(str(tmp_path / SHARD_1), {**tower, **projector})
+    (tmp_path / SHARD_2).write_bytes(b"\xff" * 16)
+    _write_index(tmp_path, {k: "model-00001-of-00006.safetensors" for k in tower})
+    with pytest.raises(Exception, match="not a readable safetensors header") as exc:
+        mistral3.Tower(MISTRAL3_CONFIG, tmp_path, dtype=mx.float32)
+    assert exc.type is ValueError and SHARD_2 in str(exc.value)
