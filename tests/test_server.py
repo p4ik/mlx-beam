@@ -396,7 +396,8 @@ def test_cors_echoes_only_listed_origins():
             return resp.status, resp.getheader("Access-Control-Allow-Origin")
 
         assert preflight("http://ok.test") == (204, "http://ok.test")
-        assert preflight("http://evil.test") == (204, None)
+        # An origin not on the list gets no CORS answer and no request either.
+        assert preflight("http://evil.test") == (403, None)
         status, _, raw = call(httpd, "GET", "/health")
         assert json.loads(raw)["api"]["allowed_origins"] == ["http://ok.test"]
     finally:
@@ -404,15 +405,15 @@ def test_cors_echoes_only_listed_origins():
         engine.stop()
 
 
-def test_cors_default_admits_no_origin(server):
-    """Nothing is listed by default: a page in a browser cannot read the
-    answers of a server it was not told about (the operator names origins)."""
+def test_cors_default_refuses_every_origin(server):
+    """Nothing is listed by default: a page in a browser is refused by a
+    server it was not told about (the operator names origins)."""
     conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
     conn.request("OPTIONS", "/v1/models", headers={"Origin": "http://any.test"})
     resp = conn.getresponse()
     resp.read()
     conn.close()
-    assert resp.status == 204
+    assert resp.status == 403
     assert resp.getheader("Access-Control-Allow-Origin") is None
     status, _, raw = call(server, "GET", "/health")
     auth = json.loads(raw)["api"]["auth"]
@@ -591,7 +592,7 @@ def test_preflight_allows_the_headers_the_browser_asks_for():
 def test_an_allowed_origin_with_whitespace_is_refused_at_start():
     engine = Engine(tiny_llama()).start()
     try:
-        for bad in ("http://app\r\nX: 1", "http://app ", "http://a b"):
+        for bad in ("http://app\r\nX: 1", "http://app ", "http://a b", "http://a\tb"):
             with pytest.raises(ValueError):
                 Served(engine, StubTokenizer(), "tiny", allowed_origins=[bad])
     finally:
@@ -600,7 +601,8 @@ def test_an_allowed_origin_with_whitespace_is_refused_at_start():
 
 def test_a_folded_origin_never_matches_the_list():
     # The folded header's value keeps its line break; it equals no
-    # configured origin, so no Access-Control-Allow-Origin goes out.
+    # configured origin, so the request is refused and no
+    # Access-Control-Allow-Origin goes out.
     engine = Engine(tiny_llama()).start()
     served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://app"])
     server = BeamServer(served, "127.0.0.1", 0)
@@ -611,7 +613,7 @@ def test_a_folded_origin_never_matches_the_list():
         b"Access-Control-Request-Method: POST\r\n\r\n"
     )
     head = _raw_request(server.server_port, raw)
-    assert head.split("\r\n", 1)[0].split()[1] == "204"
+    assert head.split("\r\n", 1)[0].split()[1] == "403"
     assert "X-Injected" not in head
     assert "Access-Control-Allow-Origin" not in head
     server.shutdown()
@@ -683,7 +685,7 @@ def test_a_socket_error_while_reading_the_body_closes_the_connection():
     from mlx_beam.api.access import Access
 
     h = Handler.__new__(Handler)
-    h.served = SimpleNamespace(access=Access.local())
+    h.served = SimpleNamespace(access=Access.local(), origin_allowed=lambda o: True)
     h.command, h.path, h.request_version = "POST", "/v1/completions", "HTTP/1.1"
     h.requestline = "POST /v1/completions HTTP/1.1"
     h.client_address = ("127.0.0.1", 1)
