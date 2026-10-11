@@ -548,6 +548,8 @@ class Engine:
 
     def health(self) -> dict:
         gen = self._gen
+        # Read once: the worker empties the lot between two reads.
+        lot = None if gen is None else gen._parked
         counters = asdict(gen._counters) if gen is not None else None
         return {
             "alive": self.alive,
@@ -575,6 +577,11 @@ class Engine:
                 **self.prefill_valve.describe(),
                 "stalled_rounds": gen.stalled_calls if gen is not None else 0,
                 "refused": self.stalls_refused,
+                # Rounds a prompt alone at an image block found no room, and
+                # prompts parked for a block to fit: all so far, and now.
+                "block_stalled_rounds": gen.block_stalls if gen is not None else 0,
+                "parked_rows": gen.parked_rows if gen is not None else 0,
+                "parked": 0 if lot is None else len(lot),
             },
             "batching": dict(self.batching),
             # What the generator wired at start (None on a device without a
@@ -753,9 +760,14 @@ class Engine:
         if found is None:
             return
         stage, idx = found
-        batch = gen._prompt_batch if stage == 1 else gen._generation_batch
         if stage == 0:
             return
+        if stage == 1:
+            batch = gen._prompt_batch
+        elif stage == 3:
+            batch = gen._parked
+        else:
+            batch = gen._generation_batch
         caches = batch.prompt_cache
         rec = recurrent_layers(caches)
         win = window_layers(caches) if windows else []
@@ -926,18 +938,23 @@ class Engine:
             )
 
     def _relieve_stall(self, gen: BatchGenerator) -> None:
-        """The valve let nobody prefill this round. Memory the store holds
-        is memory the prefill may have: one entry goes per stalled round.
-        With the store empty and nothing decoding (whose finish would free
-        its cache) the stall cannot end by itself: after STALL_ROUNDS the
-        widest prefilling row is refused with a 400 - the prompt does not
-        fit beside what runs - instead of holding every prompt behind it
-        for ever. While something decodes, the worker waits a little
-        rather than spinning."""
+        """The valve let nobody prefill this round: one store entry goes
+        (memory the prefill may have), or the worker waits while something
+        decodes (its finish frees memory), and only a round with neither
+        counts; after STALL_ROUNDS such rounds the widest prefilling row is
+        refused with a 400 rather than holding every prompt behind it for
+        ever. A block stall counts only when it says so (`counts`)."""
         if self.prefix_store.evict_one():
             mx.clear_cache()
+            gen.stall_streak = 0
             return
         if len(gen._generation_batch) > 0:
+            gen.stall_streak = 0
+            time.sleep(STALL_SLEEP_S)
+            return
+        block = gen.block_stall
+        if block is not None and not block.counts:
+            gen.stall_streak = 0
             time.sleep(STALL_SLEEP_S)
             return
         if gen.stall_streak < STALL_ROUNDS:
@@ -948,10 +965,16 @@ class Engine:
             return
         i = max(range(len(batch.uids)), key=lambda j: len(batch.tokens[j]))
         uid, prefilled = batch.uids[i], len(batch.tokens[i])
+        if block is not None and block.at_block:
+            why = (
+                f"its image block needs {block.need} tokens in one prefill call, "
+                "and the prefill valve found no room for them"
+            )
+        else:
+            why = "the prefill valve found no room for the narrowest call"
         error = ContextTooLong(
             f"the prompt does not fit in memory beside what is running "
-            f"({prefilled} of it prefilled; the prefill valve found no room "
-            "for the narrowest call)"
+            f"({prefilled} of it prefilled; {why})"
         )
         gen.remove([uid])
         with self._lock:
@@ -963,6 +986,7 @@ class Engine:
         self._spans.pop(uid, None)
         self._forget_row(uid)
         gen.stall_streak = 0
+        gen.block_stall = None
         self.stalls_refused += 1
         if stream is not None:
             stream.put(error)

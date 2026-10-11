@@ -134,6 +134,13 @@ class GenerationRequest:
                     "an image cannot be the last prompt token; the frame "
                     "of the assistant's turn must follow it"
                 )
+            # A segment ending inside a block would be prefilled in two calls.
+            if span.block and any(span.start < b < span.end for b in self.boundaries):
+                raise ValueError(
+                    "a prompt boundary falls inside an image block; the "
+                    "block's tokens attend to each other and are prefilled "
+                    "in one call"
+                )
 
     @property
     def cache_key(self) -> list[int]:

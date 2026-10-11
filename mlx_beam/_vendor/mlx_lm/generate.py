@@ -1574,6 +1574,30 @@ class GenerationBatch:
         )
 
 
+@dataclass
+class BlockStall:
+    """A round in which the one row left in the prompt batch found no
+    room: at an image block, or alone on the valve while rows wait for
+    their blocks (VENDORED.md, parking)."""
+
+    uid: int
+    # Tokens the call must hold whole for the row: to the block's end, or
+    # the width it asked for when it stands at no block.
+    need: int
+    # The row heads the queue of waiting rows: it stays in the prompt batch
+    # until it fits or another row passes it; any other row joins the queue.
+    front: bool
+    # The round counts towards refusing the row: it heads the queue and no
+    # query of the valve saw room for anybody this round. The valve answers
+    # the queries and the round's width from one reading of memory
+    # (`PrefillValve.round`), so a row a query saw room for runs instead of
+    # stalling, uncounted, round after round.
+    counts: bool
+    # The row's block is what found no room; else (no block, or a block that
+    # fits while the row's call does not) the refusal names the valve.
+    at_block: bool = True
+
+
 class BatchGenerator:
     """
     A batch generator implements continuous batching.
@@ -1661,6 +1685,18 @@ class BatchGenerator:
         # Stalled rounds in a row; a prefill call that ran resets it. The
         # caller reads it to relieve a stall that would never end by itself.
         self.stall_streak = 0
+        # Rows whose image block does not fit beside the others wait here,
+        # a queue in arrival order, with their _currently_processing
+        # entries beside them (VENDORED.md, parking). None while empty.
+        self._parked = None
+        self._parked_processing = []
+        # Last round's block stall, or None; every round that reaches the
+        # width decision sets it anew. Nobody is admitted while it stands.
+        self.block_stall = None
+        # Rounds a row alone at an image block found no room, and rows
+        # parked; for /health.
+        self.block_stalls = 0
+        self.parked_rows = 0
 
         self._counters = BatchCounters()
 
@@ -1796,6 +1832,10 @@ class BatchGenerator:
         for i, seq in enumerate(self._unprocessed_sequences):
             if seq[0] in uids:
                 results[seq[0]] = (0, i)
+        if self._parked is not None:
+            for i, uid_i in enumerate(self._parked.uids):
+                if uid_i in uids:
+                    results[uid_i] = (3, i)
         return results
 
     def extract_cache(self, uids):
@@ -1807,6 +1847,11 @@ class BatchGenerator:
                 results[uid] = (
                     self._prompt_batch.extract_cache(idx),
                     self._prompt_batch.tokens[idx],
+                )
+            elif stage == 3:
+                results[uid] = (
+                    self._parked.extract_cache(idx),
+                    self._parked.tokens[idx],
                 )
             else:
                 results[uid] = (
@@ -1820,10 +1865,12 @@ class BatchGenerator:
         if return_prompt_caches:
             caches = self.extract_cache(uids)
 
+        parked = 0 if self._parked is None else len(self._parked)
         keep = (
             set(range(len(self._unprocessed_sequences))),
             set(range(len(self._prompt_batch))),
             set(range(len(self._generation_batch))),
+            set(range(parked)),
         )
         for stage, idx in self._find_uids(uids).values():
             keep[stage].remove(idx)
@@ -1839,6 +1886,17 @@ class BatchGenerator:
             ]
         if len(keep[2]) < len(self._generation_batch):
             self._generation_batch.filter(sorted(keep[2]))
+        if len(keep[3]) < parked:
+            self._parked.filter(sorted(keep[3]))
+            self._parked_processing = [
+                x for i, x in enumerate(self._parked_processing) if i in keep[3]
+            ]
+            if not self._parked.uids:
+                self._parked = None
+        if self.block_stall is not None and self.block_stall.uid in set(uids):
+            # The stall row is gone; a stall that no longer stands would
+            # hold the admission for ever.
+            self.block_stall = None
 
         return caches
 
@@ -1847,6 +1905,8 @@ class BatchGenerator:
         total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
+        if self._parked is not None:
+            total += sum(c.nbytes for c in self._parked.prompt_cache)
         return total
 
     def _make_batch(self, n: int):
@@ -1936,6 +1996,10 @@ class BatchGenerator:
             # Starvation guard: the rows already here get this call alone.
             self.starved_calls += 1
             n = 0
+        if n > 0 and (self._parked is not None or self.block_stall is not None):
+            # Rows wait for an image block to fit: a newcomer would push
+            # them behind itself again, for as long as newcomers arrive.
+            n = 0
         if n > 0:
             self._prompt_batch.extend(self._make_batch(n))
 
@@ -1965,11 +2029,31 @@ class BatchGenerator:
                     )
                 )
             self._generation_batch.extend(gen_batch)
-            if self._currently_processing:
+            if self._currently_processing or self._parked is not None:
                 # Hand the finished prompt over now; its first token comes
                 # at the top of the next call, not behind another prefill
-                # step of the others.
+                # step of the others or of a row brought back from waiting.
                 return prompt_responses, generation_responses
+
+        # From the queries that bring a waiting row back to the round's
+        # width, the valve decides against one reading of memory
+        # (VENDORED.md, parking).
+        valve = self.prefill_valve
+        with contextlib.nullcontext() if valve is None else valve.round():
+            return self._prefill_round(prompt_responses, generation_responses)
+
+    def _prefill_round(self, prompt_responses, generation_responses):
+        # Rows waiting for their image block to fit come back once nothing
+        # else prefills: the prompt batch is empty, or holds only the row
+        # the last round's block stall left there (VENDORED.md, parking).
+        lot_was_empty = self._parked is None
+        head, by_query = False, False
+        stall = self.block_stall
+        if not lot_was_empty and (
+            not self._currently_processing
+            or (stall is not None and self._prompt_batch.uids == [stall.uid])
+        ):
+            head, by_query = self._unpark()
 
         if not self._currently_processing:
             self._last_prefill_s = 0.0
@@ -1978,30 +2062,66 @@ class BatchGenerator:
         # One model call, as wide as the shortest current segment: nobody is
         # padded, and the width is capped by the step and the slice.
         remaining = [len(seq[0][0]) for seq in self._currently_processing]
+        rows = len(remaining)
         width = min(min(remaining), self.prefill_step_size, self.prefill_slice)
+        widths = getattr(self._prompt_batch, "block_widths", None)
+        # Whether a block stall is on is decided by every round that gets
+        # here; a stall row heads the queue of waiting rows when the lot was
+        # empty before this round or it was brought back as the head.
+        self.block_stall = None
+        front = lot_was_empty or head
         if self.prefill_valve is not None:
-            allowed = self.prefill_valve.width(width * len(remaining))
+            allowed = self.prefill_valve.width(width * rows)
             if allowed is None:
                 # Not even the narrowest call fits under the memory ceiling
                 # now: nobody is prefilled this round, decoding goes on.
-                self.stalled_calls += 1
-                self.stall_streak += 1
-                self._last_prefill_s = 0.0
-                return prompt_responses, generation_responses
-            self.stall_streak = 0
-            width = min(width, max(1, allowed // len(remaining)))
+                if rows == 1 and widths is not None:
+                    # A row alone at an image block, or alone while others
+                    # wait, stalls as a block stall: an admission next round
+                    # would park it behind the newcomers.
+                    _, _, needs = widths(width)
+                    uid = self._prompt_batch.uids[0]
+                    if uid in needs or not lot_was_empty:
+                        # A block the valve has room for is not what stalled:
+                        # then it was the row's call, and the refusal says so.
+                        at_block = uid in needs and not self._room_for(needs[uid])
+                        self._block_stall(
+                            uid, needs.get(uid, width), front, by_query, at_block
+                        )
+                return self._stalled(prompt_responses, generation_responses)
+            width = min(width, max(1, allowed // rows))
         full = min(self.prefill_step_size, self.prefill_slice)
         if max(remaining) >= full and width < full // 4:
             self._starved += 1
         else:
             self._starved = 0
-        # A span whose tokens attend to each other both ways (an image on
-        # Gemma 4's encoder-free models) cannot be cut: the call grows to
-        # its end, past the slice and the valve's width by at most the
-        # span, and rows with less left are right-padded for this call.
-        widen = getattr(self._prompt_batch, "width_for_blocks", None)
-        if widen is not None:
-            width = widen(width)
+        if widths is not None:
+            # An image block is never cut (VENDORED.md, block width): the call
+            # stops at the next block's start, or grows to the blocks' end
+            # when the valve has room for that; else the rows that need the
+            # growth wait, and the rest run at the cut width.
+            cut, grown, needs = widths(width)
+            width = cut
+            if grown > cut and not self._room_for(grown * rows):
+                uids = self._prompt_batch.uids
+                forcing = [i for i, uid in enumerate(uids) if needs.get(uid, 0) > cut]
+                if len(forcing) < rows:
+                    self._park(forcing)
+                else:
+                    # Everybody forces: the first that fits alone runs alone.
+                    stay = next(
+                        (i for i in forcing if self._room_for(needs[uids[i]])), None
+                    )
+                    fits = stay is not None
+                    stay = 0 if stay is None else stay
+                    uid, need = uids[stay], needs[uids[stay]]
+                    self._park([i for i in forcing if i != stay])
+                    if not fits:
+                        self._block_stall(uid, need, front, by_query)
+                        return self._stalled(prompt_responses, generation_responses)
+                    width = need
+            elif grown > cut:
+                width = grown
 
         prompts = []
         for i, seq in enumerate(self._currently_processing):
@@ -2014,7 +2134,9 @@ class BatchGenerator:
             if len(segments[0]) == 0:
                 segments.pop(0)
                 response.end_of_segment = True
-            seq[1] += width
+            # By the row's own tokens: a row padded for a call over another
+            # row's block has not reached the call's width.
+            seq[1] += len(prompts[-1])
             response.progress = (seq[1], seq[2])
             prompt_responses.append(response)
 
@@ -2025,10 +2147,101 @@ class BatchGenerator:
         toc = time.perf_counter()
         self._counters.prompt_time += toc - tic
         self._last_prefill_s = toc - tic
+        self.stall_streak = 0
         if self.prefill_valve is not None:
-            self.prefill_valve.observe(sum(len(p) for p in prompts))
+            # The padded width is what the call cost.
+            self.prefill_valve.observe(width * len(prompts))
 
         return prompt_responses, generation_responses
+
+    def _stalled(self, prompt_responses, generation_responses):
+        self.stalled_calls += 1
+        self.stall_streak += 1
+        self._last_prefill_s = 0.0
+        return prompt_responses, generation_responses
+
+    def _block_stall(self, uid, need, front, by_query, at_block=True):
+        self.block_stall = BlockStall(uid, need, front, front and not by_query, at_block)
+        if at_block:
+            self.block_stalls += 1
+
+    def _room_for(self, tokens):
+        """Whether the valve would let a call of `tokens` through whole;
+        asked without counting, for a call that may not be made."""
+        if self.prefill_valve is None:
+            return True
+        allowed = self.prefill_valve.peek(tokens)
+        return allowed is not None and allowed >= tokens
+
+    def _fits_alone(self, batch, seq, idx):
+        """Whether row `idx` of `batch` (its _currently_processing entry
+        `seq`) could run alone now, asked as the round would ask: the
+        valve's width for the row's own call, and room for its block whole
+        when it stands at one."""
+        width = min(len(seq[0][0]), self.prefill_step_size, self.prefill_slice)
+        if self.prefill_valve is not None and self.prefill_valve.peek(width) is None:
+            return False
+        _, _, needs = batch.block_widths(width, [idx])
+        need = needs.get(batch.uids[idx])
+        return need is None or self._room_for(need)
+
+    def _park(self, indices):
+        """Rows leave the prompt batch for the lot, in batch order, behind
+        the rows waiting there (VENDORED.md, parking)."""
+        if not indices:
+            return
+        indices = sorted(indices)
+        moved = self._prompt_batch.split(indices)
+        gone = set(indices)
+        procs = [self._currently_processing[i] for i in indices]
+        self._currently_processing = [
+            x for i, x in enumerate(self._currently_processing) if i not in gone
+        ]
+        if self._parked is None:
+            self._parked = moved
+        else:
+            self._parked.extend(moved)
+        self._parked_processing.extend(procs)
+        self.parked_rows += len(indices)
+
+    def _take(self, idx):
+        """Row `idx` of the lot joins the prompt batch, at its end."""
+        taken = self._parked.split([idx])
+        self._prompt_batch.extend(taken)
+        self._currently_processing.append(self._parked_processing.pop(idx))
+        if not self._parked.uids:
+            self._parked = None
+
+    def _unpark(self):
+        """Bring a waiting row back (VENDORED.md, parking): the queue's head
+        when it fits alone, else the first row behind it that does, else
+        the head. Returns (head, by_query): whether the row now in the
+        prompt batch heads the queue, and whether a query of the valve put
+        it there."""
+        if self._currently_processing and not self.block_stall.front:
+            self._park([0])
+        head = bool(self._currently_processing)
+        if head and self._fits_alone(
+            self._prompt_batch, self._currently_processing[0], 0
+        ):
+            return True, True
+        for j in range(len(self._parked)):
+            if not self._fits_alone(self._parked, self._parked_processing[j], j):
+                continue
+            if head:
+                # The head yields for this round and keeps its place: it
+                # parks in front of the lot.
+                lot, procs = self._parked, self._parked_processing
+                self._parked, self._parked_processing = None, []
+                self._park([0])
+                self._parked.extend(lot)
+                self._parked_processing.extend(procs)
+                j += 1
+            self._take(j)
+            return j == 0, True
+        if not head:
+            self._take(0)
+        return True, False
 
     def next(self):
         """

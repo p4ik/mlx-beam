@@ -7,7 +7,8 @@ ceiling is the smaller of the device's recommended working set and what
 the process holds plus what the system has free - dynamic, since other
 engines may share the memory. A call whose estimate does not fit is cut
 to the width that does, on a grid of 64 tokens; below the smallest width
-the admission stalls for this round instead of the engine dying.
+the admission stalls for this round instead of the engine dying. A
+scheduler round decides against one reading of what is held (`round`).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import mlx.core as mx
 
@@ -92,6 +94,9 @@ class PrefillValve:
         self.last_ceiling: int | None = None
         self._free_cached: tuple[float, int | None] = (float("-inf"), None)
         self._before: tuple[int, int] | None = None
+        # What is held, read once by `round()` for every decision of the
+        # round; None between rounds, when every decision reads anew.
+        self._round_held: int | None = None
 
     # -- the ceiling ------------------------------------------------------------
 
@@ -103,44 +108,74 @@ class PrefillValve:
             self._free_cached = (now, value)
         return value
 
+    @contextmanager
+    def round(self):
+        """One scheduler round: what is held is read once here, and every
+        `peek` and `width` inside decides against that reading, so a call a
+        query saw room for is not stalled by memory another thread took
+        moments later. The reading expires with the round."""
+        self._round_held = self._active()
+        try:
+            yield
+        finally:
+            self._round_held = None
+
+    def _held(self) -> int:
+        return self._active() if self._round_held is None else self._round_held
+
     def ceiling(self) -> int | None:
         """min(recommended working set, held + free); None when neither is
         known - then the valve lets every call through."""
-        held = self._active()
+        self.last_ceiling = self._ceiling(self._held())
+        return self.last_ceiling
+
+    def _ceiling(self, held: int) -> int | None:
         free = self._free_now()
         candidates = [
             c for c in (self.recommended, None if free is None else held + free) if c
         ]
-        self.last_ceiling = min(candidates) if candidates else None
-        return self.last_ceiling
+        return min(candidates) if candidates else None
 
     # -- the decision -----------------------------------------------------------
+
+    def _allowed(self, wanted: int, ceiling: int | None, held: int) -> int | None:
+        """`wanted` when its estimated peak fits under the ceiling, a
+        narrower width on the grid when it does not, None below the
+        narrowest (stall); `wanted` as well while nothing is known."""
+        if self.bytes_per_token is None or wanted <= 0 or ceiling is None:
+            return wanted
+        fits = int((ceiling - held) // self.bytes_per_token)
+        if fits >= wanted:
+            return wanted
+        width = max(0, (fits // GRID) * GRID)
+        return None if width < MIN_WIDTH else width
 
     def width(self, wanted: int) -> int | None:
         """The width the next call may have: `wanted` when its estimated
         peak fits under the ceiling, a narrower width on the grid when it
         does not, None when not even the narrowest fits (stall)."""
+        # Read anew for `observe`: the call's transient is measured over
+        # what was held when it ran, not over the round's reading.
         self._before = (self._active(), self._peak())
         if self.bytes_per_token is None or wanted <= 0:
             self.last_width = wanted
             return wanted
-        ceiling = self.ceiling()
-        if ceiling is None:
-            self.last_width = wanted
-            return wanted
-        room = ceiling - self._before[0]
-        fits = int(room // self.bytes_per_token)
-        if fits >= wanted:
-            self.last_width = wanted
-            return wanted
-        width = max(0, (fits // GRID) * GRID)
-        if width < MIN_WIDTH:
+        width = self._allowed(wanted, self.ceiling(), self._held())
+        if width is None:
             self.stalled_calls += 1
-            self.last_width = None
-            return None
-        self.shrunk_calls += 1
+        elif width < wanted:
+            self.shrunk_calls += 1
         self.last_width = width
         return width
+
+    def peek(self, wanted: int) -> int | None:
+        """What `width(wanted)` would answer now, with nothing counted and
+        nothing recorded for `observe`: the scheduler asks this for a call
+        it may not make (a call grown over an image block)."""
+        if self.bytes_per_token is None or wanted <= 0:
+            return wanted
+        held = self._held()
+        return self._allowed(wanted, self._ceiling(held), held)
 
     def observe(self, tokens: int) -> None:
         """A call of `tokens` ran: when it moved the allocator's peak, the

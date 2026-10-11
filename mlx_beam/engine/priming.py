@@ -130,24 +130,48 @@ class PrimingPromptBatch(PromptProcessingBatch):
                 rows.append(g[:, lo : lo + n].astype(mx.int32))
         return mx.stack(rows, axis=1)
 
-    def width_for_blocks(self, width: int) -> int:
-        """For the scheduler: the width of its next call, grown so that no
-        row's block span is cut by it (the span's end at the latest, from
-        where the row stands)."""
-        return self._whole_blocks([len(t) for t in self.tokens], 0, width)
+    def block_widths(self, width: int, rows=None) -> tuple[int, int, dict[int, int]]:
+        """For the scheduler, from the width the valve allowed: that width
+        cut back to the first block start a row would reach into, the cut
+        width grown to the end of every block a row then stands in (the
+        fixpoint over all rows), and for each row standing at a block start
+        the tokens to that block's end - what a call must hold whole for
+        the row. `rows`: batch indices to consider, all by default."""
+        if rows is None:
+            rows = range(len(self.uids))
+        starts = [len(t) for t in self.tokens]
+        cut = width
+        needs = {}
+        for i in rows:
+            lo = starts[i]
+            for span in self.spans_of(self.uids[i]):
+                if not span.block:
+                    continue
+                if lo < span.start < lo + cut:
+                    cut = span.start - lo
+                if span.start == lo:
+                    needs[self.uids[i]] = span.end - lo
+        return cut, self._whole_blocks(starts, 0, cut, rows), needs
 
-    def _whole_blocks(self, starts: list[int], done: int, n: int) -> int:
+    def _whole_blocks(self, starts: list[int], done: int, n: int, rows=None) -> int:
         """The chunk length that cuts no block span: a span whose tokens
         attend to each other both ways has to be prefilled in one call
         (its keys must all be there for its queries), so a chunk reaching
-        into one grows to the span's end."""
+        into one grows to the span's end. Grown until no span of any row
+        is cut: one row's growth can reach into a span of a row visited
+        before it."""
+        if rows is None:
+            rows = range(len(self.uids))
         grown = n
-        for i, uid in enumerate(self.uids):
-            lo = starts[i] + done
-            for span in self.spans_of(uid):
-                if span.block and span.start < lo + grown < span.end:
-                    grown = span.end - lo
-        return grown
+        while True:
+            before = grown
+            for i in rows:
+                lo = starts[i] + done
+                for span in self.spans_of(self.uids[i]):
+                    if span.block and span.start < lo + grown < span.end:
+                        grown = span.end - lo
+            if grown == before:
+                return grown
 
     def _block_ids(self, overlaps: list[tuple], n: int):
         """(B, n) block ids for the chunk, -1 for text; None without a
@@ -184,6 +208,16 @@ class PrimingPromptBatch(PromptProcessingBatch):
             raise ValueError("The batch length doesn't match the number of inputs")
         starts = [len(t) for t in self.tokens]
         lengths = [len(t) for t in tokens]
+        for i, uid in enumerate(self.uids):
+            end = starts[i] + lengths[i]
+            for span in self.spans_of(uid):
+                # A block cut here would silently attend over half an image.
+                if span.block and span.start < end < span.end:
+                    raise ValueError(
+                        f"the prefill call ends at {end}, inside the image block "
+                        f"{span.start}..{span.end} of row {uid}; a block is "
+                        "prefilled in one call"
+                    )
         widest = max(lengths, default=0)
         padding = [widest - n for n in lengths]
         if not tokens or (

@@ -87,7 +87,10 @@ admits nobody, so that row gets its full width once; measured on a
 token instead of 295, and a newcomer waits at most one call more
 (`test_a_trickle_of_short_prompts_cannot_starve_a_long_prefill`). The
 count of such calls is `starved_calls`, reported by the engine's health as
-`prefill_starved_calls`. Alone, a prompt sees
+`prefill_starved_calls`. (5) While rows wait for their image block to fit
+(`parking` below), or the last round was a block stall, no newcomer is
+admitted: a newcomer would push the waiting rows behind itself again, for
+as long as newcomers arrive. Alone, a prompt sees
 upstream's chunking at slice width; greedy output is byte-identical
 (`test_prefill_slice_keeps_output`, and the greedy replay against an unpatched
 worker on the 27B). Tests: `test_batch_matches_solo_on_hybrid`,
@@ -129,13 +132,21 @@ is stored quantized).
 `prefill valve` - `generate.py`, `BatchGenerator`: one constructor
 argument, `prefill_valve`, an object asked before every prefill call for
 the width the call may have (`width(tokens)`: the width, or None for no
-call this round) and told the width afterwards (`observe(tokens)`). The
+call this round), asked what it would answer for a call the scheduler may
+not make (`peek(tokens)`: the same answer, nothing counted and nothing
+recorded - the call grown over an image block, `block width` below) and
+told the call's width afterwards (`observe(tokens)`: the padded width
+times the rows, which is what the call cost), and asked to hold a
+round's answers to one reading of memory (`round()`: a context the
+scheduler opens before the queries that bring a waiting row back and
+closes with the round; `parking` below). The
 engine hands in `mlx_beam.engine.valve.PrefillValve`, which estimates the
 call's peak from bytes per token learned on this machine and holds it
 under min(recommended working set, held + free), cutting the width or
 stalling the round instead of letting Metal fail. `stalled_calls` counts
-the rounds held back. With the argument left out nothing changes. Tests:
-`tests/test_valve.py`.
+the rounds held back; `stall_streak` counts them in a row and is reset by
+a prefill call that ran, not by the valve's answer. With the argument
+left out nothing changes. Tests: `tests/test_valve.py`.
 
 `marker families` - `tokenizer_utils.py`, `_infer_thinking`,
 `_infer_structural_markers`, `_infer_tool_parser`, `TokenizerWrapper`: two
@@ -198,15 +209,75 @@ AND(window, OR(causal, same block)) - an image's tokens attend to each
 other both ways; the full layers stay causal, as upstream's
 `create_masks_for_vision_model` has it. A key before the chunk belongs to
 no block: the engine prefills a block whole (`PrimingPromptBatch`,
-`width_for_blocks`). Tests: `tests/test_vision_core.py`
+`block_widths`). Tests: `tests/test_vision_core.py`
 (`test_a_block_span_is_prefilled_whole_with_the_model_s_block_ids`).
 
-`block width` - `generate.py`, `BatchGenerator._next`: after the width of
-a prefill call is settled (shortest segment, step, slice, valve), the
-prompt batch may widen it (`width_for_blocks`) so that no row's block
-span is cut; rows with less left are right-padded for that call, as
-upstream pads every call. Tests: `tests/test_vision_core.py`
-(`test_unequal_prefill_rows_with_spans_are_right_padded`).
+`block width` - `generate.py`, `BatchGenerator._next`: the valve decides
+the width of a prefill call first (shortest segment, step, slice, then
+`width()`); only then do the block rules apply, through the prompt
+batch's `block_widths`: the call is cut back to the first block start a
+row would reach into, and the cut width grows to the end of every block a
+row then stands in - the fixpoint over all rows, since one row's growth
+can reach into a block of a row visited before it. A grown call runs only
+when the valve has room for it (`peek`, `prefill valve` above); otherwise
+the rows that force the growth - rows standing at a block start whose
+block is longer than the cut width - wait (`parking` below) and the rest
+run at the cut width. The valve after the block rules would narrow the
+call again and cut a block. Rows with less left than the call are
+right-padded for it, as upstream pads every call. Tests:
+`tests/test_vision_core.py` (`test_block_width_is_a_fixpoint_in_any_row_order`,
+`test_a_block_that_does_not_fit_stalls_instead_of_passing_the_valve`,
+`test_a_row_at_a_block_start_is_not_cut_by_the_valve`,
+`test_unequal_prefill_rows_with_spans_are_right_padded`).
+
+`prefill progress` - `generate.py`, `BatchGenerator._next`: a row's
+progress advances by the tokens it handed to the call, not by the call's
+width. A row right-padded for a call over another row's block reported
+the call's width and the engine filed its checkpoint under a position the
+row had never reached; a later prefix hit then assembled states of
+different positions. Test: `tests/test_vision_core.py`
+(`test_a_padded_row_files_its_checkpoint_at_its_own_position`).
+
+`parking` - `generate.py`, `BatchGenerator`: a fourth place for a row
+beside the backlog, the prompt batch and the generation batch. A row whose
+image block does not fit beside the others under the valve's ceiling
+leaves the prompt batch (`split`) for the lot (`_parked`, with its
+`_currently_processing` entries beside it) and comes back (`extend`) when
+nothing else prefills - the prompt batch is empty, or holds only the row a
+block stall left there. The lot is a queue in arrival order: its head
+comes back as soon as it fits alone, asked with `peek` what the round asks
+`width()`: a width for the row's own call, and room for its block whole
+when it stands at one; while it does not, the first row behind it that
+fits passes it, and the head keeps its place. The queries and the round's
+`width()` answer from one reading of what is held (`PrefillValve.round`,
+opened before the queries and closed with the round): a row a query saw
+room for runs that round. Read anew, memory another thread took between
+the query and the width would stall it, and a rise in step with the
+queries would stall it, uncounted, for ever. A row alone in the prompt
+batch whose block still finds no room is a block stall (`BlockStall`: the
+row, the tokens the call must hold whole for it, whether it heads the
+queue, whether the round counts, whether its block is what found no room;
+a row alone on the valve while others wait, or one whose block fits while
+its call does not, is held and counted towards the refusal the same way,
+but refused with the valve's message and left out of `block_stalls`): the
+round counts `stalled_calls` and `stall_streak` like a valve stall,
+`block_stalls` as well, and the engine relieves it as it relieves a valve
+stall (store eviction, waiting while something decodes, refusal after the
+stall rounds) - but only rounds in which the stall row heads the queue and
+no query saw room count towards the refusal; any other stall row joins the
+back of the queue the next round. Admission pauses while the lot holds
+rows or the last round was a block stall (`scheduler`, rule 5). When all
+rows of a call force the growth, the first in batch order that fits alone
+runs alone and the others park; when none fits, the first stays alone: a
+block stall. A finished prompt is handed over before a row is brought
+back. The lot's rows are known to `_find_uids` (stage 3), `extract_cache`,
+`remove` and `prompt_cache_nbytes`; the batch `split` makes is never
+prefilled itself (`_copy` carries the base class's fields only), rows
+return into the prompt batch through `extend`. Counted for /health:
+`block_stalls`, `parked_rows`, and the rows parked now. Tests:
+`tests/test_vision_core.py` (`test_a_parked_row_comes_back_intact`,
+`test_the_round_decides_from_the_reading_its_queries_answered_from`, the
+block stall tests).
 
 `emptied batch` - `generate.py`, `GenerationBatch.filter`: an emptied
 batch drops its current tokens and logprobs; upstream keeps them, and
