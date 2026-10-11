@@ -15,6 +15,22 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 - Image requests to a Pixtral tower failed with a stream error: arrays the
   tower builds while it loads are now evaluated when it loads, as are the
   ones a draft proposer holds beside its parameters.
+- A checkpoint rendered through mistral-common streamed its text through
+  the BPE detokenizer whenever a `tokenizer.json` with a ByteLevel decoder
+  lay beside `tekken.json` (the published conversions carry one): text
+  beyond ASCII came out as U+FFFD or stray control bytes, a response could
+  end in a 500 (`KeyError`) at its final flush, and logprob bytes were
+  wrong the same way. The engine now decodes from the tokenizer's own byte
+  pieces; `/health.template.detokenizer` names the detokenizer in use.
+- Tool calls on the mistral-common renderer were given ids in the OpenAI
+  form (`call_` and 24 hex digits), which mistral-common's validator
+  refuses on the next turn for tokenizer versions v3 to v11 (they take
+  nine characters of a-z, A-Z, 0-9), so a tool loop failed at its second
+  step with a 400. A fresh id now has that form, ids a client sends in
+  another form are mapped to it when the prompt renders (per turn, the
+  same for a call and its result; a call's valid id stays, a result's id
+  that answers no call of the turn is mapped whatever its form), and a
+  `[CALL_ID]` the model writes is read.
 
 ## [0.1.0a10] - 2026-10-04
 

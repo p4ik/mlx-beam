@@ -197,11 +197,15 @@ class Served:
             h["vision"] = {"refused": self.vision_refused}
         else:
             h["vision"] = None
+        # Which streaming detokenizer the loader picked, as evidence that a
+        # tekken checkpoint decodes from its own bytes; None for a stub.
+        detokenizer = getattr(self.tokenizer, "_detokenizer", None)
         # How the template takes the roles the formats admit, measured
         # once: `developer` native or rendered as system.
         h["template"] = {
             "source": self.chat_template_source,
             "roles": roles.describe(self.tokenizer),
+            "detokenizer": None if detokenizer is None else type(detokenizer).__name__,
         }
         h["api"] = {
             "reasoning_field": self.reasoning_field,

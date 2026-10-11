@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from mlx_beam import renderer
 from mlx_beam._vendor.mlx_lm.generate import TextStateMachine
 from mlx_beam.api import repair
 from mlx_beam.engine.request import TokenEvent
@@ -102,10 +103,11 @@ def xtc_special_ids(tokenizer) -> tuple[int, ...]:
 
 def holds_incomplete_bytes(detokenizer) -> bool:
     """Whether the text the detokenizer holds back ends in a cut UTF-8
-    sequence. mlx-lm's BPE and SPM detokenizers keep bytes until they form
-    a character; only those bytes tell a fragment from a real U+FFFD. With
-    no bytes to look at (the naive detokenizer) nothing is dropped: a
-    spare U+FFFD is cosmetic, a deleted character is not."""
+    sequence. mlx-lm's BPE and SPM detokenizers, and the byte-piece one a
+    tekken checkpoint gets, keep bytes until they form a character; only
+    those bytes tell a fragment from a real U+FFFD. With no bytes to look
+    at (the naive detokenizer) nothing is dropped: a spare U+FFFD is
+    cosmetic, a deleted character is not."""
     held = getattr(detokenizer, "_unflushed", None)
     if isinstance(held, str):  # BPE: byte-level characters
         try:
@@ -129,10 +131,15 @@ _SPM_BYTE = re.compile(r"^<0x([0-9A-Fa-f]{2})>$")
 
 
 def token_bytes(tokenizer, token_id: int, text: str) -> list[int]:
-    """The token's bytes: the raw ones for a byte-level token (a piece of
-    a character decodes to U+FFFD, whose bytes are not the token's) - the
+    """The token's bytes: the tokenizer's own where the detokenizer reads
+    them (tekken); else the raw ones for a byte-level token (a piece of a
+    character decodes to U+FFFD, whose bytes are not the token's) - the
     hex of a SentencePiece byte token, the byte alphabet of a BPE one -
     the text's otherwise."""
+    byte_piece = getattr(getattr(tokenizer, "_detokenizer", None), "byte_piece", None)
+    if byte_piece is not None:
+        # A list: `bytes` does not go through json.dumps.
+        return list(byte_piece(token_id))
     if "\ufffd" in text and hasattr(tokenizer, "convert_ids_to_tokens"):
         try:
             from mlx_beam._vendor.mlx_lm.tokenizer_utils import _byte_decoder
@@ -247,7 +254,14 @@ class ToolCallParser:
     longest prefix that parses, so the calls before a cut are kept."""
 
     def __init__(
-        self, tool_parser, tools, streaming: bool, start="", end="", dialect=None
+        self,
+        tool_parser,
+        tools,
+        streaming: bool,
+        start="",
+        end="",
+        dialect=None,
+        mistral_common=False,
     ):
         self._parser = tool_parser
         self._tools = tools
@@ -259,6 +273,9 @@ class ToolCallParser:
         # Python (values not in JSON quotes) would have its values changed
         # by it, so the rung runs for the JSON dialects only.
         self._json = dialect in JSON_DIALECTS
+        # On the mistral-common renderer a fresh id takes the form its
+        # validator accepts on the next turn.
+        self._mistral_common = mistral_common
 
     def __call__(
         self, blocks: Iterable[tuple[str, bool]]
@@ -375,7 +392,11 @@ class ToolCallParser:
                         text[:200],
                     )
                     return None
-            tc_id = tc.pop("id", None) or f"call_{uuid.uuid4().hex[:24]}"
+            tc_id = tc.pop("id", None) or (
+                renderer.mistral_tool_call_id()
+                if self._mistral_common
+                else f"call_{uuid.uuid4().hex[:24]}"
+            )
             try:
                 tc["arguments"] = json.dumps(args, ensure_ascii=False)
             except TypeError as e:
@@ -460,6 +481,7 @@ class TextAssembler:
             start=getattr(tokenizer, "tool_call_start", None),
             end=getattr(tokenizer, "tool_call_end", None),
             dialect=getattr(tokenizer, "tool_parser_type", None),
+            mistral_common=renderer.is_mistral_common(tokenizer),
         )
         self.tokens = 0
         # Events since the last chunk went out, each with whether its text

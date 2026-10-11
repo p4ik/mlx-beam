@@ -46,6 +46,7 @@ from mlx_beam.api.text import (
 from mlx_beam.engine.request import GenerationRequest, SamplingParams
 from mlx_beam.engine.thinking import ReasoningLimits, budget, close_tail
 from mlx_beam.modalities import Image
+from mlx_beam.renderer import is_mistral_common, mistral_tool_call_ids
 
 # What a parser falls back to when no server defaults are handed in (tests).
 DEFAULTS = RequestDefaults()
@@ -399,6 +400,9 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     if req.images and frontend is None:
         raise no_vision()
     mirror_reasoning(req.messages, renderer_reasoning_keys(tokenizer))
+    if is_mistral_common(tokenizer):
+        # On the request itself: the boundary re-renders read req.messages.
+        mistral_tool_call_ids(req.messages)
     kwargs = dict(req.template_kwargs)
     if req.tools:
         kwargs["tools"] = req.tools

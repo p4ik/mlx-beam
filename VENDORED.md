@@ -404,6 +404,31 @@ Tests: `test_qwen_literal_end_tag_in_a_value`,
 `test_qwen_parameter_tag_inside_a_value_is_refused_not_silently_split`,
 `test_qwen_text_between_parameters_is_an_error_not_dropped`.
 
+`byte pieces` - `tokenizer_utils.py`, `BytePieceStreamingDetokenizer` and
+`load`: a streaming detokenizer over the tokenizer's own byte pieces, chosen
+when the loaded tokenizer is transformers' `MistralCommonBackend` over a
+`Tekkenizer` (`id_to_byte_piece`, special tokens kept as their text so
+`[TOOL_CALLS]` reaches the tool parser). Upstream picks the detokenizer from
+the decoder in `tokenizer.json` alone; a tekken checkpoint that carries a
+`tokenizer.json` with a ByteLevel decoder got the BPE detokenizer, whose byte
+alphabet does not describe the backend's text pieces: U+FFFD and control
+bytes in the text, `KeyError` at the final flush. The bytes go through an
+incremental UTF-8 decoder: a character spread over tokens is held back
+(`_unflushed`, read by the API's fragment check), a byte no sequence can
+start comes out as U+FFFD at once, `finalize` never raises; an id outside
+the vocabulary raises, as the SPM detokenizer does. Tests:
+`tests/test_renderer.py` (`test_the_loader_picks_the_byte_detokenizer_for_tekken`,
+`test_tekken_text_round_trips`, `test_finalize_never_raises`,
+`test_a_cut_sequence_is_held_and_an_invalid_byte_is_not`,
+`test_tool_calls_marker_reaches_the_parser`).
+
+`call ids` - `tool_parsers/mistral.py`, `_tool_call_header_regex` and
+`_parse_header_calls`: the header may carry `[CALL_ID]<id>` between the name
+and `[ARGS]`, as mistral-common renders a call for the tokenizer versions
+that carry ids; the id is taken over as written, an empty one is none.
+Upstream's header regex knows no `[CALL_ID]`, so such a call failed to parse
+as a whole and came back as text. Test: `test_the_mistral_parser_reads_a_call_id`.
+
 Fixed upstream since 0.31.3 and therefore not carried: the float32 promotion
 in `BatchKVCache.extend` when a fresh prompt joins a batch (mlx-lm #1491).
 

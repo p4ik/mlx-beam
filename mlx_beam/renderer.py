@@ -6,8 +6,12 @@ loads, since the choice is a tokenizer argument."""
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
+import random
+import re
+import string
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +21,11 @@ MISTRAL_COMMON = "mistral-common"
 # What mistral-common's tool-call marker is called in every tekken
 # vocabulary; its presence is what makes the checkpoint tool-capable.
 TOOL_CALL_START = "[TOOL_CALLS]"
+
+# The tool-call id mistral-common's validators take, in every tokenizer
+# version that checks one (v3 to v11; v13 on want a non-empty id only).
+TOOL_CALL_ID = re.compile(r"^[a-zA-Z0-9]{9}$")
+_BASE62 = string.digits + string.ascii_uppercase + string.ascii_lowercase
 
 
 @dataclass
@@ -87,3 +96,90 @@ def install_tool_parser(tokenizer) -> str | None:
     tokenizer._tool_call_end_tokens = ()
     tokenizer._tool_parser_type = "mistral"
     return "mistral"
+
+
+def is_mistral_common(tokenizer) -> bool:
+    """Whether the prompt renders through mistral-common: the object behind
+    the engine's tokenizer is transformers' MistralCommonBackend (the mark
+    the vision package reads too). Its validator sets the id format."""
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    return type(inner).__name__ == "MistralCommonBackend"
+
+
+def mistral_tool_call_id() -> str:
+    """A fresh tool-call id in the form mistral-common's validators take."""
+    return "".join(random.choices(_BASE62, k=9))
+
+
+def mistral_tool_call_ids(messages: list[dict]) -> None:
+    """Rewrite, in place, the tool-call ids mistral-common's validator would
+    refuse into the nine-character form. Per turn - an assistant message's
+    calls and the tool results up to the next assistant message - a call's
+    valid id stays and every other non-empty id gets a substitute: a call's
+    in another form, and a result's that answers no call of the turn,
+    whatever its form (as sent, it could name the substitute of a call it
+    never answered); the same one for a call and its result. None and ""
+    stay for mistral-common to report. Per turn, since that is where the
+    validator checks for duplicates, and so a later turn never changes an
+    earlier one. Run once per request, when the prompt renders: a second
+    run would give a result that answers no call a new substitute."""
+    turn: list[dict] = []
+    for m in messages:
+        if m.get("role") == "assistant" and turn:
+            _map_turn(turn)
+            turn = []
+        turn.append(m)
+    _map_turn(turn)
+
+
+def _needs_mapping(value) -> bool:
+    return isinstance(value, str) and bool(value) and not TOOL_CALL_ID.match(value)
+
+
+def _digest_id(original: str) -> str:
+    # Base62 of SHA-256, most significant digit first, cut to nine.
+    n = int.from_bytes(hashlib.sha256(original.encode()).digest(), "big")
+    digits = ""
+    while n:
+        n, r = divmod(n, 62)
+        digits = _BASE62[r] + digits
+    return digits[:9]
+
+
+def _map_turn(turn: list[dict]) -> None:
+    calls = [
+        c
+        for m in turn
+        if m.get("role") == "assistant"
+        for c in m.get("tool_calls") or ()
+    ]
+    results = [m for m in turn if m.get("role") == "tool"]
+    # String ids only: anything else is left for the validator to refuse.
+    sent = {c["id"] for c in calls if isinstance(c.get("id"), str)}
+    taken = {
+        c["id"]
+        for c in calls
+        if isinstance(c.get("id"), str) and TOOL_CALL_ID.match(c["id"])
+    }
+    mapped: dict[str, str] = {}
+
+    def substitute(original: str) -> str:
+        if original not in mapped:
+            candidate, n = _digest_id(original), 0
+            # An id another call of the turn holds would pair a result with
+            # a call it never answered (the client's pairing is what counts).
+            while candidate in taken:
+                n += 1
+                candidate = _digest_id(f"{n}:{original}")
+            taken.add(candidate)
+            mapped[original] = candidate
+        return mapped[original]
+
+    for c in calls:
+        if _needs_mapping(c.get("id")):
+            c["id"] = substitute(c["id"])
+    for m in results:
+        rid = m.get("tool_call_id")
+        # A result answering no call of the turn is mapped whatever its form.
+        if _needs_mapping(rid) or (isinstance(rid, str) and rid and rid not in sent):
+            m["tool_call_id"] = substitute(rid)

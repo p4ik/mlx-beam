@@ -5,8 +5,11 @@ from typing import Any
 
 import regex as re
 
-# Matches a "name[ARGS]" header, ending where the JSON arguments start.
-_tool_call_header_regex = re.compile(r"([\w-]+)\s*\[ARGS\]\s*")
+# Matches a "name[ARGS]" or "name[CALL_ID]id[ARGS]" header, ending where the
+# JSON arguments start; the id is whatever stands between the markers.
+_tool_call_header_regex = re.compile(
+    r"([\w-]+)\s*(?:\[CALL_ID\]\s*([^\[\]]*?)\s*)?\[ARGS\]\s*"
+)
 
 tool_call_start = "[TOOL_CALLS]"
 tool_call_end = ""
@@ -42,8 +45,9 @@ def _parse_json_calls(text: str) -> list[dict[str, Any]]:
 
 
 def _parse_header_calls(text: str) -> list[dict[str, Any]]:
-    """Parse `name[ARGS]{...}`, which can repeat. The template always renders
-    valid JSON, so a decode failure means generation was cut short."""
+    """Parse `name[ARGS]{...}` or `name[CALL_ID]id[ARGS]{...}`, which can
+    repeat. The template always renders valid JSON, so a decode failure means
+    generation was cut short."""
     # raw_decode reads exactly one JSON value and reports where it ended.
     decoder = json.JSONDecoder()
     calls = []
@@ -58,7 +62,11 @@ def _parse_header_calls(text: str) -> list[dict[str, Any]]:
             arguments, pos = decoder.raw_decode(text, pos)
         except json.JSONDecodeError as e:
             raise ValueError(f"Could not parse tool call from: {text}") from e
-        calls.append(dict(name=match.group(1), arguments=arguments))
+        call = dict(name=match.group(1), arguments=arguments)
+        if match.group(2):
+            # The id the model wrote; an empty one is none.
+            call["id"] = match.group(2)
+        calls.append(call)
     if calls and text[pos:].strip():
         raise ValueError(f"Could not parse tool call from: {text}")
     return calls
