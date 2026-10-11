@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import mlx.core as mx
+from jinja2.exceptions import TemplateError
 from mlx_beam_vision import families
 from mlx_beam_vision.cache import FeatureCache
 
@@ -52,9 +53,12 @@ def _spans_from(
     `[IMG_BREAK]`) gives an image several runs."""
     positions = [i for i, t in enumerate(ids) if t == token]
     if len(positions) != sum(counts):
-        raise ValueError(
-            f"the template placed {len(positions)} image placeholders for "
-            f"{sum(counts)} image tokens ({len(counts)} images)"
+        # The template's count was checked before the processor ran; what is
+        # left is a tower image_token_id that is not the processor's
+        # placeholder, or an image expanded into more tokens than features.
+        raise RuntimeError(
+            f"the prompt holds {len(positions)} image tokens for "
+            f"{sum(counts)} image features ({len(counts)} images)"
         )
     spans = []
     at = 0
@@ -96,6 +100,59 @@ def open_images(images: Sequence[Image]):
             raise ValueError(f"not a readable image ({e})") from None
         out.append(pil.convert("RGB"))
     return out
+
+
+class _Stage:
+    """A `with` block that says whose fault an exception inside it is: the
+    `passed` types go on as they are, any other Exception becomes `wrap`
+    with the original as its cause. A class, not a contextmanager
+    generator: that one hands a StopIteration on as itself."""
+
+    def __init__(self, passed: tuple, wrap: type, message: str, warn: bool = False):
+        self.passed = passed
+        self.wrap = wrap
+        self.message = message
+        self.warn = warn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not isinstance(exc, Exception) or isinstance(exc, self.passed):
+            return False
+        if self.warn:
+            logger.warning(self.message, exc_info=exc)
+        raise self.wrap(f"{self.message} ({type(exc).__name__}: {exc})") from exc
+
+
+def _client_stage(what: str) -> _Stage:
+    """`what` - the template, the processor or the renderer - judging the
+    request: a ValueError or TemplateError is its verdict, the client's 400;
+    anything else is made one too, with the traceback in the log in case
+    the engine was at fault after all."""
+    return _Stage(
+        (ValueError, TemplateError),
+        ValueError,
+        f"the {what} refused the request",
+        warn=True,
+    )
+
+
+def _engine_stage(what: str) -> _Stage:
+    """`what` - the tower, the positions, an output - failing is the
+    server's."""
+    return _Stage((RuntimeError,), RuntimeError, f"the {what} failed")
+
+
+def _image_parts(messages) -> int:
+    """The `{"type": "image"}` parts in the messages' content lists, the
+    ones the engine put there, one per image."""
+    return sum(
+        1
+        for m in messages
+        for part in (m.get("content") if isinstance(m.get("content"), list) else ())
+        if isinstance(part, dict) and part.get("type") == "image"
+    )
 
 
 class VisionFrontend:
@@ -158,35 +215,54 @@ class VisionFrontend:
 
     def build(self, messages, images: Sequence[Image], template_kwargs: dict) -> Built:
         kwargs = dict(template_kwargs)
+        # The engine makes the image part and the image in one step.
+        parts = _image_parts(messages)
+        if parts != len(images):
+            raise RuntimeError(
+                f"{len(images)} images for {parts} image parts in the messages"
+            )
         if self.renderer is not None:
             ids, processed = self._render_mistral_common(messages, images, kwargs)
             assistant_start = len(ids)
         else:
             if self.chat_template is not None:
                 kwargs["chat_template"] = self.chat_template
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, **kwargs
-            )
-            pil = open_images(images)
-            processed = self.processor(
-                text=[text],
-                images=pil or None,
-                return_tensors="np",
-                **self._text_kwargs(text),
-            )
-            ids = [int(t) for t in processed["input_ids"][0]]
+            with _client_stage("template"):
+                text = self.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, **kwargs
+                )
+            # A template that drops an image part: the processor would take
+            # the image anyway and the mismatch surface later, if at all.
+            placed = text.count(self.processor.image_token)
+            if placed != len(images):
+                raise ValueError(
+                    f"the chat template placed {placed} image placeholders for "
+                    f"{len(images)} images"
+                )
+            with _client_stage("processor"):
+                pil = open_images(images)
+                processed = self.processor(
+                    text=[text],
+                    images=pil or None,
+                    return_tensors="np",
+                    **self._text_kwargs(text),
+                )
+            with _engine_stage("processor's output"):
+                ids = [int(t) for t in processed["input_ids"][0]]
             assistant_start = None
-        encoded = self._encode(images, processed)
+        with _engine_stage("vision tower"):
+            encoded = self._encode(images, processed)
         counts = [int(enc.features.shape[0]) for enc in encoded]
         family = families.module_for(self.family)
         positions, delta = None, 0
         if hasattr(family, "positions"):
-            positions, delta = family.positions(
-                ids,
-                self.tower.image_token_id,
-                processed.get("image_grid_thw", []),
-                self.tower.config.spatial_merge_size,
-            )
+            with _engine_stage("image positions"):
+                positions, delta = family.positions(
+                    ids,
+                    self.tower.image_token_id,
+                    processed.get("image_grid_thw", []),
+                    self.tower.config.spatial_merge_size,
+                )
         spans = []
         block = bool(getattr(family, "BLOCKS", False))
         for runs, image, enc in zip(
@@ -256,26 +332,28 @@ class VisionFrontend:
                         parts.append(part)
                 m = {**m, "content": parts}
             with_images.append(m)
-        if queue:
-            raise ValueError("more images than image parts in the messages")
-        out = self.renderer.apply_chat_template(
-            with_images, tokenize=True, return_dict=True, **kwargs
-        )
-        ids = [int(t) for t in out["input_ids"]]
-        pixels = [
-            np.asarray(p, dtype=np.float32) for p in out.get("pixel_values") or []
-        ]
-        if not pixels:
-            return ids, {
-                "pixel_values": np.zeros((0, 3, 0, 0), np.float32),
-                "image_sizes": [],
-            }
-        height = max(p.shape[1] for p in pixels)
-        width = max(p.shape[2] for p in pixels)
-        padded = np.zeros((len(pixels), pixels[0].shape[0], height, width), np.float32)
-        for i, p in enumerate(pixels):
-            padded[i, :, : p.shape[1], : p.shape[2]] = p
-        sizes = [[int(h), int(w)] for h, w in out["image_sizes"]]
+        with _client_stage("renderer"):
+            out = self.renderer.apply_chat_template(
+                with_images, tokenize=True, return_dict=True, **kwargs
+            )
+        with _engine_stage("renderer's output"):
+            ids = [int(t) for t in out["input_ids"]]
+            pixels = [
+                np.asarray(p, dtype=np.float32) for p in out.get("pixel_values") or []
+            ]
+            if not pixels:
+                return ids, {
+                    "pixel_values": np.zeros((0, 3, 0, 0), np.float32),
+                    "image_sizes": [],
+                }
+            height = max(p.shape[1] for p in pixels)
+            width = max(p.shape[2] for p in pixels)
+            padded = np.zeros(
+                (len(pixels), pixels[0].shape[0], height, width), np.float32
+            )
+            for i, p in enumerate(pixels):
+                padded[i, :, : p.shape[1], : p.shape[2]] = p
+            sizes = [[int(h), int(w)] for h, w in out["image_sizes"]]
         return ids, {"pixel_values": padded, "image_sizes": sizes}
 
     def _assistant_start(self, messages, kwargs: dict, text, ids: list[int]) -> int:
@@ -286,26 +364,33 @@ class VisionFrontend:
         against the prompt's tail. A template that renders the same either
         way puts the start at the end (nothing of the prompt is the
         assistant's, as the text path reads it); 0 - the whole prompt - is
-        the answer only when the template will not render or the frame's
-        ids do not match."""
+        the answer only when the frame cannot be located (no tokenizer or
+        no text, a template that will not render without the generation
+        prompt or renders no prefix of the prompt, frame ids that are not
+        the prompt's tail), and the log says which."""
         tok = getattr(self.processor, "tokenizer", None)
         if tok is None or not isinstance(text, str):
-            return 0
+            return _no_start("the processor has no tokenizer, or rendered no text")
         try:
             without = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False, **kwargs
             )
-        except Exception:  # noqa: BLE001 - the template's business
-            return 0
+        except Exception as e:  # noqa: BLE001 - the template's business
+            return _no_start(
+                "the template will not render without the generation prompt", e
+            )
         if not isinstance(without, str) or not text.startswith(without):
-            return 0
+            return _no_start(
+                "the prompt does not start with what the template renders "
+                "without the generation prompt"
+            )
         suffix = text[len(without) :]
         if not suffix:
             return len(ids)
         frame = tok.encode(suffix, add_special_tokens=False)
         n = len(frame)
         if not n or n > len(ids) or ids[-n:] != [int(t) for t in frame]:
-            return 0
+            return _no_start("the generation prompt's ids are not the prompt's tail")
         return len(ids) - n
 
     def _encode(self, images: Sequence[Image], processed: dict) -> list:
@@ -317,11 +402,17 @@ class VisionFrontend:
         found = [self.cache.get(k) for k in keys]
         missing = [i for i, f in enumerate(found) if f is None]
         if missing:
-            inputs = family.pixel_inputs(processed)
-            if family.count(inputs) != len(images):
-                raise ValueError("the processor's grids do not match the images")
-            if len(missing) < len(images):
-                inputs = family.select(inputs, missing)
+            # The pixel arrays are read here: a key missing from them is the
+            # output's fault, not the tower's.
+            source = (
+                "processor's output" if self.renderer is None else "renderer's output"
+            )
+            with _engine_stage(source):
+                inputs = family.pixel_inputs(processed)
+                if family.count(inputs) != len(images):
+                    raise RuntimeError("the processor's grids do not match the images")
+                if len(missing) < len(images):
+                    inputs = family.select(inputs, missing)
             fresh = self.tower.encode(*inputs)
             for i, enc in zip(missing, fresh, strict=True):
                 # A slice of the call's batch would keep the whole batch
@@ -352,6 +443,21 @@ class VisionFrontend:
             "feature_cache": self.cache.describe(),
             "images_encoded": self.images_encoded,
         }
+
+
+def _no_start(why: str, exc: BaseException | None = None) -> int:
+    # The frame is not located: the reasoning check and the parser read the
+    # whole prompt, and no boundary can be claimed at the generation prompt.
+    if exc is None:
+        logger.warning("assistant_start 0 (the whole prompt): %s", why)
+    else:
+        logger.warning(
+            "assistant_start 0 (the whole prompt): %s (%s: %.300s)",
+            why,
+            type(exc).__name__,
+            exc,
+        )
+    return 0
 
 
 def load_processor(

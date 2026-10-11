@@ -77,7 +77,10 @@ class Frontend(Protocol):
     ) -> Built:
         """The prompt for `messages` (content lists with `{"type": "image"}`
         parts in the order of `images`), rendered by the model's own
-        template and processor, the images encoded by the tower."""
+        template and processor, the images encoded by the tower. A request
+        the template, the processor or the renderer refuses raises
+        `ValueError` (or Jinja's `TemplateError`): the client's 400.
+        Anything else is the server's 500."""
 
     def describe(self) -> dict: ...
 

@@ -790,25 +790,29 @@ def test_images_in_tool_results_reach_the_frontend():
     assert exc.value.code == "extra_not_installed"
 
 
+class Picky(FakeFrontend):
+    """A frontend whose template takes three effort words; `boom` in the
+    template kwargs is the exception its processor raises instead."""
+
+    def build(self, messages, images, template_kwargs):
+        if template_kwargs.get("reasoning_effort") not in (
+            None,
+            "low",
+            "medium",
+            "high",
+        ):
+            raise ValueError("reasoning_effort must be one of low, medium, high")
+        if template_kwargs.get("boom"):
+            raise template_kwargs["boom"]
+        return super().build(messages, images, template_kwargs)
+
+
 def test_an_image_path_climbs_the_effort_ladder_and_reports_the_processor():
     """With images the prompt goes through the frontend, and through the
     same ladder: an effort word the template rejects is replaced by the
-    rung it takes; a processor error is the client's 400, not a 500."""
+    rung it takes; a failure inside the frontend is the server's error,
+    not the client's 400."""
     tok = StubTokenizer()
-
-    class Picky(FakeFrontend):
-        def build(self, messages, images, template_kwargs):
-            if template_kwargs.get("reasoning_effort") not in (
-                None,
-                "low",
-                "medium",
-                "high",
-            ):
-                raise ValueError("reasoning_effort must be one of low, medium, high")
-            if template_kwargs.get("boom"):
-                raise RuntimeError("the processor choked")
-            return super().build(messages, images, template_kwargs)
-
     body = {
         "messages": [
             {
@@ -830,9 +834,10 @@ def test_an_image_path_climbs_the_effort_ladder_and_reports_the_processor():
     tokens = chat.build_prompt(tok, req, Picky(tok))
     assert req.template_kwargs["reasoning_effort"] == "high" and len(req.spans) == 1
     assert tokens[req.spans[0].start] == PAD
-    req.template_kwargs["boom"] = True
-    with pytest.raises(ApiError, match="image input was refused: the processor choked"):
+    req.template_kwargs["boom"] = RuntimeError("the processor choked")
+    with pytest.raises(Exception, match="the processor choked") as exc:
         chat.build_prompt(tok, req, Picky(tok))
+    assert exc.type is RuntimeError
     with pytest.raises(ApiError) as exc:
         chat.build_prompt(tok, req, None)
     assert exc.value.code == "extra_not_installed"
@@ -1932,3 +1937,142 @@ def test_prompt_refuses_a_call_that_ends_inside_a_block():
     both = batch([0, 1])
     both.prompt([tokens[:10], tokens[:5]])
     assert [len(t) for t in both.tokens] == [10, 5]
+
+
+def image_body(**extra) -> dict:
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "w1"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }
+        ],
+        **extra,
+    }
+
+
+def _refusals(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "mlx_beam.api.chat"]
+
+
+def test_a_frontend_failure_on_a_later_rung_is_the_server_s_error_too():
+    """The ladder's second catch judges like the first: the template
+    rejects the word, the next rung renders and the processor fails."""
+    tok = StubTokenizer()
+    body = image_body(chat_template_kwargs={"reasoning_effort": "xhigh"})
+    req = chat.parse_chat_request(body, "m", vision=True)
+    req.template_kwargs["boom"] = RuntimeError("the processor choked")
+    with pytest.raises(Exception, match="the processor choked") as exc:
+        chat.build_prompt(tok, req, Picky(tok))
+    assert exc.type is RuntimeError
+
+
+def test_a_refused_image_is_the_client_s_400_with_one_log_line(caplog):
+    """A ValueError from the frontend is the refusal it always was, and
+    the log now says so, with the error's type and the text cut short."""
+    import logging
+
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(image_body(), "m", vision=True)
+    req.template_kwargs["boom"] = ValueError("not a readable image")
+    caplog.set_level(logging.INFO, logger="mlx_beam.api.chat")
+    with pytest.raises(
+        ApiError, match="image input was refused: not a readable image"
+    ) as exc:
+        chat.build_prompt(tok, req, Picky(tok))
+    assert exc.value.status == 400 and exc.value.param == "messages"
+    assert _refusals(caplog) == [
+        "image input refused: ValueError: not a readable image"
+    ]
+    caplog.clear()
+    req.template_kwargs["boom"] = ValueError("x" * 1000)
+    with pytest.raises(ApiError):
+        chat.build_prompt(tok, req, Picky(tok))
+    assert _refusals(caplog) == ["image input refused: ValueError: " + "x" * 300]
+
+
+def test_an_unknown_failure_in_the_frontend_is_the_server_s_whatever_its_type():
+    """An OSError out of the frontend would be taken for the socket's by
+    the server; wrapped as RuntimeError it reaches the catch-all, its
+    cause kept for the traceback."""
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(image_body(), "m", vision=True)
+    failure = OSError("disk gone")
+    req.template_kwargs["boom"] = failure
+    with pytest.raises(
+        Exception, match=r"the image frontend failed \(OSError: disk gone\)"
+    ) as exc:
+        chat.build_prompt(tok, req, Picky(tok))
+    assert exc.type is RuntimeError and exc.value.__cause__ is failure
+
+
+def test_an_exhausted_effort_ladder_with_an_image_leaves_one_log_line(caplog):
+    import logging
+
+    class Strict(FakeFrontend):
+        def build(self, messages, images, template_kwargs):
+            if template_kwargs.get("reasoning_effort"):
+                raise ValueError("reasoning_effort must be one of none")
+            return super().build(messages, images, template_kwargs)
+
+    tok = StubTokenizer()
+    body = image_body(chat_template_kwargs={"reasoning_effort": "xhigh"})
+    req = chat.parse_chat_request(body, "m", vision=True)
+    caplog.set_level(logging.INFO, logger="mlx_beam.api.chat")
+    with pytest.raises(ApiError) as exc:
+        chat.build_prompt(tok, req, Strict(tok))
+    assert exc.value.param == "reasoning_effort"
+    assert _refusals(caplog) == [
+        "image input refused: ValueError: reasoning_effort must be one of none"
+    ]
+
+
+def test_count_tokens_with_an_image_reports_a_frontend_failure_as_the_server_s():
+    """The messages endpoints' token count builds the prompt the same way."""
+    from mlx_beam.api import messages
+
+    tok = StubTokenizer()
+    data = base64.b64encode(png(4).data).decode()
+    body = {
+        "max_tokens": 4,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "w1"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": data,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    req = messages.parse_messages_request(body, "m", vision=True)
+    req.chat.template_kwargs["boom"] = RuntimeError("the processor choked")
+    with pytest.raises(Exception, match="the processor choked") as exc:
+        messages.count_tokens(tok, req, Picky(tok))
+    assert exc.type is RuntimeError
+
+
+def test_the_template_s_verdict_with_an_image_stays_the_client_s_400():
+    from jinja2.exceptions import TemplateError
+
+    tok = StubTokenizer()
+    req = chat.parse_chat_request(image_body(), "m", vision=True)
+    req.template_kwargs["boom"] = TemplateError("roles must alternate")
+    with pytest.raises(
+        ApiError, match="image input was refused: roles must alternate"
+    ) as exc:
+        chat.build_prompt(tok, req, Picky(tok))
+    assert exc.value.status == 400

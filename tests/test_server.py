@@ -793,3 +793,30 @@ def test_a_non_streaming_client_that_leaves_is_cancelled(server, monkeypatch):
             break
         time.sleep(0.2)
     assert json.loads(raw)["in_flight"] == 0
+
+
+def test_an_unexpected_error_is_a_500_with_a_traceback(server, monkeypatch, caplog):
+    """A failure no handler knows is the server's: a 500 on the OpenAI
+    route, Anthropic's `api_error` on the messages route, and in the log
+    a `request failed` with the traceback for each."""
+    import logging
+
+    from mlx_beam.api import chat
+
+    def failing(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(chat, "build_prompt", failing)
+    body = {"messages": [{"role": "user", "content": "w1"}], "max_tokens": 2}
+    with caplog.at_level(logging.ERROR, logger="mlx_beam.server"):
+        status, _, raw = call(server, "POST", "/v1/chat/completions", body)
+        assert status == 500 and json.loads(raw)["error"]["type"] == "server_error"
+        status, _, raw = call(server, "POST", "/v1/messages", body)
+        assert status == 500 and json.loads(raw)["error"]["type"] == "api_error"
+    failed = [
+        r
+        for r in caplog.records
+        if r.name == "mlx_beam.server" and r.getMessage() == "request failed"
+    ]
+    assert len(failed) == 2
+    assert all(r.exc_info and r.exc_info[0] is RuntimeError for r in failed)

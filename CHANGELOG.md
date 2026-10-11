@@ -59,6 +59,23 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   something still decoded or the prefix store was still giving up
   entries. Only rounds with nothing decoding and the store empty count
   now.
+- A request with images that failed inside the engine while its prompt
+  was prepared (the vision tower, the image positions) was answered 400
+  since 0.1.0a5, as if the client had sent a bad image, and the server
+  log said nothing. It is now a 500 with its traceback in the log; one
+  that is not already a `RuntimeError` is wrapped and names the stage -
+  the tower, the positions, the output. A request the template, the
+  processor or the renderer refuses stays a 400, and the log names the
+  error's type; when one of them fails with another type, the 400 names
+  which of them. A modality frontend reports a refused request as
+  `ValueError` (or Jinja's `TemplateError`); anything else it raises is
+  a server error.
+- A request with an image part that the chat template drops from the
+  prompt is refused before the processor and the vision tower run,
+  with a 400 that says how many image placeholders the template placed
+  for how many images. Until now the images went to the processor
+  anyway, and the mismatch surfaced later, with a reason that depended
+  on the model.
 
 ## [0.1.0a10] - 2026-10-04
 
