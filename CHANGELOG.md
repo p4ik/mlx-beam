@@ -6,6 +6,8 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+## [0.1.0a11] - 2026-10-11
+
 ### Fixed
 - The 400 for thinking off on a model that cannot switch it names the
   fields of the surface the request came in on - `thinking.budget_tokens`
