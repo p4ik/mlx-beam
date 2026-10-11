@@ -106,6 +106,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   differed from a run alone (since 0.1.0a1; every model with
   sliding-window layers, among them Gemma 4, gpt-oss and Muse). The mask
   now trims what the cache trims.
+- The processor 0.1.0a10 builds for a checkpoint without
+  `preprocessor_config.json` failed under transformers 5.19, which names
+  the video processor per backend, so such a checkpoint of a family with
+  a video processor (Qwen3-VL, Qwen3.5, Gemma 4, Muse Glimmer) still
+  came up without vision: the loader passed that mapping on as a class
+  name. The video processor is now picked like the image processor.
 
 ## [0.1.0a10] - 2026-10-04
 

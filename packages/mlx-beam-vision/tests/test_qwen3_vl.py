@@ -824,6 +824,66 @@ def test_load_processor_builds_only_when_the_checkpoint_ships_no_file(
         frontend.load_processor(tmp_path, config)
 
 
+def test_classes_for_reads_a_video_mapping_per_backend(monkeypatch):
+    """transformers names the video processor per backend, as it names the
+    image processor: a dict, not a string. Under a model type of its own
+    the mappings get such an entry, and the class comes back by name."""
+    from transformers.models.auto import (
+        image_processing_auto,
+        processing_auto,
+        video_processing_auto,
+    )
+
+    monkeypatch.setitem(
+        processing_auto.PROCESSOR_MAPPING_NAMES, "beam_test_vl", "Qwen3VLProcessor"
+    )
+    monkeypatch.setitem(
+        image_processing_auto.IMAGE_PROCESSOR_MAPPING_NAMES,
+        "beam_test_vl",
+        image_processing_auto.IMAGE_PROCESSOR_MAPPING_NAMES["qwen3_vl"],
+    )
+    monkeypatch.setitem(
+        video_processing_auto.VIDEO_PROCESSOR_MAPPING_NAMES,
+        "beam_test_vl",
+        {"torchvision": "Qwen3VLVideoProcessor"},
+    )
+    assert frontend.classes_for("beam_test_vl")[2].__name__ == "Qwen3VLVideoProcessor"
+
+
+def test_classes_for_resolves_the_installed_mappings():
+    """Against the installed transformers, without a mock: the families with
+    a video processor get its class, the ones without get None."""
+    expected = {
+        "qwen3_vl": "Qwen3VLVideoProcessor",
+        "qwen3_5": "Qwen3VLVideoProcessor",
+        "gemma4": "Gemma4VideoProcessor",
+        "gemma4_unified": "Gemma4UnifiedVideoProcessor",
+        "muse_glimmer": "MuseGlimmerVideoProcessor",
+    }
+    for model_type, name in expected.items():
+        classes = frontend.classes_for(model_type)
+        assert all(isinstance(c, type) for c in classes[:3]), model_type
+        assert classes[2].__name__ == name
+    for model_type in ("mistral3", "granite4_vision"):
+        assert frontend.classes_for(model_type)[2] is None
+
+
+def test_a_mapping_value_becomes_one_class_name():
+    """The helper picks one class name out of a transformers mapping value:
+    a string as it is; a dict by backend, the first name it has when the
+    backend's is missing, None when it has none; a tuple by its first name;
+    None for nothing."""
+    assert hasattr(frontend, "_class_name")
+    pick = frontend._class_name
+    assert pick("PixtralImageProcessor", "torchvision") == "PixtralImageProcessor"
+    assert pick({"torchvision": "A", "pil": "B"}, "torchvision") == "A"
+    assert pick({"pil": "B"}, "torchvision") == "B"
+    assert pick({"torchvision": None}, "torchvision") is None
+    assert pick(("A", "B"), "torchvision") == "A"
+    assert pick((None, "B"), "pil") == "B"
+    assert pick(None, "torchvision") is None
+
+
 def test_a_quantized_tower_loads_with_the_bits_its_tensors_imply(tmp_path):
     """An 8-bit conversion packs the tower's linears too (weight as uint32
     words, scales and biases beside it) and may leave some of them in

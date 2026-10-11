@@ -498,8 +498,9 @@ def load_processor(
 
 def classes_for(model_type: str):
     """transformers' own (processor, image processor, video processor or
-    None) for a model type; the image backend is torchvision when it is
-    installed, PIL otherwise, as AutoImageProcessor picks it."""
+    None) for a model type; the image class per backend - torchvision when
+    it is installed, PIL otherwise - as AutoImageProcessor picks it, the
+    video class likewise, None without torchvision."""
     from transformers.models.auto.image_processing_auto import (
         IMAGE_PROCESSOR_MAPPING_NAMES,
         get_image_processor_class_from_name,
@@ -515,24 +516,33 @@ def classes_for(model_type: str):
     from transformers.utils import is_torchvision_available
 
     proc = PROCESSOR_MAPPING_NAMES.get(model_type)
-    names = IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type)
-    if not proc or not names:
+    backend = "torchvision" if is_torchvision_available() else "pil"
+    image = _class_name(IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
+    if not proc or not image:
         raise ValueError(
             f"the checkpoint ships no preprocessor_config.json and transformers "
             f"has no processor for model type {model_type!r}, so images cannot "
             "be prepared"
         )
-    if isinstance(names, dict):
-        backend = "torchvision" if is_torchvision_available() else "pil"
-        image = names.get(backend) or next(n for n in names.values() if n)
-    else:
-        image = names if isinstance(names, str) else next(n for n in names if n)
-    video = VIDEO_PROCESSOR_MAPPING_NAMES.get(model_type)
+    video = _class_name(VIDEO_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
     return (
         processor_class_from_name(proc),
         get_image_processor_class_from_name(image),
         video_processor_class_from_name(video) if video else None,
     )
+
+
+def _class_name(names, backend: str):
+    """One class name out of a transformers mapping value: a string as it
+    is, a dict by `backend` (else the first name it holds), a tuple or a
+    list by its first name; None when there is none."""
+    if isinstance(names, str):
+        return names
+    if isinstance(names, dict):
+        return names.get(backend) or next((n for n in names.values() if n), None)
+    if isinstance(names, (tuple, list)):
+        return next((n for n in names if n), None)
+    return None
 
 
 class ModelValues:
