@@ -333,7 +333,8 @@ def test_api_decodes_data_urls_and_refuses_the_rest():
         chat.build_prompt(tok, req)
     assert exc.value.code == "extra_not_installed"
     gen = chat.to_generation_request(tok, req, frontend=front)
-    assert len(gen.spans) == 1 and gen.boundaries == [] and gen.system_end is None
+    assert len(gen.spans) == 1 and gen.system_end is None
+    assert gen.boundaries == [len(gen.tokens) - 1]
     assert gen.tokens[gen.spans[0].start : gen.spans[0].end] == [PAD] * K
     assert req.assistant_start == len(gen.tokens) - 1
 
@@ -2076,3 +2077,56 @@ def test_the_template_s_verdict_with_an_image_stays_the_client_s_400():
     ) as exc:
         chat.build_prompt(tok, req, Picky(tok))
     assert exc.value.status == 400
+
+
+def test_an_image_request_claims_the_boundary_only_where_it_holds():
+    """The one boundary of an image request is where the generation prompt
+    begins, when the frontend found it (not 0), inside the prompt, behind
+    every span - a span's end included; none for a start of 0, at the
+    prompt end (a template without a generation suffix) or inside a span.
+    A frontend that reports no spans claims it the same way."""
+
+    class At(FakeFrontend):
+        def __init__(self, tok, where, spans=True):
+            super().__init__(tok)
+            self.where = where
+            self.spans = spans
+
+        def build(self, messages, images, template_kwargs):
+            built = super().build(messages, images, template_kwargs)
+            start = self.where(len(built.tokens), built.spans[0])
+            spans = built.spans if self.spans else []
+            return Built(built.tokens, spans, assistant_start=start)
+
+    tok = StubTokenizer()
+    data = base64.b64encode(png(1).data).decode()
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "w1"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{data}"},
+                    },
+                    {"type": "text", "text": "w2"},
+                ],
+            }
+        ],
+        "max_tokens": 2,
+    }
+
+    def bounds(where, spans=True):
+        req = chat.parse_chat_request(body, "m", vision=True)
+        gen = chat.to_generation_request(tok, req, frontend=At(tok, where, spans))
+        return gen.boundaries, len(gen.tokens), gen.spans[0] if gen.spans else None
+
+    out, n, span = bounds(lambda n, s: n - 1)
+    assert span.end < n - 1 and out == [n - 1]
+    assert bounds(lambda n, s: s.end)[0] == [span.end]
+    for where in (lambda n, s: n, lambda n, s: 0, lambda n, s: s.end - 1):
+        assert bounds(where)[0] == []
+    # Without spans the start alone decides, and 0 is still no boundary.
+    assert bounds(lambda n, s: n - 1, spans=False)[0] == [n - 1]
+    assert bounds(lambda n, s: 0, spans=False)[0] == []

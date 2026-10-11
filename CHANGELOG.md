@@ -76,6 +76,17 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   for how many images. Until now the images went to the processor
   anyway, and the mismatch surfaced later, with a reason that depended
   on the model.
+- A hybrid model prefilled the conversation again from its start (from
+  the last stride checkpoint, in a long one) on every turn after an
+  image: a request with images claimed no boundary, so the entry's
+  checkpoint sat at the prompt end - behind the point the next
+  round agrees with when the template renders the finished answer
+  differently from the prompt that asked for it (Qwen3.5 with thinking
+  off). The start of the generation prompt, which the vision frontend
+  locates, is the boundary now, as it is for text since 0.1.0a9; the
+  recurrent layers resume from there. One checkpoint more per image
+  request for recurrent and sliding-window models, none for plain
+  attention without a draft head.
 
 ## [0.1.0a10] - 2026-10-04
 

@@ -707,11 +707,14 @@ def to_generation_request(
                 code="context_length_exceeded",
             )
     if req.images:
-        # Boundaries come from re-rendering message prefixes as text; with
-        # images the placeholders expand in the processor, so no boundary
-        # is claimed - a whole-entry hit (the next turn) still works, the
-        # image's digest is part of the key.
-        bounds, system_end = [], None
+        # With images the message prefixes cannot be re-rendered as text
+        # (the placeholders expand in the processor), so the one boundary
+        # is where the generation prompt begins, which the frontend located.
+        a = req.assistant_start
+        bounds = (
+            [a] if 0 < a < len(prompt) and all(s.end <= a for s in req.spans) else []
+        )
+        system_end = None
     else:
         bounds, system_end = boundaries_and_system_end(tokenizer, req, prompt)
     return GenerationRequest(

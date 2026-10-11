@@ -1701,3 +1701,97 @@ def test_a_processor_output_without_the_pixel_arrays_is_the_output_s_error():
     ) as exc:
         front.build(TWO_PARTS, [png(1), png(2)], {})
     assert exc.type is RuntimeError and exc.value.__cause__.__class__ is KeyError
+
+
+THINK_START, THINK_END = _core_tests.THINK_START, _core_tests.THINK_END
+
+
+class ThinkOffRendered(str):
+    """`Rendered` with the empty think block behind the frame."""
+
+    def __new__(cls, rendered):
+        self = super().__new__(cls, rendered + "<think></think>")
+        self.messages = rendered.messages
+        return self
+
+
+class ThinkOffFakeProcessor(FakeProcessor):
+    """A template like Qwen3's with thinking off: the generation prompt
+    carries an empty think block behind the assistant header (three
+    tokens), the finished turn in the history does not - so the prompt end
+    is no prefix of the next round."""
+
+    class Tok(FakeProcessor.Tok):
+        def encode(self, text, add_special_tokens=True):
+            if text == "<gen><think></think>":
+                return [7, THINK_START, THINK_END]
+            return super().encode(text, add_special_tokens)
+
+    tokenizer = Tok()
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=True, **kw
+    ):
+        rendered = super().apply_chat_template(
+            messages, tokenize, add_generation_prompt, **kw
+        )
+        if add_generation_prompt and kw.get("enable_thinking") is False:
+            return ThinkOffRendered(rendered)
+        return rendered
+
+    def __call__(self, text, images=None, return_tensors="np", **kw):
+        out = super().__call__(text, images, return_tensors, **kw)
+        if isinstance(text[0], ThinkOffRendered):
+            ids = out["input_ids"][0].tolist() + [THINK_START, THINK_END]
+            out["input_ids"] = np.array([ids])
+        return out
+
+
+def test_an_image_turn_resumes_from_the_generation_prompt():
+    """Round two renders the first answer without the think block the
+    prompt had asked for, so the entry's checkpoint at the prompt end lies
+    behind the point the rounds agree on; the recurrent layers resume from
+    the boundary where the generation prompt begins - with a cold run's
+    tokens."""
+    import base64
+
+    model = tiny_qwen35()
+    front = VisionFrontend(ThinkOffFakeProcessor([(1, 4, 4)]), tower(), "qwen3_vl")
+    tok = StubTokenizer()
+    data = base64.b64encode(png(3).data).decode()
+    asked = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "w3 w5"},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{data}"},
+            },
+        ],
+    }
+
+    def generation(messages):
+        req = chat.parse_chat_request(
+            {"messages": messages, "max_tokens": 4, "enable_thinking": False},
+            "m",
+            vision=True,
+        )
+        return chat.to_generation_request(tok, req, frontend=front), req
+
+    gen1, req1 = generation([asked])
+    start = req1.assistant_start
+    assert gen1.tokens[start:] == [7, THINK_START, THINK_END]
+    # The history carries the answer as the client sends it back - a fixed
+    # one, so the rounds part exactly where the frame's think block begins.
+    turn2 = [
+        asked,
+        {"role": "assistant", "content": "w4"},
+        {"role": "user", "content": "w9"},
+    ]
+    with Engine(model) as engine:
+        [e.token for e in engine.submit(gen1)]
+        second = engine.submit(generation(turn2)[0])
+        out2 = [e.token for e in second]
+    assert second.prompt_cached == start
+    with Engine(model) as cold:
+        assert out2 == [e.token for e in cold.submit(generation(turn2)[0])]
