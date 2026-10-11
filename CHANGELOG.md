@@ -6,6 +6,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Fixed
+- The 400 for thinking off on a model that cannot switch it names the
+  fields of the surface the request came in on - `thinking.budget_tokens`
+  on `/v1/messages`, `reasoning.effort` and `reasoning.max_tokens` on
+  `/v1/responses` - and advises an effort level only where the chat
+  template takes one.
+
 ## [0.1.0a10] - 2026-10-04
 
 ### Added

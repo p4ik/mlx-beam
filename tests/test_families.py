@@ -420,6 +420,7 @@ def test_a_family_without_a_switch_refuses_thinking_off():
         with pytest.raises(ApiError) as e:
             chat.build_prompt(MUSE, req)
         assert e.value.status == 400 and "reasoning_effort: low" in str(e.value)
+        assert e.value.param == "enable_thinking"
     # Thinking on, and an effort word, render as before.
     on = chat.parse_chat_request({"messages": [{"role": "user", "content": "hi"}]}, "m")
     assert initial_state(MUSE, chat.build_prompt(MUSE, on)) == ("frame", "")
@@ -433,12 +434,95 @@ def test_a_family_without_a_switch_refuses_thinking_off():
     assert zero.template_kwargs.get("enable_thinking") is not False
 
 
+def _refused(tokenizer, req):
+    """The 400 `build_prompt` raises for `req` on `tokenizer`."""
+    from mlx_beam.api.errors import ApiError
+
+    with pytest.raises(ApiError) as e:
+        chat.build_prompt(tokenizer, req)
+    assert e.value.status == 400
+    return e.value
+
+
+def test_the_messages_refusal_names_thinking_budget_tokens():
+    """Messages bounds reasoning through thinking.budget_tokens and has no
+    effort field: the refusal names that field and no effort word."""
+    from mlx_beam.api import messages
+
+    req = messages.parse_messages_request(
+        {
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "disabled"},
+        },
+        "m",
+    )
+    err = _refused(MUSE, req.chat)
+    assert err.param == "thinking"
+    assert "budget_tokens" in str(err)
+    assert "effort" not in str(err)
+
+
+def test_the_responses_refusal_names_reasoning_effort_and_max_tokens():
+    """Responses bounds reasoning through reasoning.effort and
+    reasoning.max_tokens: the refusal names those, not the chat fields."""
+    from mlx_beam.api import responses
+
+    req = responses.parse_responses_request(
+        {"input": "hi", "reasoning": {"effort": "none"}}, "m"
+    )
+    err = _refused(MUSE, req.chat)
+    assert err.param == "reasoning.effort"
+    assert "reasoning.effort: low" in str(err)
+    assert "reasoning.max_tokens" in str(err)
+    assert "reasoning_effort" not in str(err)
+    assert "max_reasoning_tokens" not in str(err)
+
+
+def test_a_surface_the_table_does_not_know_gets_the_chat_text():
+    """A guard: a surface outside the table falls back to the chat wording,
+    not to a KeyError."""
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}], "enable_thinking": False},
+        "m",
+    )
+    req.surface = "other"
+    err = _refused(MUSE, req)
+    assert err.param == "enable_thinking"
+    assert "reasoning_effort: low" in str(err)
+
+
+def test_without_an_effort_kwarg_the_refusal_names_only_the_bound():
+    """A template without an effort kwarg drops an effort word on the floor,
+    so the advice names the bound alone - on chat and on Responses."""
+    from mlx_beam.api import responses
+    from tests.stub_tokenizer import StubTokenizer
+
+    class NoSwitch(StubTokenizer):
+        thinking_switch = None
+
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}], "enable_thinking": False},
+        "m",
+    )
+    err = _refused(NoSwitch(), req)
+    assert "max_reasoning_tokens" in str(err)
+    assert "reasoning_effort: low" not in str(err)
+    req = responses.parse_responses_request(
+        {"input": "hi", "reasoning": {"effort": "none"}}, "m"
+    )
+    err = _refused(NoSwitch(), req.chat)
+    assert err.param == "reasoning.effort"
+    assert "reasoning.max_tokens" in str(err)
+    assert "reasoning.effort: low" not in str(err)
+
+
 def test_thinking_off_with_tools_is_a_zero_budget():
     """Without the opener in the prompt the block is kept out by the
     budget: zero masks the reasoning label behind the shared opener
-    (Harmony's `analysis`, Muse's `=self`), the answer's and the tools'
-    channels stay open. Without tools the opener does the job and no
-    budget is set. Muse refuses thinking off altogether (above)."""
+    (Harmony's `analysis`), the answer's and the tools' channels stay
+    open. Without tools the opener does the job and no budget is set.
+    Muse refuses thinking off altogether (above)."""
     for tok in (HARMONY,):
         req = chat.parse_chat_request(
             {
@@ -451,8 +535,7 @@ def test_thinking_off_with_tools_is_a_zero_budget():
         gen = chat.to_generation_request(tok, req)
         assert gen.reasoning is not None and gen.reasoning.max_tokens == 0
         tracker = ThinkingBudget(gen.reasoning)
-        # Harmony: the label after the shared marker; Muse: the opener's own
-        # last token (` to` + `=self`), so ` to=<tool>` stays free.
+        # Harmony: the label after the shared marker.
         label = tuple(getattr(tok, "reasoning_label_tokens", None) or ())[:1]
         assert tracker._block and tracker._cut == tuple(tok.think_start_tokens) + label
         without = chat.parse_chat_request(

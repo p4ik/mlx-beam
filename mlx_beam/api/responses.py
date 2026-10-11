@@ -266,6 +266,7 @@ def parse_responses_request(
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
         images=images or [],
+        surface="responses",
     )
     return ResponsesRequest(
         chat=chat,
