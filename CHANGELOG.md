@@ -12,6 +12,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   on `/v1/messages`, `reasoning.effort` and `reasoning.max_tokens` on
   `/v1/responses` - and advises an effort level only where the chat
   template takes one.
+- Image requests to a Pixtral tower failed with a stream error: arrays the
+  tower builds while it loads are now evaluated when it loads, as are the
+  ones a draft proposer holds beside its parameters.
 
 ## [0.1.0a10] - 2026-10-04
 

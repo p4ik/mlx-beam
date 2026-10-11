@@ -16,11 +16,11 @@ from dataclasses import asdict, replace
 from typing import Any
 
 import mlx.core as mx
-from mlx.utils import tree_flatten
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
 from mlx_beam.engine import exact
+from mlx_beam.engine.arrays import materialize
 from mlx_beam.engine.kv import (
     KVPolicy,
     describe_caches,
@@ -316,18 +316,13 @@ class Engine:
         request. A second call while the first warm-up runs waits for it."""
         with self._lock:
             if self._thread is None:
-                # Lazy arrays carry the loading thread's stream; the worker
-                # cannot evaluate them ("There is no Stream(cpu, 0) in
-                # current thread"). The state holds more than the
-                # parameters: rope frequency tables (Gemma 4, Llama 3) are
-                # lazy arrays outside parameters().
-                mx.eval(
-                    [
-                        a
-                        for _, a in tree_flatten(self.model.state)
-                        if isinstance(a, mx.array)
-                    ]
-                )
+                # Lazy arrays carry the loading thread's stream, which the
+                # worker cannot use.
+                if self.speculator is None:
+                    n = materialize(self.model)
+                else:
+                    n = materialize(self.model, self.speculator.proposer)
+                logger.info("%d arrays evaluated before the worker starts", n)
                 self._started_at = time.monotonic()
                 self._thread = threading.Thread(
                     target=self._run, name="beam-engine", daemon=True

@@ -22,6 +22,7 @@ from functools import cached_property
 from importlib.metadata import entry_points
 from typing import Any, Protocol
 
+from mlx_beam.engine.arrays import materialize
 from mlx_beam.engine.request import ImageSpan
 
 logger = logging.getLogger("beam.modalities")
@@ -133,6 +134,10 @@ def load_frontend(
                     tokenizer,
                     trust_remote_code=trust_remote_code,
                 )
+                # The tower computes in request threads; what the load left
+                # lazy carries this thread's stream.
+                n = materialize(frontend)
+                logger.info("modality %s: %d arrays evaluated", name, n)
                 missing = unmet_needs(
                     model, getattr(frontend, "needs", ("input_embeddings",))
                 )
