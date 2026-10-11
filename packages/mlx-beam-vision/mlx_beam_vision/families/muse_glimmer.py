@@ -65,6 +65,7 @@ class Tower:
         )
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -76,9 +77,13 @@ class Tower:
             for k, v in loaded.part("vision_tower").items()
             if "rotary_emb.inv_freq" not in k
         }
-        loaded.fit(self.model, tower, self.dtype)
-        loaded.fit(self.vision_adapter, loaded.part("vision_adapter"), self.dtype)
-        loaded.fit(self.vision_projection, loaded.part("vision_projection"), self.dtype)
+        self.model = loaded.fit(self.model, tower, self.dtype)
+        self.vision_adapter = loaded.fit(
+            self.vision_adapter, loaded.part("vision_adapter"), self.dtype
+        )
+        self.vision_projection = loaded.fit(
+            self.vision_projection, loaded.part("vision_projection"), self.dtype
+        )
         mx.eval(
             self.model.parameters(),
             self.vision_adapter.parameters(),
@@ -86,6 +91,7 @@ class Tower:
         )
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     def encode(self, pixel_values: mx.array, grid_thw: mx.array) -> list[Encoded]:
         features = self.model(pixel_values.astype(self.dtype), grid_thw)
@@ -105,6 +111,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 

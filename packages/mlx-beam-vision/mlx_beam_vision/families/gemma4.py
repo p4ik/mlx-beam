@@ -58,6 +58,7 @@ class Tower:
         )
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -70,11 +71,14 @@ class Tower:
                 k: v for k, v in weights.items() if not any(c in k for c in CLIP_KEYS)
             }
         weights = {k: v for k, v in weights.items() if "rotary_emb" not in k}
-        loaded.fit(self.model, self.model.sanitize(weights), self.dtype)
-        loaded.fit(self.embedder, loaded.part("embed_vision"), self.dtype)
+        self.model = loaded.fit(self.model, self.model.sanitize(weights), self.dtype)
+        self.embedder = loaded.fit(
+            self.embedder, loaded.part("embed_vision"), self.dtype
+        )
         mx.eval(self.model.parameters(), self.embedder.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     def encode(self, images: list[mx.array], positions: list | None) -> list[Encoded]:
         """One tower pass per image (their sizes differ); `positions` are
@@ -103,6 +107,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 

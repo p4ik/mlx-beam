@@ -86,6 +86,7 @@ class Tower:
         self.dtype = dtype
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -108,11 +109,12 @@ class Tower:
             embedder = {
                 k: v for k, v in embedder.items() if not k.startswith("multimodal_")
             }
-        loaded.fit(self.embedder, embedder, self.dtype)
-        loaded.fit(self.projection, projection, self.dtype)
+        self.embedder = loaded.fit(self.embedder, embedder, self.dtype)
+        self.projection = loaded.fit(self.projection, projection, self.dtype)
         mx.eval(self.embedder.parameters(), self.projection.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     def encode(self, pixel_values: mx.array, positions: mx.array) -> list[Encoded]:
         """All images of one processor call: patches padded to the
@@ -137,6 +139,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 

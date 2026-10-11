@@ -113,6 +113,7 @@ class Tower:
         )
         self.loaded_from: list[str] = []
         self.quantized = False
+        self.index = "none"
         self.checkpoint = config
         if model_path is not None:
             self.load(model_path)
@@ -122,11 +123,14 @@ class Tower:
         weights = self.model.sanitize(
             tower_keys(loaded.part("vision_tower", "vision_encoder"))
         )
-        loaded.fit(self.model, weights, self.dtype)
-        loaded.fit(self.projector, loaded.part("multi_modal_projector"), self.dtype)
+        self.model = loaded.fit(self.model, weights, self.dtype)
+        self.projector = loaded.fit(
+            self.projector, loaded.part("multi_modal_projector"), self.dtype
+        )
         mx.eval(self.model.parameters(), self.projector.parameters())
         self.loaded_from = loaded.shards
         self.quantized = loaded.quantized
+        self.index = loaded.index
 
     def encode(
         self, pixel_values: mx.array, image_sizes: list[tuple[int, int]]
@@ -159,6 +163,7 @@ class Tower:
             "dtype": str(self.dtype),
             "loaded_from": self.loaded_from,
             "quantized": self.quantized,
+            "index": self.index,
         }
 
 

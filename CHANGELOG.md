@@ -112,6 +112,28 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   a video processor (Qwen3-VL, Qwen3.5, Gemma 4, Muse Glimmer) still
   came up without vision: the loader passed that mapping on as a class
   name. The video processor is now picked like the image processor.
+- A checkpoint whose `processor_config.json` has no block for one of the
+  parts its processor class takes (the files of Gemma 4's encoder-free
+  models - the 12B and up - and of Muse Glimmer have none for the video
+  processor) came up without vision since 0.1.0a5: transformers refuses
+  such a file, and the loader passed that on. The processor is now put
+  together from the file - every part the file describes as transformers
+  loads it, only the missing one from the model and the class defaults,
+  the tokenizer, chat template and top-level values the checkpoint's;
+  `/health.vision.processor.built` names the parts that were built.
+- Muse Glimmer's 8-bit conversions were still refused since 0.1.0a5:
+  their projection to the text width is one bare linear, a part of its
+  own, and the loader swapped only the children of a part for their
+  quantized form, never the part itself, so its packed tensors did not
+  fit. A part that is itself a packed layer is now loaded as such.
+- A checkpoint whose `model.safetensors.index.json` belongs to another
+  conversion of the model (it names shards that are not there, or none
+  of the tower tensors it names is in the shard it points at) came up
+  without vision since 0.1.0a5: the loader followed the index and found
+  no tower. Such an index is now dropped whole and the tower read from
+  the `model*.safetensors` files whose headers list its tensors;
+  `/health.vision.tower.index` says `followed`, `stale` or `none` (no
+  index).
 
 ## [0.1.0a10] - 2026-10-04
 
