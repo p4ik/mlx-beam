@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hmac
 import ipaddress
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 # Names and addresses that mean this machine; a bind on one of them is
@@ -108,3 +108,22 @@ class Access:
 
     def describe(self) -> dict:
         return {"mode": self.mode, "allowed_hosts": list(self.hosts)}
+
+
+def check_allowed_origins(origins: Sequence[str]) -> tuple[str, ...]:
+    """The origin list as the server keeps it; an entry no browser sends
+    (empty, or with whitespace in it) or `null` is refused - by `serve`
+    before the model loads, by `Served` when it is built."""
+    for origin in origins:
+        if not origin:
+            raise ValueError("an allowed origin must not be empty")
+        # An origin goes back out as a header value: CR or LF would write
+        # into the response, and no browser sends an Origin with whitespace.
+        if any(c.isspace() for c in origin):
+            raise ValueError("an allowed origin must not contain whitespace")
+        if origin == "null":
+            raise ValueError(
+                "--allowed-origins null would admit every sandboxed page and "
+                "local file; serve the page over http and list that origin"
+            )
+    return tuple(origins)

@@ -88,8 +88,10 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         nargs="+",
         default=[],
         metavar="ORIGIN",
-        help="origins CORS admits, so a page in a browser may call the "
-        "server; by default none",
+        help="pages a browser may call the server from and read the answers of; "
+        "any other page's Origin gets 403, requests without an Origin header "
+        "(CLI, SDKs, curl) are not affected; null and empty entries are refused; "
+        "by default none",
     )
     access = p.add_argument_group("access")
     access.add_argument(
@@ -571,7 +573,7 @@ def serve(args) -> int:
 
     from mlx_beam import modalities, renderer
     from mlx_beam._vendor.mlx_lm.utils import _download, hf_repo_to_path, load
-    from mlx_beam.api.access import Access
+    from mlx_beam.api.access import Access, check_allowed_origins
     from mlx_beam.api.defaults import RequestDefaults
     from mlx_beam.engine import Engine, EngineDead
     from mlx_beam.server import Served
@@ -583,7 +585,7 @@ def serve(args) -> int:
     log = logging.getLogger("beam")
     # Flags are checked before minutes of loading are spent on a typo: the
     # KV policy, the template file, the draft flag, the request defaults
-    # the flags set, and the port.
+    # the flags set, the access policy, the origin list, and the port.
     try:
         policy = kv_policy_from_args(args)
         template = chat_template_from_args(args)
@@ -592,6 +594,7 @@ def serve(args) -> int:
         access = Access.resolve(
             args.host, args.api_key, args.skip_api_key, args.allowed_hosts
         )
+        check_allowed_origins(args.allowed_origins)
         probe_port(args.host, args.port)
     except (StartupError, ValueError, OSError) as e:
         log.error("%s", e)

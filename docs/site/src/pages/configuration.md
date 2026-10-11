@@ -21,7 +21,7 @@ Flags take mlx-lm's names where mlx-lm has one. `beam serve --help` prints the s
 | `--reasoning-field` | `reasoning` / `reasoning_content` / `both` / `none` | `reasoning` | <span class="hint" tabindex="0" data-tip="where a chat completion carries the model&#x27;s thinking: the field name(s), or none to leave the think markers in the content">where a chat completion carries the model's thinking</span> |
 | `--host` | text | `127.0.0.1` | address to listen on |
 | `--port` | integer ≥ 1 | `8000` | TCP port to listen on |
-| `--allowed-origins` | `ORIGIN` (one or more) | — | <span class="hint" tabindex="0" data-tip="origins CORS admits, so a page in a browser may call the server; by default none">origins CORS admits, so a page in a browser may call the server</span> |
+| `--allowed-origins` | `ORIGIN` (one or more) | — | <span class="hint" tabindex="0" data-tip="pages a browser may call the server from and read the answers of; any other page&#x27;s Origin gets 403, requests without an Origin header (CLI, SDKs, curl) are not affected; null and empty entries are refused; by default none">pages a browser may call the server from and read the answers of</span> |
 | `--max-queued` | integer ≥ 1 | — | <span class="hint" tabindex="0" data-tip="requests allowed to wait for a batch slot; one more is a 503 with Retry-After (default: unlimited)">requests allowed to wait for a batch slot</span> |
 | `--trust-remote-code` | switch | — | run a model_file shipped inside the checkpoint |
 | `--log-level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` | how much the server log says |

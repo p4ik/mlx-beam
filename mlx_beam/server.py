@@ -23,7 +23,7 @@ from typing import Any
 
 from mlx_beam import __version__
 from mlx_beam.api import chat, completions, messages, metrics, repair, responses, roles
-from mlx_beam.api.access import Access
+from mlx_beam.api.access import Access, check_allowed_origins
 from mlx_beam.api.defaults import RequestDefaults
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.reasoning import effort_capability, renderer_reasoning_keys
@@ -80,12 +80,7 @@ class Served:
         self.model_name = model_name
         self.reasoning_field = reasoning_field
         self.defaults = defaults or RequestDefaults()
-        # An origin goes back out as a header value; one with a line break
-        # or a space would write into the response, so it is refused here.
-        for origin in allowed_origins:
-            if origin != origin.strip() or any(c in origin for c in "\r\n "):
-                raise ValueError("an allowed origin must not contain whitespace")
-        self.allowed_origins = tuple(allowed_origins)
+        self.allowed_origins = check_allowed_origins(allowed_origins)
         # Who may call: the key policy and the Host names, from the bind.
         self.access = access or Access.local()
         # "model", "flag" or "default": where the chat template came from.
@@ -104,6 +99,14 @@ class Served:
         )
         digest = hashlib.sha256(f"{model_name}|{__version__}|{layout}".encode())
         self.fingerprint = "fp_" + digest.hexdigest()[:12]
+
+    def origin_allowed(self, origin: str | None) -> bool:
+        """Whether a request with this Origin header may run: no header is
+        no browser (CLI, SDK, curl, a proxy that drops it), `*` admits every
+        page, otherwise the value must equal a listed origin, as in CORS."""
+        if origin is None or "*" in self.allowed_origins:
+            return True
+        return origin in self.allowed_origins
 
     def capabilities(self) -> dict:
         t = self.tokenizer
@@ -342,9 +345,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admitted(self) -> bool:
         """The Host must be one the server was told about (a browser's DNS
-        rebinding sends another), and outside loopback the key must match;
-        a preflight carries no credentials by the browser's rules and is
-        let through to its CORS answer."""
+        rebinding sends another), an Origin, when a browser sends one, must
+        be on the list, and outside loopback the key must match; a preflight
+        carries no credentials by the browser's rules and is let through to
+        its CORS answer."""
         access = self.served.access
         if not access.host_allowed(self.headers.get("Host")):
             self._send_error(
@@ -354,6 +358,29 @@ class Handler(BaseHTTPRequestHandler):
                     status=403,
                     type="permission_error",
                     code="host_not_allowed",
+                )
+            )
+            return False
+        # Before the key: the preflight skips the key and would pass unchecked.
+        origin = self.headers.get("Origin")
+        if not self.served.origin_allowed(origin):
+            if origin == "null":
+                message = (
+                    "the Origin header is null (a page opened from a file or in "
+                    "a sandboxed frame), which no --allowed-origins entry can "
+                    "name; only '*' admits it, and '*' admits every page"
+                )
+            else:
+                message = (
+                    "the Origin header names a page this server does not answer "
+                    "to; start it with --allowed-origins to add it"
+                )
+            self._send_error(
+                ApiError(
+                    message,
+                    status=403,
+                    type="permission_error",
+                    code="origin_not_allowed",
                 )
             )
             return False

@@ -139,8 +139,10 @@ def test_a_preflight_needs_no_key(keyed):
     resp, _ = request(keyed, "OPTIONS", "/v1/models", {"Origin": "http://ok.test"})
     assert resp.status == 204
     assert resp.getheader("Access-Control-Allow-Origin") == "http://ok.test"
+    # An origin not on the list is refused outright, preflight included: the
+    # browser's rules let the key be skipped here, the origin check does not.
     resp, _ = request(keyed, "OPTIONS", "/v1/models", {"Origin": "http://other.test"})
-    assert resp.status == 204 and resp.getheader("Access-Control-Allow-Origin") is None
+    assert resp.status == 403 and resp.getheader("Access-Control-Allow-Origin") is None
 
 
 def test_a_public_bind_without_a_policy_fails_before_the_load(monkeypatch, caplog):
@@ -154,3 +156,167 @@ def test_a_public_bind_without_a_policy_fails_before_the_load(monkeypatch, caplo
     with caplog.at_level(logging.ERROR, logger="beam"):
         assert main(["serve", "--model", "x", "--host", "0.0.0.0"]) == 3
     assert "--skip-api-key" in caplog.text and not loaded
+
+
+@pytest.fixture(scope="module")
+def open_local():
+    # Loopback without a key: the only thing between a page and the model
+    # is the origin list.
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["http://ok.test"])
+    httpd = BeamServer(served, "127.0.0.1", 0)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield httpd, served
+    httpd.shutdown()
+    engine.stop()
+
+
+CHAT = {"messages": [{"role": "user", "content": "w1"}], "max_tokens": 1}
+MESSAGES = {"max_tokens": 1, "messages": [{"role": "user", "content": "w1"}]}
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        ("/v1/chat/completions", CHAT),
+        ("/v1/chat/completions", {**CHAT, "stream": True}),
+        ("/v1/completions", {"prompt": [1, 2], "max_tokens": 1}),
+        ("/v1/responses", {"input": "w1", "max_output_tokens": 1}),
+        ("/v1/messages", MESSAGES),
+        ("/v1/messages/count_tokens", MESSAGES),
+        ("/health/reset-peak", None),
+    ],
+    ids=["chat", "stream", "completions", "responses", "messages", "count", "peak"],
+)
+def test_a_foreign_origin_runs_nothing(open_local, monkeypatch, path, body):
+    """A text/plain POST needs no preflight, so the refusal must come before
+    anything runs: the engine is the witness, it must not be asked."""
+    httpd, served = open_local
+    submitted = []
+
+    def submit(gen_request):
+        submitted.append(gen_request)
+        raise RuntimeError("submitted")
+
+    monkeypatch.setattr(served.engine, "submit", submit)
+    resp, raw = request(
+        httpd,
+        "POST",
+        path,
+        {"Origin": "http://evil.test", "Content-Type": "text/plain"},
+        body,
+    )
+    assert resp.status == 403, raw
+    err = json.loads(raw)["error"]
+    if path.startswith("/v1/messages"):
+        # Anthropic's envelope carries no code; the type and the message say it.
+        assert err["type"] == "permission_error" and "code" not in err
+        assert "Origin header" in err["message"]
+    else:
+        assert err["code"] == "origin_not_allowed"
+    assert submitted == []
+
+
+def test_origin_null_and_empty_are_refused(open_local):
+    httpd, _ = open_local
+    routes = (("POST", "/v1/chat/completions", CHAT), ("GET", "/health", None))
+    for origin in ("null", ""):
+        for method, path, body in routes:
+            resp, raw = request(httpd, method, path, {"Origin": origin}, body)
+            assert resp.status == 403, (origin, path)
+            err = json.loads(raw)["error"]
+            assert err["code"] == "origin_not_allowed", (origin, path)
+            if origin == "null":
+                # No list entry can admit null; the message names the one way.
+                assert "only '*' admits it" in err["message"]
+
+
+def test_a_foreign_preflight_is_refused(open_local):
+    httpd, _ = open_local
+    resp, _ = request(
+        httpd, "OPTIONS", "/v1/chat/completions", {"Origin": "http://evil.test"}
+    )
+    assert resp.status == 403
+    assert resp.getheader("Access-Control-Allow-Origin") is None
+
+
+def test_a_listed_origin_and_none_pass(open_local):
+    httpd, _ = open_local
+    listed = {"Origin": "http://ok.test"}
+    resp, _ = request(httpd, "POST", "/v1/chat/completions", listed, CHAT)
+    assert resp.status == 200
+    assert resp.getheader("Access-Control-Allow-Origin") == "http://ok.test"
+    stream = {**CHAT, "stream": True}
+    resp, _ = request(httpd, "POST", "/v1/chat/completions", listed, stream)
+    assert resp.status == 200
+    assert resp.getheader("Access-Control-Allow-Origin") == "http://ok.test"
+    # No Origin at all: a CLI, an SDK, curl - not a browser's request.
+    resp, _ = request(httpd, "POST", "/v1/chat/completions", None, CHAT)
+    assert resp.status == 200
+
+
+def test_a_wildcard_admits_any_origin():
+    engine = Engine(tiny_llama()).start()
+    served = Served(engine, StubTokenizer(), "tiny", allowed_origins=["*"])
+    httpd = BeamServer(served, "127.0.0.1", 0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        # `*` means every page, the null origin of a local file included;
+        # only the list entry `null` is refused, and that at start.
+        for origin in ("http://evil.test", "null"):
+            resp, _ = request(httpd, "GET", "/health", {"Origin": origin})
+            assert resp.status == 200, origin
+            assert resp.getheader("Access-Control-Allow-Origin") == "*"
+    finally:
+        httpd.shutdown()
+        engine.stop()
+
+
+def test_the_order_is_host_origin_key(keyed):
+    def error(headers):
+        resp, raw = request(keyed, "GET", "/health", headers)
+        return resp.status, (json.loads(raw).get("error") or {}).get("code")
+
+    key = {"x-api-key": "s3cret"}
+    assert error({"Host": "evil.test:8000", "Origin": "http://evil.test", **key}) == (
+        403,
+        "host_not_allowed",
+    )
+    assert error({"Origin": "http://ok.test"}) == (401, "invalid_api_key")
+    assert error({"Origin": "http://evil.test", **key}) == (403, "origin_not_allowed")
+    assert error({"Origin": "http://evil.test"}) == (403, "origin_not_allowed")
+
+
+@pytest.mark.parametrize("origin", ["null", ""], ids=["null", "empty"])
+def test_null_and_empty_origins_are_refused_at_start(
+    open_local, monkeypatch, caplog, origin
+):
+    import logging
+
+    import mlx_beam._vendor.mlx_lm.utils as utils
+    from mlx_beam import cli
+
+    _, served = open_local
+    with pytest.raises(ValueError):
+        Served(served.engine, StubTokenizer(), "tiny", allowed_origins=[origin])
+
+    # The CLI refuses the list before the files are fetched or the port is
+    # probed: both would make the outcome depend on the machine.
+    loaded = []
+
+    def load(*a, **k):
+        loaded.append(1)
+        raise RuntimeError("loaded")
+
+    monkeypatch.setattr(utils, "_download", load)
+    monkeypatch.setattr(utils, "load", load)
+    monkeypatch.setattr(cli, "probe_port", lambda host, port: None)
+    with caplog.at_level(logging.ERROR, logger="beam"):
+        try:
+            rc = cli.main(["serve", "--model", "x", "--allowed-origins", origin])
+        except RuntimeError:
+            rc = None
+    assert rc == 3 and not loaded
+    expected = "null would admit" if origin == "null" else "must not be empty"
+    assert expected in caplog.text
