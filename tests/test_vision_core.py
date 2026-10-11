@@ -1602,6 +1602,7 @@ def test_a_parked_row_comes_back_intact(policy):
             prefill_step_size=2,
             prefill_slice=2,
             stop_tokens=[],
+            decode_share=0,  # one decode step per next(): first_step reads the batch
         )
 
     def restored():
