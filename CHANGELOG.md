@@ -99,6 +99,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   listed; one that sends `Origin: null` (a page opened from a file or in a
   sandboxed frame) is admitted only by `*`. `null` and empty entries are
   refused at start.
+- In a batch, a sliding-window layer could hide a prompt's oldest key in
+  the window from it: once the window was full, a one-token call made
+  the next call of several tokens mask that key out for a prompt that
+  shared its batch with a longer one, and its keys and its answer then
+  differed from a run alone (since 0.1.0a1; every model with
+  sliding-window layers, among them Gemma 4, gpt-oss and Muse). The mask
+  now trims what the cache trims.
 
 ## [0.1.0a10] - 2026-10-04
 

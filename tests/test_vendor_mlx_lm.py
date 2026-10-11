@@ -1,15 +1,16 @@
 """The vendored mlx-lm: self-contained import, and the local changes listed in
-VENDORED.md hold on a tiny hybrid model with random weights."""
+VENDORED.md hold on tiny random-weight models and on the caches alone."""
 
 import subprocess
 import sys
 
 import mlx.core as mx
+import pytest
 
 from mlx_beam._vendor import mlx_lm as vendored
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator
 from mlx_beam._vendor.mlx_lm.models import qwen3_next
-from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache
+from mlx_beam._vendor.mlx_lm.models.cache import ArraysCache, BatchRotatingKVCache
 
 TINY_HYBRID = dict(
     model_type="qwen3_next",
@@ -230,3 +231,171 @@ def test_an_emptied_batch_keeps_no_current_tokens():
     assert a._current_tokens is None and a._current_logprobs == []
     a.extend(batch([3], [13]))
     assert a.uids == [3] and a._current_tokens.tolist() == [13]
+
+
+WINDOW = 8
+
+
+def _window_keys(rows, positions):
+    # A key names its row and position, so the mask can be read off the
+    # keys it lets through; a right-padding token is -1, an unwritten column 0.
+    vals = [
+        [1000.0 * r + p + 1 if p is not None else -1.0 for p in ps]
+        for r, ps in zip(rows, positions, strict=True)
+    ]
+    keys = mx.array(vals, dtype=mx.float32)[:, None, :, None]
+    return keys, keys
+
+
+def _feed(cache, rows, n, positions=None):
+    at = cache.offset.tolist()
+    if positions is None:
+        positions = [[at[i] + j for j in range(n)] for i in range(len(rows))]
+    return cache.update_and_fetch(*_window_keys(rows, positions))
+
+
+@pytest.mark.parametrize(
+    "source, ones, alone, before",
+    [
+        ("extend", 0, False, ([-3, 14], False, 17)),
+        ("extend", 1, False, ([-13, 4], True, 1)),
+        ("extend", 3, True, ([2], True, 3)),
+        ("right_padding", 0, False, ([0, 19], False, 21)),
+        ("right_padding", 1, False, ([-14, 5], True, 1)),
+    ],
+)
+def test_rotating_mask_trims_what_the_update_trims(source, ones, alone, before):
+    """A call of several tokens puts a rotated ring in temporal order and
+    trims it; the mask is made before that and must trim the same. After
+    `ones` one-token calls on a full window a row with left padding - it
+    joined through `extend`, or it was right-padded - must still see its
+    oldest key in the window. `alone` is the state of a verify of one row
+    after decode steps; `before` is (left_padding, rotated, _idx) going in."""
+    if source == "extend":
+        cache = BatchRotatingKVCache(WINDOW, [0])
+        _feed(cache, [0], 10)
+        _feed(cache, [0], 10)
+        other = BatchRotatingKVCache(WINDOW, [0])
+        _feed(other, [1], 3)
+        cache.extend(other)
+    else:
+        cache = BatchRotatingKVCache(WINDOW, [0, 0])
+        _feed(cache, [0, 1], 1)
+        cache.prepare(lengths=[20, 1], right_padding=[0, 19])
+        _feed(cache, [0, 1], 20, [[1 + j for j in range(20)], [1] + [None] * 19])
+        cache.finalize()
+    rows = [0, 1]
+    for _ in range(ones):
+        _feed(cache, rows, 1)
+    if alone:
+        cache.filter([1])
+        rows = [1]
+    assert (cache.left_padding.tolist(), cache.rotated, cache._idx) == before
+
+    at = cache.offset.tolist()
+    mask = cache.make_mask(3, window_size=WINDOW)
+    keys, _ = _feed(cache, rows, 3)
+    L = keys.shape[2]
+    assert mask.shape[-1] == L
+    mask = mx.broadcast_to(mask, (len(rows), 1, 3, L))
+    for r, row in enumerate(rows):
+        line = keys[r, 0, :, 0].tolist()
+        for q in range(3):
+            p = at[r] + q
+            seen = [k for k, m in zip(line, mask[r, 0, q].tolist(), strict=True) if m]
+            want = [1000.0 * row + x + 1 for x in range(max(0, p - WINDOW + 1), p + 1)]
+            assert seen == want, (row, p, seen, want)
+
+
+@pytest.mark.parametrize("tail", [2, 3])
+@pytest.mark.parametrize("name", ["gemma4_text", "gpt_oss", "muse_glimmer"])
+def test_a_joined_row_matches_its_solo_run_after_a_one_token_call(name, tail):
+    """A row that joins a longer batch sits behind left padding in the
+    sliding layers. With `tail` 2 the other row's last segments make the
+    joined row's first call one token wide on a full window, and its next
+    call must still see the row's first token: its caches and the logprobs
+    of its first decode step are those of a run alone. `tail` 3 has no
+    one-token call and is the control."""
+    from mlx_beam._vendor.mlx_lm.models import gemma4_text
+    from tests.test_engine import GEMMA4_SHARED, _tiny
+    from tests.test_model_classes import tiny
+
+    if name == "gemma4_text":
+        model = _tiny(gemma4_text, **GEMMA4_SHARED)
+    else:
+        model = tiny(name)
+    a = [(3 * i + 5) % 64 for i in range(10 + tail)]
+    b = [(7 * i + 11) % 64 for i in range(6)]
+
+    def generator():
+        return BatchGenerator(
+            model,
+            max_tokens=8,
+            stop_tokens=[],
+            prefill_batch_size=2,
+            prefill_step_size=64,
+            prefill_slice=64,
+        )
+
+    def caches_of(gen, uid):
+        i = gen._prompt_batch.uids.index(uid)
+        caches = [c.extract(i) for c in gen._prompt_batch.prompt_cache]
+        mx.eval([(c.keys, c.values) for c in caches])
+        return caches
+
+    def first_logprobs(gen, uid):
+        calls = 0
+        while True:
+            _, generated = gen.next()
+            calls += 1
+            assert calls < 50
+            for r in generated:
+                if r.uid == uid:
+                    return r.logprobs
+
+    gen = generator()
+    (ua,) = gen.insert_segments([[a[:10], a[10:]]], max_tokens=[8])
+    prompts, _ = gen.next()
+    assert [(r.uid, r.progress) for r in prompts] == [(ua, (10, 10 + tail))]
+    window = gen._prompt_batch.prompt_cache[0]
+    assert isinstance(window, BatchRotatingKVCache)
+    (ub,) = gen.insert([b], max_tokens=[2])
+    progress = []
+    calls = 0
+    while not progress or progress[-1] != (5, 6):
+        prompts, _ = gen.next()
+        calls += 1
+        assert calls < 50
+        mine = [r.progress for r in prompts if r.uid == ub]
+        if mine and not progress:
+            # After the joined row's first call: the ring has wrapped with
+            # `tail` 2, and the row sits behind the other's ten tokens.
+            i = gen._prompt_batch.uids.index(ub)
+            assert window.rotated is (tail == 2)
+            assert tail == 3 or window._idx == 1
+            assert window.left_padding.tolist()[i] == 7
+        progress += mine
+    assert progress == ([(1, 6), (5, 6)] if tail == 2 else [(2, 6), (5, 6)])
+    batched = caches_of(gen, ub)
+    batched_logprobs = first_logprobs(gen, ub)
+    gen.close()
+
+    solo = generator()
+    (us,) = solo.insert([b], max_tokens=[2])
+    prompts, _ = solo.next()
+    assert [(r.uid, r.progress) for r in prompts] == [(us, (5, 6))]
+    alone = caches_of(solo, us)
+    alone_logprobs = first_logprobs(solo, us)
+    solo.close()
+
+    assert len(batched) == len(alone)
+    for got, want in zip(batched, alone, strict=True):
+        for what, x, y in (
+            ("keys", got.keys, want.keys),
+            ("values", got.values, want.values),
+        ):
+            assert (x.shape, x.dtype) == (y.shape, y.dtype), what
+            assert mx.allclose(x, y, atol=1e-4), (what, mx.abs(x - y).max().item())
+    x, y = batched_logprobs, alone_logprobs
+    assert (x.shape, x.dtype) == (y.shape, y.dtype)
+    assert mx.allclose(x, y, atol=1e-4), mx.abs(x - y).max().item()
