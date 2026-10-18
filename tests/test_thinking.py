@@ -7,10 +7,30 @@ import pytest
 
 from mlx_beam.engine import ContextTooLong, Engine, GenerationRequest, ReasoningLimits
 from mlx_beam.engine.thinking import ThinkingBudget, budget
+from tests.stub_tokenizer import (
+    CHANNEL_CLOSE,
+    CHANNEL_OPEN,
+    LABEL,
+    NEWLINE,
+    ChannelStubTokenizer,
+)
 from tests.test_engine import collect, tiny_hybrid
+from tests.tracked import tracked_events
 
 START, END, NL, NL2 = 50, 51, 52, 53
 LIMITS = ReasoningLimits(start=(START,), end=(END,), close=(NL, END, NL2))
+# Gemma 4's channel: no label the budget reads, the close the model was
+# trained to write, and the opener never masked - the block is closed at
+# once when no room is left.
+CHANNEL = ReasoningLimits(
+    start=(CHANNEL_OPEN,),
+    end=(CHANNEL_CLOSE,),
+    close=(NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE),
+    mask_opener=False,
+)
+# A channel the budget closed at once, as the stream carries it: opener,
+# the free token (the label), the forced close.
+GHOST = [CHANNEL_OPEN, LABEL, NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE]
 
 
 def test_budget_serves_small_limits_and_refuses_a_reserve_that_cannot_fit():
@@ -41,6 +61,7 @@ class Steps:
         self.out = []
         # What the tracker said about each token after observing it.
         self.forced = []
+        self.suppressed = []
 
     def run(self, n):
         context = [0]
@@ -54,12 +75,15 @@ class Steps:
             context.append(token)
             # Python sees the previous token only now, one step behind.
             if len(self.out) >= 2:
-                self.tracker.observe(self.out[-2], None)
-                self.forced.append(self.tracker.last_forced)
+                self._observe(self.out[-2])
         if self.out:
-            self.tracker.observe(self.out[-1], None)
-            self.forced.append(self.tracker.last_forced)
+            self._observe(self.out[-1])
         return self.out
+
+    def _observe(self, token):
+        self.tracker.observe(token, None)
+        self.forced.append(self.tracker.last_forced)
+        self.suppressed.append(self.tracker.last_suppressed)
 
 
 def test_forced_close_lands_exactly_at_the_budget():
@@ -611,3 +635,230 @@ def test_a_labelled_opener_counts_only_when_its_label_means_reasoning():
     tracker = ThinkingBudget(replace(limits, max_tokens=0))
     out = Steps(tracker, [START, F, MSG, 10, 11]).run(5)
     assert out == [START, F, MSG, 10, 11] and not tracker.in_reasoning
+
+
+def test_a_channel_family_at_budget_zero_lets_the_opener_through_and_closes_at_once():
+    tracker = ThinkingBudget(replace(CHANNEL, max_tokens=0))
+    steps = Steps(tracker, [CHANNEL_OPEN, LABEL, NEWLINE, 10, 11, 12, 13])
+    out = steps.run(7)
+    # The opener is not masked; the label is the free token, then the
+    # forced close; the answer follows.
+    assert out == GHOST + [13]
+    assert tracker.reasoning_tokens == 0 and not tracker.thinking_truncated
+    assert steps.suppressed == [True] * 6 + [False]
+
+
+def test_two_ghost_channels_are_both_closed_at_once():
+    tracker = ThinkingBudget(replace(CHANNEL, max_tokens=0))
+    wishes = [CHANNEL_OPEN, LABEL, NEWLINE, 10, 11, 12]
+    wishes += [CHANNEL_OPEN, LABEL, NEWLINE, 20, 21, 22, 11]
+    out = Steps(tracker, wishes).run(13)
+    assert out == GHOST + GHOST + [11]
+    assert tracker.reasoning_tokens == 0 and not tracker._block
+
+
+def test_an_exhausted_positive_budget_closes_the_next_channel_at_once():
+    tracker = ThinkingBudget(replace(CHANNEL, max_tokens=3))
+    wishes = [CHANNEL_OPEN, LABEL, NEWLINE, 20, 21, 22]
+    wishes += [CHANNEL_OPEN, LABEL, NEWLINE, 30, 31, 32, 30]
+    steps = Steps(tracker, wishes)
+    out = steps.run(13)
+    # The first block spends the budget and is forced shut; the second
+    # opens (not masked), is closed at once and counts nothing.
+    assert out == GHOST + GHOST + [30]
+    assert tracker.reasoning_tokens == 3 and tracker.thinking_truncated
+    assert steps.suppressed == [False] * 6 + [True] * 6 + [False]
+
+
+def test_think_and_xtml_openers_stay_masked_at_budget_zero():
+    tracker = ThinkingBudget(ReasoningLimits(**{**LIMITS.__dict__, "max_tokens": 0}))
+    out = Steps(tracker, [START, 10, 11]).run(3)
+    assert START not in out and tracker.reasoning_tokens == 0
+    # XTML's opener is three tokens, cut at the last.
+    S1, S2, S3 = 44, 45, 46
+    tracker = ThinkingBudget(
+        ReasoningLimits((S1, S2, S3), (END,), (NL, END, NL2), max_tokens=0)
+    )
+    out = Steps(tracker, [S1, S2, S3, 10, 11]).run(5)
+    assert out[:2] == [S1, S2] and out[2] != S3 and tracker.reasoning_tokens == 0
+
+
+def test_a_labelled_opener_stays_masked_at_budget_zero():
+    A, F, MSG = 40, 41, 42
+    limits = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, F, MSG),
+        max_tokens=0,
+        labels=((A,),),
+        label_end=(MSG,),
+    )
+    tracker = ThinkingBudget(limits)
+    out = Steps(tracker, [START, A, MSG, 10, 11]).run(5)
+    assert out[0] == START and out[1] != A and tracker.reasoning_tokens == 0
+
+
+def test_a_seeded_block_at_budget_zero_is_still_forced_shut():
+    tracker = ThinkingBudget(replace(CHANNEL, seeded=True, max_tokens=0))
+    out = Steps(tracker, [10, 11, 12, 13, 14, 15]).run(6)
+    assert out == [NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE, 14, 15]
+    assert tracker.thinking_truncated
+
+
+def test_a_suppressed_block_counts_nothing_in_the_assembler():
+    from mlx_beam.api.text import TextAssembler
+
+    limits = replace(CHANNEL, max_tokens=0)
+    tracker = ThinkingBudget(limits)
+    evs = tracked_events(limits, GHOST + [10], tracker=tracker)
+    asm = TextAssembler(ChannelStubTokenizer(), prompt_tokens=[6, 1, 7])
+    deltas = [asm.feed(e) for e in evs]
+    assert tracker.reasoning_tokens == 0
+    assert asm.reasoning_tokens == 0
+    assert [e.reasoning_counted for e in evs] == [0] * len(evs)
+    assert not asm.thinking_truncated
+    assert "".join(d.content for d in deltas) == "w10 "
+    assert not any(d.reasoning for d in deltas)
+
+
+def test_the_forced_close_of_a_suppressed_block_is_still_forced():
+    tracker = ThinkingBudget(replace(CHANNEL, max_tokens=0))
+    steps = Steps(tracker, [CHANNEL_OPEN, LABEL, 10, 11, 12, 13, 20])
+    out = steps.run(7)
+    assert out == GHOST + [20]
+    # The label is the model's free token; the counted line break, the
+    # marker and the tail come from the queue, down to its last token.
+    assert steps.forced == [False, False, True, True, True, True, False]
+    assert not tracker._natural
+    # The block's progress runs on while the published count stays at 0.
+    assert tracker._seen == 3 and tracker.reasoning_tokens == 0
+
+
+def test_a_suppressed_block_cut_by_length_is_a_cut_answer():
+    limits = replace(CHANNEL, max_tokens=0)
+    # Cut at the opener, inside the label, at the end marker, in the tail.
+    for ids in (GHOST[:1], GHOST[:2], GHOST[:4], GHOST[:5]):
+        tracker = ThinkingBudget(limits)
+        for t in ids[:-1]:
+            tracker.observe(t, None)
+        tracker.observe(ids[-1], "length")
+        assert not tracker.thinking_truncated, ids
+        # What the engine reads: not inside the reasoning, so the cut is
+        # the answer's (response_truncated = cut and not in_reasoning).
+        assert not tracker.in_reasoning and tracker.reasoning_tokens == 0, ids
+    # A flag a real first block set stays.
+    tracker = ThinkingBudget(replace(CHANNEL, max_tokens=3))
+    for t in GHOST:
+        tracker.observe(t, None)
+    assert tracker.thinking_truncated and tracker.reasoning_tokens == 3
+    tracker.observe(CHANNEL_OPEN, "length")
+    assert tracker.thinking_truncated and tracker.reasoning_tokens == 3
+
+
+def test_a_newline_as_the_free_token_shows_nothing():
+    from mlx_beam.api import messages, responses
+    from mlx_beam.api.text import TextAssembler
+
+    tok = ChannelStubTokenizer()
+    limits = replace(CHANNEL, max_tokens=0)
+    # The free token ends the label: the forced line break would be
+    # reasoning text, the tail's two would be content.
+    ids = [CHANNEL_OPEN, NEWLINE, NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE, 10]
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+    deltas = [asm.feed(e) for e in tracked_events(limits, ids)]
+    assert "".join(d.content for d in deltas) == "w10 "
+    assert not any(d.reasoning for d in deltas)
+    assert asm.reasoning_tokens == 0
+    req = responses.parse_responses_request({"input": "w1"}, "m")
+    gen = responses.to_generation_request(tok, req)
+    final = responses.ResponsesResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, ids), 0
+    )
+    assert [i["type"] for i in final["output"]] == ["message"]
+    req = messages.parse_messages_request(
+        {"max_tokens": 16, "messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = messages.to_generation_request(tok, req)
+    final = messages.MessagesResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, ids), 0
+    )
+    assert [b["type"] for b in final["content"]] == ["text"]
+
+
+def test_the_suppressed_flag_ends_with_the_last_tail_token():
+    from types import SimpleNamespace
+
+    from mlx_beam.engine.request import SamplingParams
+    from tests.test_vendor_optiq_kv import tiny_llama
+
+    limits = replace(CHANNEL, max_tokens=0)
+    # _on_step reads only the budgets and the observed tuples.
+    uid = 7
+    stand_in = SimpleNamespace(_budgets={uid: ThinkingBudget(limits)}, _observed={})
+    for t in GHOST + [10]:
+        Engine._on_step(
+            stand_in, [SimpleNamespace(uid=uid, token=t, finish_reason=None)]
+        )
+    tuples = list(stand_in._observed[uid])
+    flags = [t[3] for t in tuples]
+    # The close's last token still carries the flag, the first answer
+    # token no longer: observe reads it before the block state is cleared.
+    assert flags[5]
+    assert flags == [True] * 6 + [False]
+    assert [t[0] for t in tuples] == [False, False, True, True, True, True, False]
+    assert [t[4] for t in tuples] == [0] * 7
+    # The event build in the engine: the bias draws the opener and the
+    # free token, the forced close overrides it, the stop sequence ends
+    # the completion on the close's last token.
+    with Engine(tiny_llama()) as solo:
+        events = list(
+            solo.submit(
+                GenerationRequest(
+                    [3, 7, 11],
+                    max_tokens=8,
+                    sampling=SamplingParams(logit_bias={CHANNEL_OPEN: 100.0}),
+                    reasoning=limits,
+                    stop_sequences=[(NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE)],
+                )
+            )
+        )
+    tokens = [e.token for e in events]
+    assert tokens == [
+        CHANNEL_OPEN,
+        CHANNEL_OPEN,
+        NEWLINE,
+        CHANNEL_CLOSE,
+        NEWLINE,
+        NEWLINE,
+    ]
+    assert [e.suppressed for e in events] == [True] * 6
+    assert [e.forced for e in events] == [False, False, True, True, True, True]
+    assert [e.reasoning_counted for e in events] == [0] * 6
+    assert events[-1].finish_reason == "stop" and not events[-1].response_truncated
+    assert not events[-1].thinking_truncated
+    # The helper mirrors the engine.
+    assert tracked_events(limits, tokens, finish="stop", eos=None) == events
+
+
+def test_a_suppressed_channel_stays_visible_without_routing():
+    from mlx_beam.api import chat
+
+    tok = ChannelStubTokenizer()
+    limits = replace(CHANNEL, max_tokens=0)
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        tracked_events(limits, GHOST + [10]), cached=0
+    )
+    # Counted 0 in every mode; with routing off the block is the client's
+    # to parse, as the model wrote it.
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
+    content = out["choices"][0]["message"]["content"]
+    assert content == "<|channel>thought\n<channel|>\n\nw10 "
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, GHOST + [10]), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "w10 " and "reasoning" not in msg

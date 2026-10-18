@@ -24,7 +24,7 @@ from mlx_beam.engine.proposer import (
 )
 from mlx_beam.engine.request import SamplingParams
 from mlx_beam.engine.speculative import rollback_recurrent
-from mlx_beam.engine.thinking import ReasoningLimits
+from mlx_beam.engine.thinking import ReasoningLimits, ThinkingBudget
 from tests.lazy_arrays import Table, computed_in_another_thread, lazy
 from tests.test_engine import TINY_QWEN35_WRAPPED
 from tests.test_vendor_mlx_lm import TINY_HYBRID
@@ -580,6 +580,25 @@ def test_budget_row_speculates_after_the_forced_close():
     # Cycles ran in the answer: more than one per plain step would allow.
     assert after["cycles"] - before["cycles"] >= 4
     assert after["accepted"] > before["accepted"]
+
+
+def test_a_family_without_the_opener_mask_never_speculates_at_budget_zero():
+    """The price of a family whose opener is never masked: with no mask
+    there is no stable stretch outside a block at budget 0 (or after the
+    budget is spent), so such a row decodes plainly. Documents the price,
+    which is 0 while no such family has a proposer; no guard."""
+    from dataclasses import replace
+
+    from tests.stub_tokenizer import CHANNEL_CLOSE, CHANNEL_OPEN, NEWLINE
+
+    limits = ReasoningLimits(
+        (CHANNEL_OPEN,),
+        (CHANNEL_CLOSE,),
+        (NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE),
+        max_tokens=0,
+    )
+    assert ThinkingBudget(limits).stable_for(3)
+    assert not ThinkingBudget(replace(limits, mask_opener=False)).stable_for(3)
 
 
 def test_budget_that_arms_inside_a_block_is_left_to_plain_steps():

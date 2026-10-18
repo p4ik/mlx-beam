@@ -1,13 +1,15 @@
 """The API layer without a model: parsing, prompt building, text assembly."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
-from mlx_beam.api import chat, completions, responses
+from mlx_beam.api import chat, completions, messages, responses
 from mlx_beam.api.errors import ApiError
 from mlx_beam.api.text import TextAssembler, initial_state
 from mlx_beam.engine.request import TokenEvent
+from mlx_beam.engine.thinking import ReasoningLimits, ThinkingBudget
 from tests.stub_tokenizer import (
     CHANNEL_CLOSE,
     CHANNEL_OPEN,
@@ -23,6 +25,20 @@ from tests.stub_tokenizer import (
     StubDetokenizer,
     StubTokenizer,
 )
+from tests.tracked import limits_for, tracked_events
+
+# Gemma 4's channel with the close the budget forces (line break, marker,
+# blank line); the opener goes through and the block is closed at once.
+CHANNEL = ReasoningLimits(
+    start=(CHANNEL_OPEN,),
+    end=(CHANNEL_CLOSE,),
+    close=(NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE),
+    mask_opener=False,
+)
+# A channel the budget closed at once, as the stream carries it.
+GHOST = [CHANNEL_OPEN, LABEL, NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE]
+# A prompt that ends with the template's closed, empty channel.
+CLOSED = [6, 1, 7, CHANNEL_OPEN, LABEL, NEWLINE, CHANNEL_CLOSE]
 
 
 def events(ids, finish="stop"):
@@ -415,9 +431,14 @@ def test_responses_stream_has_the_item_and_part_events():
     assert [e["sequence_number"] for e in evs] == list(range(1, len(evs) + 1))
 
 
-def assembled(asm, ids, finish="stop"):
-    deltas = [asm.feed(e) for e in events(ids, finish)]
+def texts(asm, evs):
+    """(reasoning, content) once `evs` went through `asm`."""
+    deltas = [asm.feed(e) for e in evs]
     return "".join(d.reasoning for d in deltas), "".join(d.content for d in deltas)
+
+
+def assembled(asm, ids, finish="stop"):
+    return texts(asm, events(ids, finish))
 
 
 @pytest.mark.parametrize("label", [LABEL, LABEL_SPACED])
@@ -429,7 +450,10 @@ def test_a_channel_is_thinking_whatever_token_its_label_comes_as(label):
     tok = ChannelStubTokenizer()
     ids = [CHANNEL_OPEN, label, NEWLINE, 10, 11, CHANNEL_CLOSE, 12]
     asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
-    assert assembled(asm, ids) == ("w10 w11 ", "w12 ")
+    assert texts(asm, tracked_events(limits_for(tok, [6, 1, 7]), ids)) == (
+        "w10 w11 ",
+        "w12 ",
+    )
     # Marker, label and line end count like any opener's tokens.
     assert asm.reasoning_tokens == 5
     # Routing off: the client gets the block as the model wrote it.
@@ -520,6 +544,184 @@ def test_a_channel_the_prompt_opened_continues_as_thinking():
     assert assembled(asm, ids) == ("", "<|channel>thought\nw10 <channel|>w11 ")
 
 
+def test_a_stray_end_marker_after_a_closed_channel_is_cut():
+    # The model writes the channel's head without the opener (the budget
+    # left it no room): the end marker that follows is no text.
+    tok = ChannelStubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=CLOSED)
+    evs = tracked_events(limits_for(tok, CLOSED), [CHANNEL_CLOSE, 10, 11])
+    assert texts(asm, evs) == ("", "w10 w11 ")
+    assert asm.reasoning_tokens == 0
+    # Streaming: no chunk carries the marker.
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}], "stream": True}, "m"
+    )
+    prompt = chat.to_generation_request(tok, req).tokens + CLOSED[3:]
+    chunks = chat.ChatResponder(tok, req, prompt).stream(
+        tracked_events(limits_for(tok, prompt), [CHANNEL_CLOSE, 10, 11]), cached=0
+    )
+    deltas = [c["choices"][0]["delta"].get("content", "") for c in chunks]
+    assert "".join(deltas) == "w10 w11 "
+
+
+def test_a_stray_end_marker_mid_answer_is_cut():
+    tok = ChannelStubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+    evs = tracked_events(limits_for(tok, [6, 1, 7]), [10, CHANNEL_CLOSE, 11])
+    assert texts(asm, evs) == ("", "w10 w11 ")
+
+
+def test_a_channel_the_model_opens_after_a_closed_one_is_thinking():
+    tok = ChannelStubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=CLOSED)
+    ids = [CHANNEL_OPEN, LABEL, NEWLINE, 20, CHANNEL_CLOSE, 10]
+    assert texts(asm, tracked_events(limits_for(tok, CLOSED), ids)) == ("w20 ", "w10 ")
+    assert asm.reasoning_tokens == 4
+
+
+def test_the_raw_endpoint_keeps_the_stray_marker():
+    tok = ChannelStubTokenizer()
+    asm = TextAssembler(
+        tok,
+        prompt_tokens=CLOSED,
+        route_thinking=False,
+        tools_enabled=False,
+        lead=False,
+        raw=True,
+    )
+    assert assembled(asm, [CHANNEL_CLOSE, 10])[1].startswith("<channel|>")
+
+
+def test_the_channel_stub_derives_the_policy():
+    assert limits_for(ChannelStubTokenizer(), [6, 1, 7], 0).mask_opener is False
+    assert limits_for(StubTokenizer(), [6, 1, 7], 0).mask_opener is True
+
+
+def test_a_cut_channel_label_counts_what_the_budget_booked():
+    tok = ChannelStubTokenizer()
+    # Room to think: a channel cut inside its label is cut thinking.
+    limits = limits_for(tok, [6, 1, 7], 10)
+    tracker = ThinkingBudget(limits)
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+    ids = [CHANNEL_OPEN, LABEL]
+    texts(asm, tracked_events(limits, ids, finish="length", tracker=tracker))
+    assert tracker.reasoning_tokens == 2 == asm.reasoning_tokens
+    assert asm.thinking_truncated and not asm.response_truncated
+    # No room: the opener goes through unmasked and the block is
+    # suppressed - cut by the length limit, it is a cut answer.
+    limits = limits_for(tok, [6, 1, 7], 0)
+    tracker = ThinkingBudget(limits)
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+    texts(asm, tracked_events(limits, ids, finish="length", tracker=tracker))
+    assert tracker.reasoning_tokens == 0
+    assert asm.reasoning_tokens == 0
+    assert not asm.thinking_truncated and asm.response_truncated
+
+
+def test_a_stop_word_inside_a_block_counts_its_last_token():
+    tok = StubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], stop_words=["w11"])
+    evs = tracked_events(
+        limits_for(tok, [6, 1, 7]), [THINK_START, 10, 11], finish="stop", eos=None
+    )
+    assert texts(asm, evs) == ("w10 ", "") and asm.stopped
+    # The token that completes the stop word was observed inside the block.
+    assert asm.reasoning_tokens == 3 == sum(e.reasoning_counted for e in evs)
+
+
+def test_a_harmony_head_cut_before_its_end_counts_nothing():
+    # The automaton of a labelled family with limits in Harmony's form:
+    # the budget books a head at its end only.
+    tok = ChannelStubTokenizer()
+    limits = ReasoningLimits(
+        start=(CHANNEL_OPEN,),
+        end=(CHANNEL_CLOSE,),
+        close=(NEWLINE, CHANNEL_CLOSE),
+        max_tokens=10,
+        labels=((LABEL,),),
+        label_end=(NEWLINE,),
+    )
+    for finish, cut in (("length", True), ("stop", False)):
+        tracker = ThinkingBudget(limits)
+        asm = TextAssembler(tok, prompt_tokens=[6, 1, 7])
+        evs = tracked_events(
+            limits, [CHANNEL_OPEN, LABEL], finish=finish, tracker=tracker
+        )
+        texts(asm, evs)
+        assert asm.reasoning_tokens == 0 == tracker.reasoning_tokens, finish
+        assert not asm.thinking_truncated and asm.response_truncated is cut, finish
+
+
+def test_a_tool_call_inside_a_think_block_counts_to_the_end_marker():
+    tok = StubTokenizer()
+    asm = TextAssembler(tok, prompt_tokens=[6, 1, 7], tools=[{"type": "function"}])
+    ids = [THINK_START, 10, TOOL_START, 20, TOOL_END, 11, THINK_END, 12]
+    evs = tracked_events(limits_for(tok, [6, 1, 7]), ids)
+    deltas = [asm.feed(e) for e in evs]
+    assert "".join(d.reasoning for d in deltas) == "w10 "
+    calls = [c for d in deltas for c in d.tool_calls]
+    assert [c["function"]["name"] for c in calls] == ["w20"]
+    assert "".join(d.content for d in deltas).endswith("w12 ")
+    # The budget knows no tool transition: the opener, `10`, the call's
+    # four tokens and `11` count up to the end marker; usage reports that.
+    assert asm.reasoning_tokens == 6 == sum(e.reasoning_counted for e in evs)
+
+
+def test_a_suppressed_channel_is_no_reasoning_on_chat():
+    tok = ChannelStubTokenizer()
+    limits = replace(CHANNEL, max_tokens=0)
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, GHOST + [10]), cached=0
+    )
+    details = out["usage"]["completion_tokens_details"]
+    assert details["reasoning_tokens"] == 0
+    assert not details["thinking_truncated"]
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "w10 " and "reasoning" not in msg
+    req.stream = True
+    chunks = list(
+        chat.ChatResponder(tok, req, gen.tokens).stream(
+            tracked_events(limits, GHOST + [10]), cached=0
+        )
+    )
+    assert not any("<channel|>" in json.dumps(c) for c in chunks)
+    assert (
+        "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) == "w10 "
+    )
+
+
+def test_a_suppressed_channel_is_no_reasoning_on_messages():
+    tok = ChannelStubTokenizer()
+    limits = replace(CHANNEL, max_tokens=0)
+    req = messages.parse_messages_request(
+        {"max_tokens": 16, "messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = messages.to_generation_request(tok, req)
+    evs = tracked_events(limits, GHOST + [10])
+    final = messages.MessagesResponder(tok, req, gen.tokens).complete(evs, 0)
+    assert final["content"] == [{"type": "text", "text": "w10 "}]
+    assert not any("reasoning" in k for k in final["usage"])
+    assert final["usage"]["output_tokens"] == len(evs)
+
+
+def test_a_suppressed_channel_is_no_reasoning_on_responses():
+    tok = ChannelStubTokenizer()
+    limits = replace(CHANNEL, max_tokens=0)
+    req = responses.parse_responses_request({"input": "w1"}, "m")
+    gen = responses.to_generation_request(tok, req)
+    final = responses.ResponsesResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, GHOST + [10]), 0
+    )
+    assert final["usage"]["output_tokens_details"]["reasoning_tokens"] == 0
+    assert final["status"] == "completed"
+    assert [i["type"] for i in final["output"]] == ["message"]
+    assert final["output"][0]["content"][0]["text"] == "w10 "
+
+
 def test_the_channel_family_is_inferred_on_the_marker_alone():
     from mlx_beam._vendor.mlx_lm.tokenizer_utils import TokenizerWrapper
 
@@ -607,7 +809,7 @@ def test_reasoning_tokens_are_counted():
     )
     gen = chat.to_generation_request(tok, req)
     out = chat.ChatResponder(tok, req, gen.tokens).complete(
-        events([THINK_START, 10, 11, THINK_END, 12]), cached=0
+        tracked_events(gen.reasoning, [THINK_START, 10, 11, THINK_END, 12]), cached=0
     )
     assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
     assert out["choices"][0]["message"]["reasoning"] == "w10 w11 "
@@ -704,7 +906,7 @@ def test_reasoning_field_none_leaves_the_markers_in_the_content():
     )
     gen = chat.to_generation_request(tok, req)
     out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
-        events([THINK_START, 10, THINK_END, 11]), cached=0
+        tracked_events(gen.reasoning, [THINK_START, 10, THINK_END, 11]), cached=0
     )
     msg = out["choices"][0]["message"]
     assert msg["content"] == "<think>w10 </think>w11 "
@@ -723,26 +925,28 @@ def test_reasoning_field_none_shows_a_think_block_the_prompt_opened():
     # Qwen-style: the template ends the prompt with the open marker, the
     # model never emits it, so a client parsing the text would miss it.
     prompt = chat.to_generation_request(tok, req).tokens + [THINK_START]
+    limits = limits_for(tok, prompt)
+    assert limits.seeded
     out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
-        events([10, THINK_END, 11]), cached=0
+        tracked_events(limits, [10, THINK_END, 11]), cached=0
     )
     assert out["choices"][0]["message"]["content"] == "<think>w10 </think>w11 "
     assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 1
     req.stream = True
     chunks = list(
         chat.ChatResponder(tok, req, prompt, reasoning_field="none").stream(
-            events([10, THINK_END, 11]), cached=0
+            tracked_events(limits, [10, THINK_END, 11]), cached=0
         )
     )
     assert chunks[0]["choices"][0]["delta"]["content"] == "<think>w10 "
     # The block closes on the very first token: the opener still goes first.
     out = chat.ChatResponder(tok, req, prompt, reasoning_field="none").complete(
-        events([THINK_END, 11]), cached=0
+        tracked_events(limits, [THINK_END, 11]), cached=0
     )
     assert out["choices"][0]["message"]["content"] == "<think></think>w11 "
     # Routed, the same prompt yields the reasoning field, no marker anywhere.
     out = chat.ChatResponder(tok, req, prompt).complete(
-        events([10, THINK_END, 11]), cached=0
+        tracked_events(limits, [10, THINK_END, 11]), cached=0
     )
     msg = out["choices"][0]["message"]
     assert msg["reasoning"] == "w10 " and msg["content"] == "w11 "

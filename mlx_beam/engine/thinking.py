@@ -42,6 +42,10 @@ class ReasoningLimits:
     # so the budget counts exactly what the API shows as reasoning (a label
     # with stray whitespace too); without it, only `labels` do.
     label_means_reasoning: Callable[[tuple[int, ...]], bool] | None = None
+    # Whether the opener is masked once no block fits; False for a family
+    # whose block is closed at once instead and counts nothing (Gemma 4's
+    # channel, whose model writes the head without a masked opener).
+    mask_opener: bool = True
 
 
 def budget(
@@ -155,8 +159,10 @@ class ThinkingBudget:
         self._label_end_ids = mx.array(limits.label_end or (0,), dtype=mx.int32)
         self.reasoning_tokens = 0
         self.thinking_truncated = False
-        # Set by observe(): the token just seen came from the force queue.
+        # Set by observe(): the token just seen came from the force queue,
+        # or belongs to a block the budget closed at once (suppressed).
         self.last_forced = False
+        self.last_suppressed = False
         # The free token began the end marker itself: the queue stood down.
         self._natural = False
         # Forced tokens, consumed by the processor one per step, and the
