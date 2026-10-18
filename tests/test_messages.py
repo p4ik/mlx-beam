@@ -165,6 +165,66 @@ def test_refusals_are_explicit():
     assert req.chat.tools is None
 
 
+def tool_turn(*blocks):
+    """The user's turn at the second step of a tool loop, after the
+    assistant's `tool_use`, with the given blocks in that order."""
+    return {
+        "max_tokens": 4,
+        "messages": [
+            {"role": "user", "content": "w1"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {}}
+                ],
+            },
+            {"role": "user", "content": list(blocks)},
+        ],
+    }
+
+
+RESULT = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "w4"}
+TEXT = {"type": "text", "text": "w5"}
+THOUGHT = {"type": "thinking", "thinking": "hmm", "signature": "x"}
+
+
+def test_a_text_block_before_a_tool_result_is_refused():
+    with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request(tool_turn(TEXT, RESULT), "m")
+    err = exc.value
+    assert err.status == 400 and err.type == "invalid_request_error"
+    assert err.param == "messages[2].content[0]"
+    assert "messages[2].content[1]" in err.message
+    assert "messages[2].content[0]" in err.message
+
+
+def test_a_text_block_between_tool_results_is_refused():
+    with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request(tool_turn(RESULT, TEXT, RESULT), "m")
+    assert exc.value.status == 400 and exc.value.param == "messages[2].content[1]"
+
+
+def test_an_image_block_before_a_tool_result_is_refused():
+    image = IMAGE_TURN["content"][1]
+    with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request(tool_turn(image, RESULT), "m", vision=True)
+    assert exc.value.status == 400 and exc.value.param == "messages[2].content[0]"
+
+
+def test_a_thinking_block_before_a_tool_result_is_refused():
+    with pytest.raises(ApiError) as exc:
+        messages.parse_messages_request(tool_turn(THOUGHT, RESULT), "m")
+    assert exc.value.status == 400 and exc.value.param == "messages[2].content[0]"
+
+
+def test_text_after_the_tool_results_is_accepted():
+    req = messages.parse_messages_request(tool_turn(RESULT, TEXT), "m")
+    assert [m["role"] for m in req.chat.messages[-2:]] == ["tool", "user"]
+    assert req.chat.messages[-1]["content"] == "w5"
+    req = messages.parse_messages_request(tool_turn(RESULT, RESULT, TEXT), "m")
+    assert [m["role"] for m in req.chat.messages[-3:]] == ["tool", "tool", "user"]
+
+
 IMAGE_TURN = {
     "role": "user",
     "content": [
@@ -304,6 +364,20 @@ def test_endpoints_and_the_error_envelope(server):  # noqa: F811
     }
     status, _, raw = call(server, "POST", "/v1/messages", {**body, "model": "other"})
     assert status == 404 and json.loads(raw)["error"]["type"] == "not_found_error"
+
+
+def test_count_tokens_refuses_text_before_a_tool_result(server):  # noqa: F811
+    # The refusal falls in the parser, so count_tokens answers it too, in
+    # the Anthropic envelope: the block's path stands in the message.
+    status, _, raw = call(
+        server, "POST", "/v1/messages/count_tokens", tool_turn(TEXT, RESULT)
+    )
+    err = json.loads(raw)
+    assert status == 400 and err == {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": err["error"]["message"]},
+    }
+    assert "messages[2].content[0]" in err["error"]["message"]
 
 
 def test_stop_sequences_end_the_text_and_name_the_sequence():
