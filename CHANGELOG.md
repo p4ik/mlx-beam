@@ -81,6 +81,13 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   other event, and a stream that fails before its first token still opens
   with `response.created` and `response.in_progress`, as the OpenAI SDK's
   stream helper expects.
+- mistral-common below 1.11.1 refuses a tool turn followed by a user
+  turn, the sequence an Anthropic-style client sends after a tool result
+  with text; with transformers 5.17.0 to 5.20.1 an installation below
+  1.11.5 did not load a tekken checkpoint at all. The dependency floor is
+  now 1.11.7 in both packages - the version transformers' tekken backend
+  requires - and the combination mistral-common 1.11.7 with transformers
+  5.17.0 is tested through the renderer.
 
 ## [0.1.0a11] - 2026-10-11
 

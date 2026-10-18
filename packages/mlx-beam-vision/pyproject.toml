@@ -38,7 +38,9 @@ dependencies = [
   "jinja2>=3.1",
   # The image chunks of a tekken checkpoint (Pixtral) are prepared by
   # mistral-common itself; the core carries the text part.
-  "mistral-common[image]>=1.8.4",
+  # 1.11.7: what transformers' tekken backend requires; the validator takes
+  # a user turn after a tool turn from 1.11.1 (measured 2026-10-17).
+  "mistral-common[image]>=1.11.7",
 ]
 
 [project.optional-dependencies]
