@@ -46,6 +46,8 @@ dev = [
   "import-linter>=2",
   # CPU build of MLX so the tests run on Linux too (Apple silicon stays the reference).
   "mlx[cpu]>=0.32; sys_platform == 'linux'",
+  # The server tests drive the Responses stream through the SDK's stream helper.
+  "openai>=3.6",
 ]
 # The extra is the installation selector for the package that serves images
 # (packages/mlx-beam-vision in this repository, its own project on PyPI).

@@ -2172,3 +2172,19 @@ def test_logprob_bytes_of_a_sentencepiece_byte_token_are_its_hex():
 
     entry = logprob_entry(Spm(), TokenEvent(40, -0.1))
     assert entry["bytes"] == [0xE2]
+
+
+def test_a_value_below_a_floor_says_at_least():
+    """A field with a floor and no ceiling: the refusal names the floor,
+    not a ceiling of None."""
+    with pytest.raises(ApiError) as e:
+        chat.parse_chat_request(
+            {
+                "messages": [{"role": "user", "content": "w1"}],
+                "max_reasoning_tokens": -1,
+            },
+            "m",
+        )
+    assert "max_reasoning_tokens must be at least 0" in str(e.value)
+    assert "None" not in str(e.value)
+    assert e.value.param == "max_reasoning_tokens"
