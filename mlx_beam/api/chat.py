@@ -755,8 +755,45 @@ def reasoning_limits(
     label = tuple(getattr(tokenizer, "reasoning_label_tokens", None) or ())
     label_end = tuple(getattr(tokenizer, "think_label_end_tokens", None) or ())
     labels: tuple[tuple[int, ...], ...] = ()
-    verdict = None
-    if label and label_end:
+    verdict = head_may_open = None
+    frame: tuple[int, ...] = ()
+    at_frame = False
+    opener_counted = True
+    think_start = getattr(tokenizer, "think_start", None) or ""
+    frame_start = getattr(tokenizer, "frame_start", None)
+    if frame_start and not think_start.startswith("<"):
+        # A textual opener (Muse's ` to=`) is the frame's only right after
+        # it, and the assembler holds it as a prefix: not counted. The
+        # vocabulary may merge its tail into the label (` to`, `=self`), so
+        # the budget's opener is what the two forms share; the rest is read
+        # from the head with the recipient, judged as the assembler judges.
+        frame = tuple(tokenizer.encode(frame_start, add_special_tokens=False))
+        at_frame = bool(frame) and tuple(prompt[-len(frame) :]) == frame
+        opener_counted = False
+        plain = tuple(tokenizer.encode(think_start, add_special_tokens=False))
+        head = start[: _common_prefix(list(plain), list(start))]
+        if head:
+            start = head
+            rest = think_start[len(tokenizer.decode(list(head))) :].strip()
+
+            def head_text(ids: tuple[int, ...]) -> str:
+                return tokenizer.decode(list(ids)).lstrip()
+
+            def verdict(ids: tuple[int, ...]) -> bool:
+                text = head_text(ids)
+                if not text.startswith(rest):
+                    return False
+                return route_label(tokenizer, text[len(rest) :]) == "reasoning"
+
+            def head_may_open(ids: tuple[int, ...]) -> bool:
+                text = head_text(ids)
+                return text.startswith(rest) or rest.startswith(text)
+
+        else:
+            # No shared prefix (a vocabulary that writes the whole recipient
+            # as one token): the opener's token form alone, no head to read.
+            label_end = ()
+    elif label and label_end:
         # The mask cuts the label as the vocabulary writes it, with and
         # without the space a word token carries; what the model writes
         # instead is judged by its text, as the assembler judges it.
@@ -770,6 +807,9 @@ def reasoning_limits(
         def verdict(ids: tuple[int, ...]) -> bool:
             return route_label(tokenizer, tokenizer.decode(list(ids))) == "reasoning"
 
+    else:
+        label_end = ()
+
     return ReasoningLimits(
         start=start,
         end=end,
@@ -777,11 +817,16 @@ def reasoning_limits(
         seeded=initial_state(tokenizer, prompt)[0] in ("reasoning", "label"),
         max_tokens=max_tokens,
         labels=labels,
-        label_end=label_end if label else (),
+        label_end=label_end,
         label_means_reasoning=verdict,
-        # Gemma 4's model writes the channel's head without a masked opener:
+        # Gemma 4's model writes the channel's head without a masked opener,
+        # Muse's recipient says only at the head's end whether it reasons:
         # the block is let in and closed at once instead (ThinkingBudget).
-        mask_opener=getattr(tokenizer, "think_family", None) != "channel",
+        mask_opener=getattr(tokenizer, "think_family", None) not in ("channel", "muse"),
+        frame=frame,
+        at_frame=at_frame,
+        opener_counted=opener_counted,
+        head_may_open=head_may_open,
     )
 
 
