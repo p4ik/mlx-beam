@@ -101,8 +101,9 @@ local = [
   "muse_glimmer/__init__.py",
   "granite4_vision/__init__.py",
 ]
-# base.py holds two pieces of upstream's models/base.py, nothing else.
-modified = ["base.py"]
+# base.py holds two pieces of upstream's models/base.py, nothing else;
+# qwen3_vl/vision.py takes the MoE type (the package's VENDORED.md).
+modified = ["base.py", "qwen3_vl/vision.py"]
 
 [parts.mlx-vlm-vision.files]
 "base.py" = "models/base.py"

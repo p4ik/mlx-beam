@@ -199,6 +199,8 @@ class VisionModel(nn.Module):
 
         if self.model_type not in [
             "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_vl_moe_vision",
             "qwen3_5",
             "qwen3_5_moe",
             "qwen3_5_vision",
