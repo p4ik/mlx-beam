@@ -453,6 +453,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         handler = routes.get(path)
         self._streaming = False
+        self._responder = None
         try:
             if handler is None:
                 raise ApiError("not found", status=404, type="not_found_error")
@@ -488,9 +489,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fail(self, err: ApiError) -> None:
         """An error before the headers is a status; inside a stream it is the
-        last event, since the 200 is already on the wire."""
+        last event, since the 200 is already on the wire - a responder that
+        ends its own stream (Responses) does so with its lifecycle events."""
         if not self._streaming:
             self._send_error(err)
+            return
+        failed = getattr(self._responder, "failed", None)
+        if self._sse_events and failed is not None:
+            for payload in failed(err):
+                self._sse(payload, payload["type"])
             return
         self._sse(self._error_body(err), "error" if self._sse_events else None)
         if not self._sse_events:
@@ -514,6 +521,8 @@ class Handler(BaseHTTPRequestHandler):
         connection."""
         result = self.served.engine.submit(gen_request)
         self._sse_events = sse_events
+        # Known before the headers go out: a failure after them is its stream's end.
+        self._responder = responder
         try:
             if stream:
                 self._start_sse()

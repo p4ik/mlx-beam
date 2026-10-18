@@ -139,9 +139,10 @@ def effort_capability(tokenizer) -> EffortCapability:
     return cached
 
 
-def normalise_effort(effort) -> str | None:
+def normalise_effort(effort, field: str = "reasoning_effort") -> str | None:
     """The request's effort word, checked against the vocabulary; None for
-    thinking off. Unknown words are refused with the list that applies."""
+    thinking off. Unknown words are refused with the list that applies,
+    under `field`, the name the surface gives the word."""
     if effort is None:
         return None
     if isinstance(effort, bool):
@@ -151,9 +152,9 @@ def normalise_effort(effort) -> str | None:
         return None
     if word not in ORDINAL and word not in EFFORT_ALIASES:
         raise ApiError(
-            f"unknown reasoning_effort {effort!r}; one of "
+            f"unknown {field} {effort!r}; one of "
             f"{', '.join(EFFORT_OFF + ORDINAL + tuple(EFFORT_ALIASES))}",
-            param="reasoning_effort",
+            param=field,
         )
     return word
 

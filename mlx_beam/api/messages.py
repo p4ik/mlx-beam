@@ -290,7 +290,15 @@ def parse_messages_request(
             thinking_requested = True
             budget = thinking.get("budget_tokens")
             if budget is not None:
-                max_reasoning = _number(thinking, "budget_tokens", None, 0, None, int)
+                max_reasoning = _number(
+                    thinking,
+                    "budget_tokens",
+                    None,
+                    0,
+                    None,
+                    int,
+                    name="thinking.budget_tokens",
+                )
         else:
             raise ApiError(
                 "thinking.type must be enabled or disabled", param="thinking"

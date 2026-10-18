@@ -22,6 +22,7 @@ from mlx_beam.api.chat import (
     _normalise_messages,
     _number,
     completion_details,
+    effort_field,
     parse_sampling,
     parse_thinking,
     requested_thinking,
@@ -242,12 +243,18 @@ def parse_responses_request(
     )
     template_kwargs: dict[str, Any] = dict(defaults.chat_template_args)
     aliases = read_aliases(body)
-    level, thinking = parse_thinking(aliases)
+    # A refusal names the surface's field, whichever spelling the word came in.
+    level, thinking = parse_thinking(aliases, effort_field("responses"))
     if thinking is not None:
         template_kwargs["enable_thinking"] = thinking
     if level is not None:
         for name in EFFORT_KWARGS:
             template_kwargs.pop(name, None)
+        # A word asks for thinking: it beats a server default that switched
+        # it off (the request is the more specific), not the request's own
+        # enable_thinking.
+        if thinking is None:
+            template_kwargs.pop("enable_thinking", None)
     images: list[Image] | None = [] if vision else None
     chat = ChatRequest(
         messages=_normalise_messages(
@@ -261,7 +268,13 @@ def parse_responses_request(
         tools=tools,
         reasoning_effort=level,
         max_reasoning_tokens=_number(
-            aliases, "max_reasoning_tokens", None, 0, None, int
+            aliases,
+            "max_reasoning_tokens",
+            None,
+            0,
+            None,
+            int,
+            name="reasoning.max_tokens",
         ),
         min_response_tokens=_number(body, "min_response_tokens", None, 0, None, int),
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
@@ -314,9 +327,25 @@ class ResponsesResponder:
             route_thinking=route_thinking,
             tools_enabled=bool(req.chat.tools),
         )
+        # The stream's state lives on the responder, not in stream(): a
+        # failure once the 200 is on the wire ends the stream with the
+        # numbering and the items so far (failed).
+        self._seq = 0
+        self._cached = 0
+        self._output: list[dict] = []
+        self._index = -1
+        self._current: str | None = None  # "reasoning" or "message" while open
+        # Every opened item has its own id and text; the model may return
+        # to reasoning or text after a tool call, and that is a new item.
+        self._item_id = ""
+        self._item_text = ""
+
+    def _ev(self, kind: str, **data) -> dict:
+        self._seq += 1
+        return {"type": kind, "sequence_number": self._seq, **data}
 
     def _response(
-        self, status: str, output: list[dict], cached: int, incomplete=None
+        self, status: str, output: list[dict], cached: int, incomplete=None, error=None
     ) -> dict:
         out = {
             "id": self.id,
@@ -325,7 +354,7 @@ class ResponsesResponder:
             "status": status,
             "model": self.req.chat.model,
             "output": output,
-            "error": None,
+            "error": error,
             "incomplete_details": incomplete,
             "instructions": self.req.instructions,
             "metadata": self.req.metadata,
@@ -354,110 +383,129 @@ class ResponsesResponder:
             final = ev
         return final["response"]
 
+    def opened(self) -> Iterator[dict]:
+        """The two events every stream begins with."""
+        yield self._ev(
+            "response.created", response=self._response("in_progress", [], self._cached)
+        )
+        yield self._ev(
+            "response.in_progress",
+            response=self._response("in_progress", [], self._cached),
+        )
+
+    def close_current(self, cut: bool = False) -> Iterator[dict]:
+        """The done events of the open item, which then joins the output;
+        `cut` marks a message the length limit or a failure ended."""
+        index, item_id, item_text = self._index, self._item_id, self._item_text
+        if self._current == "reasoning":
+            item = {
+                "id": item_id,
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": item_text}],
+            }
+            yield self._ev(
+                "response.reasoning_text.done",
+                item_id=item_id,
+                output_index=index,
+                content_index=0,
+                text=item_text,
+            )
+            yield self._ev("response.output_item.done", output_index=index, item=item)
+            self._output.append(item)
+        elif self._current == "message":
+            part = {"type": "output_text", "text": item_text, "annotations": []}
+            item = {
+                "id": item_id,
+                "type": "message",
+                "status": "incomplete" if cut else "completed",
+                "role": "assistant",
+                "content": [part],
+            }
+            yield self._ev(
+                "response.output_text.done",
+                item_id=item_id,
+                output_index=index,
+                content_index=0,
+                text=item_text,
+                logprobs=[],
+            )
+            yield self._ev(
+                "response.content_part.done",
+                item_id=item_id,
+                output_index=index,
+                content_index=0,
+                part=part,
+            )
+            yield self._ev("response.output_item.done", output_index=index, item=item)
+            self._output.append(item)
+        self._current = None
+
+    def failed(self, err: ApiError) -> list[dict]:
+        """The end of a stream that fails: the open item closed as cut,
+        response.failed with the output so far and the error, then the
+        error event. Before the first event the lifecycle is opened first:
+        a client's stream helper takes nothing before response.created."""
+        events = list(self.opened()) if self._seq == 0 else []
+        events += self.close_current(cut=True)
+        code = err.code or err.type
+        events.append(
+            self._ev(
+                "response.failed",
+                response=self._response(
+                    "failed",
+                    self._output,
+                    self._cached,
+                    error={"code": code, "message": err.message},
+                ),
+            )
+        )
+        events.append(
+            self._ev("error", code=code, message=err.message, param=err.param)
+        )
+        return events
+
     def stream(self, events, cached: int) -> Iterator[dict]:
         """Server-sent events of the Responses stream: created, in_progress,
         one item at a time (reasoning, message, function calls) with their
         part and text events, then completed or incomplete."""
-        seq = 0
-
-        def ev(kind: str, **data):
-            nonlocal seq
-            seq += 1
-            return {"type": kind, "sequence_number": seq, **data}
-
-        yield ev("response.created", response=self._response("in_progress", [], cached))
-        yield ev(
-            "response.in_progress", response=self._response("in_progress", [], cached)
-        )
+        self._cached = cached
+        yield from self.opened()
         total = TextDelta()
-        output: list[dict] = []
-        index = -1
-        current: str | None = None  # "reasoning" or "message" while open
-        # Every opened item has its own id and text; the model may return
-        # to reasoning or text after a tool call, and that is a new item.
-        item_id = ""
-        item_text = ""
-
-        def close_current(cut: bool = False):
-            nonlocal current
-            if current == "reasoning":
-                item = {
-                    "id": item_id,
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": [{"type": "reasoning_text", "text": item_text}],
-                }
-                yield ev(
-                    "response.reasoning_text.done",
-                    item_id=item_id,
-                    output_index=index,
-                    content_index=0,
-                    text=item_text,
-                )
-                yield ev("response.output_item.done", output_index=index, item=item)
-                output.append(item)
-            elif current == "message":
-                part = {"type": "output_text", "text": item_text, "annotations": []}
-                item = {
-                    "id": item_id,
-                    "type": "message",
-                    "status": "incomplete" if cut else "completed",
-                    "role": "assistant",
-                    "content": [part],
-                }
-                yield ev(
-                    "response.output_text.done",
-                    item_id=item_id,
-                    output_index=index,
-                    content_index=0,
-                    text=item_text,
-                    logprobs=[],
-                )
-                yield ev(
-                    "response.content_part.done",
-                    item_id=item_id,
-                    output_index=index,
-                    content_index=0,
-                    part=part,
-                )
-                yield ev("response.output_item.done", output_index=index, item=item)
-                output.append(item)
-            current = None
-
         for event in events:
             d = self.assembler.feed(event)
             # Calls go out before the text of the same delta: what parsed came
             # first, and a cut-off tail is what the length limit hit - it is
             # the item still open at the end, closed as incomplete below.
             if d.reasoning:
-                if current != "reasoning":
-                    yield from close_current()
-                    index += 1
-                    current = "reasoning"
-                    item_id = f"rs_{uuid.uuid4().hex[:24]}"
-                    item_text = ""
-                    yield ev(
+                if self._current != "reasoning":
+                    yield from self.close_current()
+                    self._index += 1
+                    self._current = "reasoning"
+                    self._item_id = f"rs_{uuid.uuid4().hex[:24]}"
+                    self._item_text = ""
+                    yield self._ev(
                         "response.output_item.added",
-                        output_index=index,
+                        output_index=self._index,
                         item={
-                            "id": item_id,
+                            "id": self._item_id,
                             "type": "reasoning",
                             "summary": [],
                             "content": [],
                         },
                     )
                 total.reasoning += d.reasoning
-                item_text += d.reasoning
-                yield ev(
+                self._item_text += d.reasoning
+                yield self._ev(
                     "response.reasoning_text.delta",
-                    item_id=item_id,
-                    output_index=index,
+                    item_id=self._item_id,
+                    output_index=self._index,
                     content_index=0,
                     delta=d.reasoning,
                 )
             for tc in d.tool_calls:
-                yield from close_current()
-                index += 1
+                yield from self.close_current()
+                self._index += 1
                 item = {
                     "id": f"fc_{uuid.uuid4().hex[:24]}",
                     "type": "function_call",
@@ -466,52 +514,54 @@ class ResponsesResponder:
                     "name": tc["function"]["name"],
                     "arguments": tc["function"]["arguments"],
                 }
-                yield ev(
+                yield self._ev(
                     "response.output_item.added",
-                    output_index=index,
+                    output_index=self._index,
                     item={**item, "status": "in_progress", "arguments": ""},
                 )
-                yield ev(
+                yield self._ev(
                     "response.function_call_arguments.done",
                     item_id=item["id"],
-                    output_index=index,
+                    output_index=self._index,
                     name=item["name"],
                     arguments=item["arguments"],
                 )
-                yield ev("response.output_item.done", output_index=index, item=item)
-                output.append(item)
+                yield self._ev(
+                    "response.output_item.done", output_index=self._index, item=item
+                )
+                self._output.append(item)
                 total.tool_calls.append(tc)
             if d.content:
-                if current != "message":
-                    yield from close_current()
-                    index += 1
-                    current = "message"
-                    item_id = f"msg_{uuid.uuid4().hex[:24]}"
-                    item_text = ""
-                    yield ev(
+                if self._current != "message":
+                    yield from self.close_current()
+                    self._index += 1
+                    self._current = "message"
+                    self._item_id = f"msg_{uuid.uuid4().hex[:24]}"
+                    self._item_text = ""
+                    yield self._ev(
                         "response.output_item.added",
-                        output_index=index,
+                        output_index=self._index,
                         item={
-                            "id": item_id,
+                            "id": self._item_id,
                             "type": "message",
                             "status": "in_progress",
                             "role": "assistant",
                             "content": [],
                         },
                     )
-                    yield ev(
+                    yield self._ev(
                         "response.content_part.added",
-                        item_id=item_id,
-                        output_index=index,
+                        item_id=self._item_id,
+                        output_index=self._index,
                         content_index=0,
                         part={"type": "output_text", "text": "", "annotations": []},
                     )
                 total.content += d.content
-                item_text += d.content
-                yield ev(
+                self._item_text += d.content
+                yield self._ev(
                     "response.output_text.delta",
-                    item_id=item_id,
-                    output_index=index,
+                    item_id=self._item_id,
+                    output_index=self._index,
                     content_index=0,
                     delta=d.content,
                     logprobs=[],
@@ -521,13 +571,13 @@ class ResponsesResponder:
                 break
         # The item's status goes out with its done event; nothing already
         # on the wire is changed afterwards.
-        yield from close_current(cut=total.finish_reason == "length")
+        yield from self.close_current(cut=total.finish_reason == "length")
         incomplete = (
             {"reason": "max_output_tokens"} if total.finish_reason == "length" else None
         )
         status = "incomplete" if incomplete else "completed"
-        final = self._response(status, output, cached, incomplete)
-        yield ev(
+        final = self._response(status, self._output, cached, incomplete)
+        yield self._ev(
             "response.completed" if not incomplete else "response.incomplete",
             response=final,
         )
