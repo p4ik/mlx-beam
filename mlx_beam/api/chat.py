@@ -779,6 +779,9 @@ def reasoning_limits(
         labels=labels,
         label_end=label_end if label else (),
         label_means_reasoning=verdict,
+        # Gemma 4's model writes the channel's head without a masked opener:
+        # the block is let in and closed at once instead (ThinkingBudget).
+        mask_opener=getattr(tokenizer, "think_family", None) != "channel",
     )
 
 

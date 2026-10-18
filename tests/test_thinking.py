@@ -836,8 +836,9 @@ def test_the_suppressed_flag_ends_with_the_last_tail_token():
     assert [e.reasoning_counted for e in events] == [0] * 6
     assert events[-1].finish_reason == "stop" and not events[-1].response_truncated
     assert not events[-1].thinking_truncated
-    # The helper mirrors the engine.
-    assert tracked_events(limits, tokens, finish="stop", eos=None) == events
+    # The helper mirrors the engine, the logprob apart.
+    mirrored = tracked_events(limits, tokens, finish="stop", eos=None)
+    assert mirrored == [replace(e, logprob=-0.1) for e in events]
 
 
 def test_a_suppressed_channel_stays_visible_without_routing():

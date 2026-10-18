@@ -163,6 +163,13 @@ class ThinkingBudget:
         # or belongs to a block the budget closed at once (suppressed).
         self.last_forced = False
         self.last_suppressed = False
+        # Progress through a block, every token seen (opener, head, content,
+        # the counted part of the close) whether the block counts or not:
+        # the force queue runs on it, the budget on reasoning_tokens.
+        self._seen = 0
+        # Set at the opener of a block the budget has no room for
+        # (mask_opener False): closed at once, counted nothing.
+        self._suppressed = False
         # The free token began the end marker itself: the queue stood down.
         self._natural = False
         # Forced tokens, consumed by the processor one per step, and the
@@ -285,6 +292,10 @@ class ThinkingBudget:
     def observe(self, token: int, finish_reason: str | None) -> None:
         """One generated token, in order; called after the generator returned it."""
         self.last_forced = self._is_forced(token)
+        # This token's flag: the block state on entry, or a block suppressed
+        # in this very call. _disarm clears the state later in the call, so
+        # the close's last token still carries the flag.
+        self.last_suppressed = self._suppressed
         if self._closing:
             # The close's tail after the end marker (a line break, or the
             # answer's opener for a family that closes by opening it): the
@@ -298,10 +309,11 @@ class ThinkingBudget:
                 if self._armed_at is not None:
                     # Before this count the close came from the model itself
                     # (finished by the force, at most); from it on it was forced.
-                    forced = self.reasoning_tokens >= (
+                    forced = self._seen >= (
                         self._armed_at + self._free + self._close_counted
                     )
-                    self.thinking_truncated |= forced
+                    if not self._suppressed:
+                        self.thinking_truncated |= forced
                     # The marker's last token was this one; the rest of the
                     # close follows from the queue.
                     tail = close_tail(self.limits) - 1
@@ -310,7 +322,7 @@ class ThinkingBudget:
                     else:
                         self._disarm()
             else:
-                self.reasoning_tokens += 1
+                self._count(1)
                 self._gate_opener()
                 self._maybe_arm()
         elif self._state == "label":
@@ -324,7 +336,7 @@ class ThinkingBudget:
                 self._close_on_end = False
                 if self._means_reasoning(label):
                     self._state = "reasoning"
-                    self.reasoning_tokens += 1 + len(self._label)
+                    self._count(1 + len(self._label))
                     if fired:
                         # This step's logits forced the close's first token:
                         # armed from here without a free token, the queue
@@ -345,11 +357,31 @@ class ThinkingBudget:
                 self._label = []
             else:
                 self._state = "reasoning"
-                self.reasoning_tokens += 1
+                if not self.limits.mask_opener and self._no_room():
+                    # The opener came through unmasked into a block the
+                    # budget has no room for: closed at once, counted nothing.
+                    self._suppressed = self.last_suppressed = True
+                self._count(1)
                 self._gate_opener()
                 self._maybe_arm()
-        if finish_reason == "length" and self._state == "reasoning":
+        if finish_reason == "length" and self.in_reasoning:
             self.thinking_truncated = True
+
+    def _count(self, n: int) -> None:
+        """`n` tokens of a block seen: the progress always, the published
+        count only for a block the budget admitted."""
+        self._seen += n
+        if not self._suppressed:
+            self.reasoning_tokens += n
+
+    def _no_room(self) -> bool:
+        """Another block - its entry (opener, label and label end), a free
+        token and the counted part of the close - does not fit what is left."""
+        limit = self.limits.max_tokens
+        return (
+            limit is not None
+            and limit - self.reasoning_tokens < self._entry + 1 + self._close_counted
+        )
 
     def _header_overruns(self) -> bool:
         """The label so far, were it to end now, means reasoning and costs
@@ -372,7 +404,9 @@ class ThinkingBudget:
 
     @property
     def in_reasoning(self) -> bool:
-        return self._state == "reasoning"
+        """Inside a block that counts; a suppressed block is no reasoning,
+        so a length cut inside it is the answer's."""
+        return self._state == "reasoning" and not self._suppressed
 
     def stable_for(self, tokens: int) -> bool:
         """The processor's state cannot change over the next `tokens`
@@ -406,7 +440,7 @@ class ThinkingBudget:
             return False
         if self._state != "reasoning":
             return bool(self._closing) and not self._natural
-        since = self.reasoning_tokens - self._armed_at
+        since = self._seen - self._armed_at
         if since < self._free:
             self._natural = token == self._guard
             return False
@@ -426,7 +460,7 @@ class ThinkingBudget:
         self._pos = 0
         self._closed = None
         self._natural = False
-        self._armed_at = self.reasoning_tokens
+        self._armed_at = self._seen
         self._free = free
         # The model may be inside the marker already (its first tokens were
         # observed): then the free token continues it, not begins it.
@@ -441,17 +475,16 @@ class ThinkingBudget:
         self._armed_at = None
         self._closed = None
         self._closing = 0
+        self._suppressed = False
 
     def _gate_opener(self) -> None:
-        """Another block costs its entry (opener, label and label end), a
-        free token and the counted part of the close before the force can
-        land: mask the opener as soon as the allowance left cannot hold
-        that. Checked on every counted token, because the mask reaches the
-        logits two tokens later - by the time a block closes it must
-        already be in place."""
-        limit = self.limits.max_tokens
-        if (
-            limit is not None
-            and limit - self.reasoning_tokens < self._entry + 1 + self._close_counted
-        ):
+        """Mask the opener as soon as the allowance left cannot hold another
+        block (_no_room). Checked on every counted token, because the mask
+        reaches the logits two tokens later - by the time a block closes it
+        must already be in place."""
+        if not self.limits.mask_opener:
+            # A masked opener keeps the model from the opener, not from the
+            # channel: the block is let in and closed at once instead.
+            return
+        if self._no_room():
             self._block = True

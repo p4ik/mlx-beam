@@ -120,7 +120,8 @@ class CompletionResponder:
         self.echo_text = tokenizer.decode(prompt_tokens) if req.echo else ""
         self._offset = len(self.echo_text)
         # The raw endpoint returns what the model wrote: markers stay in
-        # the text, a tool-call block is text, thinking is only counted.
+        # the text, a tool-call block is text; no budget runs here, so
+        # reasoning_tokens is 0.
         self.assembler = TextAssembler(
             tokenizer,
             prompt_tokens=prompt_tokens,
