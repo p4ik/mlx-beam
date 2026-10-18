@@ -279,12 +279,15 @@ def parse_messages_request(
         )
     template_kwargs: dict[str, Any] = dict(defaults.chat_template_args)
     max_reasoning = None
+    thinking_requested = None
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         if thinking.get("type") == "disabled":
             template_kwargs["enable_thinking"] = False
+            thinking_requested = False
         elif thinking.get("type") in ("enabled", "adaptive"):
             template_kwargs["enable_thinking"] = True
+            thinking_requested = True
             budget = thinking.get("budget_tokens")
             if budget is not None:
                 max_reasoning = _number(thinking, "budget_tokens", None, 0, None, int)
@@ -307,6 +310,7 @@ def parse_messages_request(
         template_kwargs=template_kwargs,
         images=images or [],
         surface="messages",
+        thinking_requested=thinking_requested,
     )
     return MessagesRequest(chat=chat, stream=chat.stream)
 

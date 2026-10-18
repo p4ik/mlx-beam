@@ -364,7 +364,10 @@ def parse_chat_request(
         # Effort none: off, and no server-default effort word either.
         for name in EFFORT_KWARGS:
             template_kwargs.pop(name, None)
-    template_kwargs.update(object_field(body, "chat_template_kwargs"))
+    explicit = object_field(body, "chat_template_kwargs")
+    template_kwargs.update(explicit)
+    # The switch the template gets: an explicit kwarg beats the alias.
+    switch = explicit["enable_thinking"] if "enable_thinking" in explicit else thinking
     stream_opts = object_field(body, "stream_options")
     return ChatRequest(
         messages=_normalise_messages(body.get("messages"), images),
@@ -385,6 +388,7 @@ def parse_chat_request(
         max_prompt_tokens=_number(body, "max_prompt_tokens", None, 1, None, int),
         template_kwargs=template_kwargs,
         images=images or [],
+        thinking_requested=requested_thinking(switch, level),
     )
 
 
@@ -399,6 +403,16 @@ def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
     if level is None:
         return None, False if thinking is None else thinking
     return level, thinking
+
+
+def requested_thinking(switch, level: str | None) -> bool | None:
+    """ChatRequest.thinking_requested from the switch the template gets and
+    the effort word: a word alone asks for thinking, a switch beats it."""
+    if switch is True or (switch is None and level is not None):
+        return True
+    if switch is False:
+        return False
+    return None
 
 
 def _log_refusal(e: BaseException) -> None:
@@ -665,11 +679,13 @@ def to_generation_request(
         if req.min_response_tokens is None
         else req.min_response_tokens
     )
-    max_reasoning = (
-        defaults.max_reasoning_tokens
-        if req.max_reasoning_tokens is None
-        else req.max_reasoning_tokens
-    )
+    max_reasoning = req.max_reasoning_tokens
+    if max_reasoning is None:
+        max_reasoning = defaults.max_reasoning_tokens
+        if max_reasoning == 0 and req.thinking_requested is True:
+            # A server budget of 0 is thinking switched off by default; a
+            # request that switched it on is bound by its room alone.
+            max_reasoning = None
     completion_cap, reasoning_cap = budget(
         max_context, len(prompt), req.max_tokens, min_response
     )
