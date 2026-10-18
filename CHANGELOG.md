@@ -19,6 +19,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   4 template drops silently; it is now a 400 that names the block, as
   Anthropic answers it - tool results come first, text and images after
   them.
+- A Qwen3-VL-MoE checkpoint without a processor file was refused:
+  transformers names its processor and video processor but maps no image
+  processor to the type, and the vision tower refused the type before the
+  processor was built. The loader now takes the dense sibling's image
+  processor, which that processor is built with, the tower accepts the
+  type, and a refusal names the part that is missing.
 
 ## [0.1.0a11] - 2026-10-11
 

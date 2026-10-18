@@ -522,6 +522,10 @@ PART_NAMES = ("image_processor", "video_processor", "feature_extractor")
 """The parts a processor keeps beside its tokenizer, in the order
 `classes_for` lists their classes after the processor's."""
 
+# Model types transformers maps to a processor but to no image processor
+# of their own: the dense sibling's, which that processor is built with.
+IMAGE_SIBLINGS: dict[str, str] = {"qwen3_vl_moe": "qwen3_vl"}
+
 
 def assemble_processor(
     model_path: Path, config: dict, file: dict, trust_remote_code: bool, failed: OSError
@@ -649,7 +653,8 @@ def classes_for(model_type: str):
     feature extractor) for a model type, None where it has none of a kind;
     the image class per backend - torchvision when it is installed, PIL
     otherwise - as AutoImageProcessor picks it, the video class likewise,
-    None without torchvision."""
+    None without torchvision. A type in `IMAGE_SIBLINGS` without an image
+    class of its own gets the sibling's when both name the same processor."""
     from transformers.models.auto.feature_extraction_auto import (
         FEATURE_EXTRACTOR_MAPPING_NAMES,
         feature_extractor_class_from_name,
@@ -671,10 +676,19 @@ def classes_for(model_type: str):
     proc = PROCESSOR_MAPPING_NAMES.get(model_type)
     backend = "torchvision" if is_torchvision_available() else "pil"
     image = _class_name(IMAGE_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
+    if proc and not image:
+        sibling = IMAGE_SIBLINGS.get(model_type)
+        if sibling and PROCESSOR_MAPPING_NAMES.get(sibling) == proc:
+            image = _class_name(IMAGE_PROCESSOR_MAPPING_NAMES.get(sibling), backend)
     if not proc or not image:
+        missing = [
+            name
+            for name, found in (("processor", proc), ("image processor", image))
+            if not found
+        ]
         raise ValueError(
-            f"transformers has no processor for model type {model_type!r}, so "
-            "images cannot be prepared"
+            f"transformers maps no {' and no '.join(missing)} for model type "
+            f"{model_type!r}, so images cannot be prepared"
         )
     video = _class_name(VIDEO_PROCESSOR_MAPPING_NAMES.get(model_type), backend)
     feature = _class_name(FEATURE_EXTRACTOR_MAPPING_NAMES.get(model_type), backend)
