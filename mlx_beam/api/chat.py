@@ -92,6 +92,11 @@ class ChatRequest:
     # The API the request came in on (chat, messages, responses): a refusal
     # names that surface's own fields.
     surface: str = "chat"
+    # The request's own switch: True when it switched thinking on (the
+    # switch, an effort word, Messages' thinking.enabled), False when it
+    # switched it off, None when it said nothing. A server budget of 0
+    # does not bind a True.
+    thinking_requested: bool | None = None
 
 
 def _number(body, key, default, lo=None, hi=None, kind=float):
