@@ -46,6 +46,18 @@ class ReasoningLimits:
     # whose block is closed at once instead and counts nothing (Gemma 4's
     # channel, whose model writes the head without a masked opener).
     mask_opener: bool = True
+    # A family whose textual opener is the frame's (Muse's ` to=` right
+    # after `<|start|>assistant`): the frame's tokens, and whether the
+    # prompt ends with them, so the opener may be the first token.
+    frame: tuple[int, ...] = ()
+    at_frame: bool = False
+    # Whether the opener itself is a reasoning token: a marker (`<|channel|>`)
+    # is, a textual opener the assembler holds as a prefix (` to`) is not -
+    # the budget counts what usage.reasoning_tokens counts.
+    opener_counted: bool = True
+    # Frame family: whether the head written so far can still be an opener
+    # (` to` followed by `=`); None never aborts a head.
+    head_may_open: Callable[[tuple[int, ...]], bool] | None = None
 
 
 def budget(

@@ -100,9 +100,9 @@ def _split_specials(text, specials):
     return out
 
 
-def wrapper(specials, template_name):
+def wrapper(specials, template_name, cls=FakeHF):
     template = (TEMPLATES / template_name).read_text()
-    hf = FakeHF(specials, template)
+    hf = cls(specials, template)
     parser = tu._infer_tool_parser(hf)
     module = harmony if parser == "harmony" else atem
     w = tu.TokenizerWrapper(
@@ -195,8 +195,8 @@ class ScriptTokenizer:
     """A tokenizer whose ids decode to the pieces of a script: the text the
     model would produce, cut where the test wants token boundaries. One id
     per distinct piece (the budget's matcher compares ids, so a marker
-    written twice has one), the stop id for `""`, and the family's label
-    and label end, so the limits derive for a script without them."""
+    written twice has one), the stop id for `""`, and the family's label,
+    label end and frame, so the limits derive for a script without them."""
 
     has_chat_template = True
     has_thinking = True
@@ -221,7 +221,9 @@ class ScriptTokenizer:
             setattr(self, name, getattr(wrapped, name))
         family = tu.FAMILY_MARKERS.get(self.think_family, {})
         label = family.get("reasoning_label", "")
-        extras = [w for w in (label, self.think_label_end or "") if w]
+        # The frame as the scripts write it: the marker, then the role.
+        frame = re.findall(r"<\|[^|]*\|>|[^<]+", self.frame_start or "")
+        extras = [w for w in (label, self.think_label_end or "", *frame) if w]
         self._pieces = list(dict.fromkeys([*pieces, "", *extras]))
         self._ids = {w: i for i, w in enumerate(self._pieces)}
         self.eos = self._ids[""]
@@ -342,9 +344,14 @@ def test_muse_stream_routes_self_user_and_a_tool_recipient():
         " to=", "self", "<|message|>", "plan ", "first", "<|eom|>", "<|start|>",
         "assistant", "<|message|>", "Done.",
     ]  # fmt: skip
-    content, reasoning, calls, asm = run(ScriptTokenizer(MUSE, pieces), pieces)
+    tok = ScriptTokenizer(MUSE, pieces)
+    content, reasoning, calls, asm = run(
+        tok, pieces, prompt=tok.ids(["<|start|>", "assistant"])
+    )
     assert reasoning == "plan first" and content == "Done." and not calls
-    assert asm.reasoning_tokens == 5
+    # The head (`self`, `<|message|>`) and two text tokens: the opener is
+    # the frame's and counts nothing, as usage counts.
+    assert asm.reasoning_tokens == 4
 
     block = (
         '<atem:function_calls>\n<atem:invoke name="get_weather">\n'
@@ -393,6 +400,72 @@ def test_a_prompt_ending_in_an_answer_head_counts_what_the_budget_booked():
     # `<|message|>` and `Hello`; the end marker leaves the block uncounted.
     assert tracker.reasoning_tokens == 2
     assert asm.reasoning_tokens == 2
+
+
+def test_muse_limits_carry_the_frame_and_the_head():
+    """A vocabulary that merges the opener's tail into the label (Muse's):
+    the budget's opener is the token the two forms share (` to`), the
+    head runs to `<|message|>`, and every recipient the assembler routes
+    as reasoning is one - judged by its text, not by a list of forms."""
+    t = wrapper(MUSE_SPECIALS, "muse-glimmer-30b.jinja", cls=MergingHF)
+    hf = t._tokenizer
+
+    def ids(text):
+        return tuple(hf.encode(text))
+
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}]}, "m"
+    )
+    prompt = chat.build_prompt(t, req)
+    frame = ids("<|start|>assistant")
+    assert tuple(prompt[-len(frame) :]) == frame
+    limits = chat.reasoning_limits(t, prompt, 64)
+    assert limits.frame == frame and limits.at_frame and not limits.opener_counted
+    assert limits.start == ids(" to=")[:1] and limits.labels == ()
+    assert limits.label_end == tuple(t.think_label_end_tokens) == ids("<|message|>")
+    assert limits.mask_opener is False
+    assert limits.label_means_reasoning(ids("=self"))
+    assert limits.label_means_reasoning(ids("=") + ids("self"))
+    assert not limits.label_means_reasoning(ids("=user"))
+    assert not limits.label_means_reasoning(ids("=self_check"))
+    assert limits.head_may_open(ids("=")) and not limits.head_may_open(ids("the"))
+    # Harmony: a marker opener, no frame for the budget, the opener counted.
+    harmony = chat.reasoning_limits(HARMONY, [], 64)
+    assert harmony.frame == () and not harmony.at_frame and harmony.opener_counted
+    assert harmony.mask_opener and harmony.head_may_open is None
+
+
+def test_the_head_rule_holds_on_a_space_split_vocabulary():
+    """FakeHF splits at spaces: ` to=` is the empty word and `to=`, so the
+    opener the two forms share is the empty word and the rest of the
+    opener (`to=`) is read from the head - `to=self` reasons, `to=user`
+    answers, a word after the frame that is no recipient aborts."""
+    hf = MUSE._tokenizer
+
+    def ids(text):
+        return tuple(hf.encode(text))
+
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "hi"}]}, "m"
+    )
+    prompt = chat.build_prompt(MUSE, req)
+    limits = chat.reasoning_limits(MUSE, prompt, 64)
+    assert limits.start == ids(" to=")[:1] and hf.decode(limits.start) == ""
+    assert limits.at_frame and limits.frame == ids("<|start|>assistant")
+    assert limits.label_means_reasoning(ids("to=self"))
+    assert limits.label_means_reasoning(ids("to= self"))
+    assert not limits.label_means_reasoning(ids("to=user"))
+    assert limits.head_may_open(ids("to")) and not limits.head_may_open(ids("hello"))
+    # The stream: the head and the block count, the opener does not.
+    tracker = ThinkingBudget(limits)
+    for t in hf.encode(" to=self<|message|>x y<|eom|>"):
+        tracker.observe(t, None)
+    assert tracker.reasoning_tokens == 4 and not tracker.in_reasoning
+    # ` hello` at the frame: the empty word opens a head, `hello` ends it.
+    tracker = ThinkingBudget(limits)
+    for t in hf.encode(" hello"):
+        tracker.observe(t, None)
+    assert tracker.reasoning_tokens == 0 and tracker._state == "normal"
 
 
 def test_parsers_refuse_what_is_not_a_call():

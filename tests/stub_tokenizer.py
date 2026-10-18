@@ -125,3 +125,100 @@ class ChannelStubTokenizer(StubTokenizer):
 
     def rfind_think_end(self, tokens, start=None, end=None):
         return max((i for i, t in enumerate(tokens) if t == CHANNEL_CLOSE), default=-1)
+
+
+FS, ASST, MSG, EOM = 36, 37, 38, 39
+TO, SELF, EQ, SP, SELF2, SELFSP, S, ELF, USER, CHECK = (
+    40,
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+)
+# The close the family was trained to write: end marker, frame, message.
+MUSE_CLOSE = [EOM, FS, ASST, MSG]
+
+
+class MuseStubTokenizer(StubTokenizer):
+    """Muse's family: the recipient ` to=` right after the frame
+    `<|start|>assistant` says what follows - `self` the reasoning, `user`
+    the answer, any other name a tool. The vocabulary merges `=self` into
+    one token and also writes it as `=` and `self`, with or without a
+    space, or as `=`, `s`, `elf`."""
+
+    think_family = "muse"
+    think_start = " to="
+    think_end = "<|eom|>"
+    think_label_end = "<|message|>"
+    think_start_tokens = (TO, SELF)
+    think_end_tokens = (EOM,)
+    think_label_end_tokens = (MSG,)
+    reasoning_label_tokens = ()
+    think_close_tokens = tuple(MUSE_CLOSE)
+    think_openers = (" to=",)
+    frame_start = "<|start|>assistant"
+    structural_markers = ("<|start|>assistant", "<|message|>", "<|eom|>")
+    answer_opener_tokens = None
+    tool_call_via_label = True
+    tool_call_start = "<atem:function_calls>"
+    tool_call_end = "</atem:function_calls>"
+    tool_parser_type = "atem"
+
+    _TEXTS = {
+        " to=": [TO, EQ],
+        " to=self": [TO, SELF],
+        "<|start|>assistant": [FS, ASST],
+        "<|message|>": [MSG],
+        "<|eom|>": [EOM],
+        "\n": [],
+        "\n\n": [],
+    }
+    _WORDS = {
+        FS: "<|start|>",
+        ASST: "assistant",
+        MSG: "<|message|>",
+        EOM: "<|eom|>",
+        TO: " to",
+        SELF: "=self",
+        EQ: "=",
+        SP: " ",
+        SELF2: "self",
+        SELFSP: " self",
+        S: "s",
+        ELF: "elf",
+        USER: "=user",
+        CHECK: "_check",
+    }
+
+    def __init__(self):
+        super().__init__()
+        for t, w in self._WORDS.items():
+            self._words[t] = w
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        if text in self._TEXTS:
+            return list(self._TEXTS[text])
+        return super().encode(text, add_special_tokens)
+
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tokenize=True, tools=None, **kw
+    ):
+        ids = super().apply_chat_template(
+            messages, add_generation_prompt=False, tokenize=True, tools=tools, **kw
+        )
+        if add_generation_prompt:
+            # The generation prompt ends with the frame, as the template's does.
+            ids += [FS, ASST]
+        return ids if tokenize else self.decode(ids)
+
+    def rfind_think_start(self, tokens, start=None, end=None):
+        pairs = (i for i in range(len(tokens) - 1) if tokens[i : i + 2] == [TO, SELF])
+        return max(pairs, default=-1)
+
+    def rfind_think_end(self, tokens, start=None, end=None):
+        return max((i for i, t in enumerate(tokens) if t == EOM), default=-1)

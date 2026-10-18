@@ -5,17 +5,35 @@ from dataclasses import replace
 import mlx.core as mx
 import pytest
 
+from mlx_beam.api.text import TextAssembler, route_label
 from mlx_beam.engine import ContextTooLong, Engine, GenerationRequest, ReasoningLimits
 from mlx_beam.engine.thinking import ThinkingBudget, budget
 from tests.stub_tokenizer import (
+    ASST,
     CHANNEL_CLOSE,
     CHANNEL_OPEN,
+    CHECK,
+    ELF,
+    EOM,
+    EOS,
+    EQ,
+    FS,
     LABEL,
+    MSG,
+    MUSE_CLOSE,
     NEWLINE,
+    SELF,
+    SELF2,
+    SELFSP,
+    SP,
+    TO,
+    USER,
     ChannelStubTokenizer,
+    MuseStubTokenizer,
+    S,
 )
 from tests.test_engine import collect, tiny_hybrid
-from tests.tracked import tracked_events
+from tests.tracked import limits_for, tracked_events
 
 START, END, NL, NL2 = 50, 51, 52, 53
 LIMITS = ReasoningLimits(start=(START,), end=(END,), close=(NL, END, NL2))
@@ -31,6 +49,40 @@ CHANNEL = ReasoningLimits(
 # A channel the budget closed at once, as the stream carries it: opener,
 # the free token (the label), the forced close.
 GHOST = [CHANNEL_OPEN, LABEL, NEWLINE, CHANNEL_CLOSE, NEWLINE, NEWLINE]
+# Muse's recipient: a textual opener read at the message's frame only, its
+# head judged at `<|message|>` as the assembler judges it, counted as usage
+# counts it (the opener ` to` not). The verdicts read the stub's words.
+MUSE_TOK = MuseStubTokenizer()
+FRAME = (FS, ASST)
+MUSE_PROMPT = [6, 1, 7, FS, ASST]
+
+
+def _head_text(ids):
+    return MUSE_TOK.decode(ids).lstrip()
+
+
+def muse_verdict(ids):
+    text = _head_text(ids)
+    return text.startswith("=") and route_label(MUSE_TOK, text[1:]) == "reasoning"
+
+
+def muse_head_may_open(ids):
+    text = _head_text(ids)
+    return text.startswith("=") or "=".startswith(text)
+
+
+MUSE = ReasoningLimits(
+    start=(TO,),
+    end=(EOM,),
+    close=tuple(MUSE_CLOSE),
+    label_end=(MSG,),
+    label_means_reasoning=muse_verdict,
+    mask_opener=False,
+    frame=FRAME,
+    at_frame=True,
+    opener_counted=False,
+    head_may_open=muse_head_may_open,
+)
 
 
 def test_budget_serves_small_limits_and_refuses_a_reserve_that_cannot_fit():
@@ -54,17 +106,20 @@ class Steps:
     """Drives a ThinkingBudget the way the generator does: the processor runs
     one token ahead of what observe() has seen."""
 
-    def __init__(self, tracker, model_tokens, vocab=64):
+    def __init__(self, tracker, model_tokens, vocab=64, prompt=(0,)):
         self.tracker = tracker
         self.model = list(model_tokens)
         self.vocab = vocab
+        # The context the processor reads: the prompt's end, as the
+        # generator carries it, then every token sampled.
+        self.prompt = list(prompt)
         self.out = []
         # What the tracker said about each token after observing it.
         self.forced = []
         self.suppressed = []
 
     def run(self, n):
-        context = [0]
+        context = list(self.prompt)
         for _ in range(n):
             # What the model would say next, as logits with one clear winner.
             wanted = self.model[len(self.out)] if len(self.out) < len(self.model) else 1
@@ -863,3 +918,377 @@ def test_a_suppressed_channel_stays_visible_without_routing():
     )
     msg = out["choices"][0]["message"]
     assert msg["content"] == "w10 " and "reasoning" not in msg
+
+
+def muse_steps(limits, wishes, n=None):
+    """Steps at the frame: the prompt ends with `<|start|>assistant`."""
+    tracker = ThinkingBudget(limits)
+    steps = Steps(tracker, wishes, prompt=FRAME)
+    steps.run(len(wishes) if n is None else n)
+    return tracker, steps
+
+
+def muse_assembled(limits, ids, **kw):
+    """(tracker, assembler, deltas) for `ids` through a fresh tracker."""
+    tracker = ThinkingBudget(limits)
+    asm = TextAssembler(MuseStubTokenizer(), prompt_tokens=MUSE_PROMPT, **kw)
+    evs = tracked_events(limits, ids, tracker=tracker)
+    return tracker, asm, [asm.feed(e) for e in evs]
+
+
+def test_the_muse_stub_derives_the_frame_limits():
+    tok = MuseStubTokenizer()
+    limits = limits_for(tok, MUSE_PROMPT, 0)
+    # The opener is the token before the head, the head runs to the
+    # message marker, every recipient form is judged by its text.
+    assert limits.start == (TO,) and limits.label_end == (MSG,)
+    assert limits.labels == () and not limits.opener_counted
+    assert limits.frame == FRAME and limits.at_frame
+    assert limits.mask_opener is False
+    assert limits.label_means_reasoning((SELF,))
+    assert limits.label_means_reasoning((EQ, SP, SELF2))
+    assert not limits.label_means_reasoning((USER,))
+    assert not limits.label_means_reasoning((SELF, CHECK))
+    assert limits.head_may_open((EQ,)) and not limits.head_may_open((20,))
+    # A prompt that does not end with the frame: the window is shut.
+    assert not limits_for(tok, MUSE_PROMPT + [MSG, 10], 0).at_frame
+    # The channel keeps its one-token opener and no frame.
+    channel = limits_for(ChannelStubTokenizer(), [6, 1, 7], 0)
+    assert channel.frame == () and channel.opener_counted
+    assert channel.head_may_open is None
+
+
+def test_the_window_shuts_at_the_first_token_that_is_no_opener():
+    limits = replace(MUSE, max_tokens=4)
+    # The answer, after `<|message|>` or from its first word, writes
+    # ` to=self` in its text: no head, no block, no forced close.
+    for wishes in ([MSG, 20, 21, TO, SELF, MSG, 22, 23], [20, TO, SELF, MSG, 21, 22]):
+        tracker, steps = muse_steps(limits, wishes)
+        assert steps.out == wishes, wishes
+        assert tracker.reasoning_tokens == 0 and not tracker.thinking_truncated
+        assert tracker._state == "normal" and not any(steps.suppressed)
+
+
+def test_a_frame_the_model_writes_reopens_the_window():
+    limits = replace(MUSE, max_tokens=8)
+    wishes = [TO, SELF, MSG, 20, EOM, FS, ASST, TO, SELF, MSG, 30, 31, 32]
+    wishes += MUSE_CLOSE + [40]
+    tracker, steps = muse_steps(limits, wishes)
+    # Head (2) and one token, closed by the model; the model's own frame
+    # opens the window again: head (2) and three tokens, closed by force.
+    assert steps.out == wishes
+    assert tracker.reasoning_tokens == 8 and tracker.thinking_truncated
+    assert steps.out.count(EOM) == 2
+
+
+def test_a_forced_close_leaves_the_window_shut():
+    limits = replace(MUSE, max_tokens=3)
+    wishes = [TO, SELF, MSG, 10] + MUSE_CLOSE + [TO, SELF, MSG, 30]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes
+    # The recipient right after the forced close is the answer's text.
+    assert tracker.reasoning_tokens == 3 and steps.out.count(EOM) == 1
+    assert not any(steps.suppressed)
+
+
+def test_families_without_a_frame_keep_the_matcher():
+    # Harmony: two natural blocks, both counted (header 3 and one token each).
+    A, HMSG = 40, 42
+    harmony = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, 41, HMSG),
+        labels=((A,),),
+        label_end=(HMSG,),
+    )
+    tracker = ThinkingBudget(harmony)
+    for t in (START, A, HMSG, 10, END, 11, START, A, HMSG, 12, END):
+        tracker.observe(t, None)
+    assert tracker.reasoning_tokens == 8 and not tracker.in_reasoning
+    # The channel: two blocks, opener and one token each.
+    tracker = ThinkingBudget(CHANNEL)
+    for t in (CHANNEL_OPEN, 10, CHANNEL_CLOSE, 11, CHANNEL_OPEN, 12, CHANNEL_CLOSE):
+        tracker.observe(t, None)
+    assert tracker.reasoning_tokens == 4 and not tracker.in_reasoning
+
+
+def test_every_recipient_form_the_automaton_routes_opens_a_block():
+    limits = replace(MUSE, max_tokens=4)
+    for head in ([SELF], [EQ, SELF2], [EQ, SELFSP], [EQ, SP, SELF2], [EQ, S, ELF]):
+        wishes = [TO, *head, MSG, 10, 11, 12, 13, 14, 15, 16, 17]
+        tracker, steps = muse_steps(limits, wishes, 12)
+        assert tracker.reasoning_tokens == 4 and tracker.thinking_truncated, head
+        assert steps.out[: len(head) + 2] == [TO, *head, MSG], head
+        # The head costs its tokens and the marker; a free token follows
+        # only while the budget holds one.
+        free = 4 - (len(head) + 1)
+        assert steps.out.index(EOM) == len(head) + 2 + free, head
+        assert not any(steps.suppressed), head
+
+
+def test_a_recipient_that_is_no_reasoning_opens_no_block():
+    limits = replace(MUSE, max_tokens=4)
+    # The answer's recipient, and a tool whose name begins like `self`;
+    # after the head the window is shut, a later ` to=self` is text.
+    for wishes in (
+        [TO, USER, MSG, 10, TO, SELF, MSG, 11],
+        [TO, SELF, CHECK, MSG, 10, TO, SELF, MSG, 11],
+    ):
+        tracker, steps = muse_steps(limits, wishes)
+        assert steps.out == wishes and tracker.reasoning_tokens == 0, wishes
+        assert tracker._state == "normal" and not tracker.thinking_truncated
+        assert not any(steps.forced) and not any(steps.suppressed)
+
+
+def test_a_head_that_is_no_opener_aborts():
+    limits = replace(MUSE, max_tokens=0)
+    # ` to` followed by text, not by `=`: the head is given up at once,
+    # and the `<|message|>` later on ends no head.
+    wishes = [TO, 20, 21, MSG, 22, 23]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes and tracker.reasoning_tokens == 0
+    assert tracker._state == "normal" and not any(steps.forced)
+    assert not any(steps.suppressed)
+
+
+def test_no_token_of_the_frame_family_is_masked():
+    tok = MuseStubTokenizer()
+    logits = mx.zeros((64,))
+    tracker = ThinkingBudget(limits_for(tok, MUSE_PROMPT, 0))
+    out = tracker(mx.array([FS, ASST, TO]), logits)
+    assert all(float(out[t]) == 0.0 for t in (SELF, EQ, USER)) and not tracker._block
+    # After a forced close just the same.
+    tracker = ThinkingBudget(limits_for(tok, MUSE_PROMPT, 3))
+    steps = Steps(tracker, [TO, SELF, MSG, 10] + MUSE_CLOSE + [TO], prompt=FRAME)
+    steps.run(9)
+    assert steps.out[-1] == TO and tracker.reasoning_tokens == 3
+    out = tracker(mx.array([*FRAME, *steps.out]), logits)
+    assert all(float(out[t]) == 0.0 for t in (SELF, EQ, USER)) and not tracker._block
+
+
+def test_a_reasoning_head_at_budget_zero_is_closed_at_once_and_counts_nothing():
+    limits = replace(MUSE, max_tokens=0)
+    for head in ([SELF], [EQ, SELF2], [EQ, SP, SELF2]):
+        wishes = [TO, *head, MSG] + MUSE_CLOSE + [10, 11]
+        tracker, steps = muse_steps(limits, wishes)
+        cost = len(head) + 1  # the head and its end marker
+        assert steps.out == wishes, head
+        assert tracker.reasoning_tokens == 0 and tracker._seen == cost, head
+        assert not tracker.thinking_truncated
+        # Suppressed from the head's end to the close's last token; forced
+        # on the four tokens of the close.
+        assert steps.suppressed == [False] * cost + [True] * 5 + [False] * 2, head
+        assert steps.forced == [False] * (cost + 1) + [True] * 4 + [False] * 2, head
+        # The assembler over the sequence as it was emitted: the head's
+        # tokens without a flag, every count 0, nothing shown.
+        tracker, asm, deltas = muse_assembled(limits, steps.out)
+        assert tracker.reasoning_tokens == 0 == asm.reasoning_tokens, head
+        assert "".join(d.content for d in deltas) == "w10 w11 ", head
+        assert not any(d.reasoning for d in deltas) and not asm.thinking_truncated
+
+
+def test_a_tool_head_at_budget_zero_is_untouched():
+    limits = replace(MUSE, max_tokens=0)
+    wishes = [TO, SELF, CHECK, MSG, 20, 21, EOM]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes and tracker.reasoning_tokens == 0
+    assert not any(steps.forced) and not any(steps.suppressed)
+    # The call reaches the parser as written: head, marker, arguments.
+    tok = MuseStubTokenizer()
+    seen = []
+    tok.tool_parser = lambda text, tools: seen.append(text) or {
+        "name": "self_check",
+        "arguments": {},
+    }
+    asm = TextAssembler(tok, prompt_tokens=MUSE_PROMPT, tools=[{"type": "function"}])
+    evs = tracked_events(limits, steps.out)
+    assert not any(e.suppressed or e.forced or e.reasoning_counted for e in evs)
+    deltas = [asm.feed(e) for e in evs]
+    assert len(seen) == 1 and seen[0].startswith("self_check<|message|>w20 w21 ")
+    calls = [c["function"]["name"] for d in deltas for c in d.tool_calls]
+    assert calls == ["self_check"] and asm.reasoning_tokens == 0
+    assert not any(d.content or d.reasoning for d in deltas)
+
+
+def test_an_answer_head_at_budget_zero_is_shown():
+    limits = replace(MUSE, max_tokens=0)
+    wishes = [TO, USER, MSG, 10, 11]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes and tracker.reasoning_tokens == 0
+    assert not any(steps.forced) and not any(steps.suppressed)
+    tracker, asm, deltas = muse_assembled(limits, steps.out)
+    assert "".join(d.content for d in deltas) == "w10 w11 "
+    assert asm.reasoning_tokens == 0 and not any(d.reasoning for d in deltas)
+
+
+def test_a_reasoning_head_after_an_exhausted_budget_is_closed_at_once():
+    limits = replace(MUSE, max_tokens=3)
+    wishes = [TO, SELF, MSG, 10] + MUSE_CLOSE + [FS, ASST, TO, SELF, MSG]
+    wishes += MUSE_CLOSE + [30]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes
+    # The first block spent the budget; the second head is let through,
+    # closed at once and counts nothing. The flag of the first stays.
+    assert tracker.reasoning_tokens == 3 and tracker.thinking_truncated
+    assert steps.suppressed == [False] * 12 + [True] * 5 + [False]
+    assert steps.forced == [False] * 4 + [True] * 4 + [False] * 5 + [True] * 4 + [False]
+
+
+def test_a_head_that_does_not_fit_is_suppressed_whatever_its_length():
+    cases = [
+        # limit, head, counted, suppressed, free tokens before the close
+        (3, [EQ, SP, SELF2], 0, True, 0),
+        (3, [EQ, SP, S, ELF], 0, True, 0),
+        (3, [EQ, SELF2], 3, False, 0),
+        (3, [SELF], 3, False, 1),
+        (4, [EQ, SP, SELF2], 4, False, 0),
+        (5, [EQ, SP, SELF2], 5, False, 1),
+    ]
+    for limit, head, counted, suppressed, free in cases:
+        limits = replace(MUSE, max_tokens=limit)
+        wishes = [TO, *head, MSG] + [10] * free + MUSE_CLOSE + [11, 12]
+        tracker, steps = muse_steps(limits, wishes)
+        assert steps.out == wishes, (limit, head)
+        assert tracker.reasoning_tokens == counted <= limit, (limit, head)
+        assert any(steps.suppressed) is suppressed, (limit, head)
+        assert tracker.thinking_truncated is (not suppressed), (limit, head)
+        tracker, asm, _ = muse_assembled(limits, steps.out)
+        assert asm.reasoning_tokens == tracker.reasoning_tokens == counted
+
+
+def test_a_head_cut_before_its_end_counts_nothing():
+    for limit in (0, 3):
+        limits = replace(MUSE, max_tokens=limit)
+        for ids, finish, eos, stop in (
+            ([TO, SELF], "length", EOS, None),
+            ([TO, EQ], "length", EOS, None),
+            ([TO, SELF, EOM], "stop", EOS, None),
+            ([TO, SELF, 10], "stop", None, ["w10"]),
+        ):
+            tracker = ThinkingBudget(limits)
+            evs = tracked_events(limits, ids, finish=finish, eos=eos, tracker=tracker)
+            asm = TextAssembler(
+                MuseStubTokenizer(), prompt_tokens=MUSE_PROMPT, stop_words=stop
+            )
+            for e in evs:
+                asm.feed(e)
+            assert tracker.reasoning_tokens == 0 == asm.reasoning_tokens, (limit, ids)
+            assert not tracker.thinking_truncated and not asm.thinking_truncated
+            assert asm.response_truncated is (finish == "length"), (limit, ids)
+            assert not any(e.suppressed for e in evs), (limit, ids)
+    # After a real first block the count and its flag stay.
+    limits = replace(MUSE, max_tokens=3)
+    ids = [TO, SELF, MSG, 10] + MUSE_CLOSE + [FS, ASST, TO, SELF]
+    tracker = ThinkingBudget(limits)
+    evs = tracked_events(limits, ids, finish="length", tracker=tracker)
+    asm = TextAssembler(MuseStubTokenizer(), prompt_tokens=MUSE_PROMPT)
+    for e in evs:
+        asm.feed(e)
+    assert tracker.reasoning_tokens == 3 == asm.reasoning_tokens
+    assert tracker.thinking_truncated and asm.thinking_truncated
+    assert asm.response_truncated
+
+
+def test_a_suppressed_head_stays_visible_without_routing():
+    from mlx_beam.api import chat
+
+    tok = MuseStubTokenizer()
+    limits = limits_for(tok, MUSE_PROMPT, 0)
+    req = chat.parse_chat_request(
+        {"messages": [{"role": "user", "content": "w1"}]}, "m"
+    )
+    gen = chat.to_generation_request(tok, req)
+    assert gen.tokens[-2:] == [FS, ASST]
+    ids = [TO, SELF, MSG] + MUSE_CLOSE + [10]
+    out = chat.ChatResponder(tok, req, gen.tokens, reasoning_field="none").complete(
+        tracked_events(limits, ids), cached=0
+    )
+    # Counted 0 in every mode; with routing off the head, its marker and
+    # the end marker stay, the frame of the close is structural and cut.
+    assert out["usage"]["completion_tokens_details"]["reasoning_tokens"] == 0
+    content = out["choices"][0]["message"]["content"]
+    assert content == " to=self<|message|><|eom|>w10 "
+    out = chat.ChatResponder(tok, req, gen.tokens).complete(
+        tracked_events(limits, ids), cached=0
+    )
+    msg = out["choices"][0]["message"]
+    assert msg["content"] == "w10 " and "reasoning" not in msg
+
+
+@pytest.mark.parametrize(
+    "head, limit, counted, free",
+    [
+        ([SELF], 0, 0, 0),
+        ([SELF], 1, 0, 0),
+        ([SELF], 2, 2, 0),
+        ([SELF], 3, 3, 1),
+        ([SELF], 4, 4, 2),
+        ([EQ, SELF2], 3, 3, 0),
+        ([EQ, SELF2], 4, 4, 1),
+    ],
+)
+def test_small_budgets_at_the_frame(head, limit, counted, free):
+    """Budgets 0 and 1 cannot hold the canonical head: suppressed, 0.
+    Budget 2 holds the head and no free token: counted, closed at once.
+    From 3 on the free tokens follow. The split head costs one more."""
+    limits = replace(MUSE, max_tokens=limit)
+    wishes = [TO, *head, MSG] + [10, 11][:free] + MUSE_CLOSE + [20]
+    tracker, steps = muse_steps(limits, wishes)
+    assert steps.out == wishes
+    assert tracker.reasoning_tokens == counted
+    assert any(steps.suppressed) is (counted == 0)
+    assert tracker.thinking_truncated is (counted > 0)
+
+
+def test_entry_per_family():
+    """What a block costs before its first free token: the opener alone
+    for <think>, XTML and the channel; opener, label and label end for
+    Harmony; the shortest head and its end for Muse, the opener not."""
+    think = ReasoningLimits(start=(START,), end=(END,), close=(NL, END, NL2))
+    xtml = ReasoningLimits(start=(44, 45, 46), end=(END,), close=(NL, END, NL2))
+    harmony = ReasoningLimits(
+        start=(START,),
+        end=(END,),
+        close=(END, START, 41, 42),
+        labels=((40,),),
+        label_end=(42,),
+    )
+    assert ThinkingBudget(think)._entry == 1
+    assert ThinkingBudget(xtml)._entry == 1
+    assert ThinkingBudget(CHANNEL)._entry == 1
+    assert ThinkingBudget(harmony)._entry == 3
+    assert ThinkingBudget(MUSE)._entry == 2
+
+
+def test_the_head_counts_like_the_assembler():
+    tok = MuseStubTokenizer()
+    limits = limits_for(tok, MUSE_PROMPT)
+    cases = [
+        ([TO, SELF, MSG, 10, 11, EOM, FS, ASST, MSG, 12], 4, "w10 w11 ", "w12 "),
+        ([TO, EQ, SELF2, MSG, 10, EOM, FS, ASST, MSG, 12], 4, "w10 ", "w12 "),
+        ([TO, EQ, SP, SELF2, MSG, 10, EOM, FS, ASST, MSG, 12], 5, "w10 ", "w12 "),
+        ([TO, USER, MSG, 10], 0, "", "w10 "),
+    ]
+    for ids, counted, reasoning, content in cases:
+        tracker, asm, deltas = muse_assembled(limits, ids)
+        # The head after ` to` with its marker, the block, not the opener.
+        assert tracker.reasoning_tokens == counted, ids
+        assert asm.reasoning_tokens == tracker.reasoning_tokens, ids
+        assert "".join(d.reasoning for d in deltas) == reasoning, ids
+        assert "".join(d.content for d in deltas) == content, ids
+    # At the bounds the processor shapes the stream: the emitted sequence
+    # goes through a fresh tracker, the assembler's sum is its count.
+    for limit in (2, 3, 4):
+        bounded = replace(limits, max_tokens=limit)
+        wishes = [TO, SELF, MSG] + list(range(10, 18))
+        tracker, steps = muse_steps(bounded, wishes, 11)
+        again, asm, deltas = muse_assembled(bounded, steps.out)
+        assert tracker.reasoning_tokens == again.reasoning_tokens == limit
+        assert asm.reasoning_tokens == limit
+        free = limit - 2
+        assert "".join(d.reasoning for d in deltas) == "".join(
+            f"w{t} " for t in range(10, 10 + free)
+        )
+        assert "".join(d.content for d in deltas) == "".join(
+            f"w{t} " for t in range(14 + free, 18)
+        )
