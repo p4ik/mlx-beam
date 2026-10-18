@@ -191,6 +191,22 @@ def test_tower_encodes_per_image_with_deepstack():
     assert d["family"] == "qwen3_vl" and d["deepstack_layers"] == 1
 
 
+def test_the_tower_takes_the_moe_type_of_its_family():
+    """A Qwen3-VL-MoE checkpoint names its vision config by the family
+    (`qwen3_vl_moe`) or by transformers' class (`qwen3_vl_moe_vision`);
+    the tower is the dense one and builds for both."""
+    for model_type in ("qwen3_vl_moe", "qwen3_vl_moe_vision"):
+        config = {
+            "model_type": "qwen3_vl_moe",
+            "vision_config": {
+                **TOWER_CONFIG["vision_config"],
+                "model_type": model_type,
+            },
+        }
+        t = qwen3_vl.Tower(config, None, dtype=mx.float32)
+        assert t.model.model_type == model_type
+
+
 def test_frontend_builds_the_mrope_positions_and_the_decode_delta():
     """Text before an image at one running position; the image's tokens at
     the block's start plus (frame, row, column) of the merged grid; the
@@ -870,6 +886,57 @@ def test_classes_for_resolves_the_installed_mappings():
         assert classes[2].__name__ == name
     for model_type in ("mistral3", "granite4_vision"):
         assert frontend.classes_for(model_type)[2] is None
+
+
+def test_classes_for_takes_the_dense_sibling_s_image_processor_for_the_moe():
+    """transformers maps the MoE type to the dense family's processor and
+    video processor but to no image processor of its own; the dense
+    sibling's is the one that processor is built with."""
+    moe = frontend.classes_for("qwen3_vl_moe")
+    dense = frontend.classes_for("qwen3_vl")
+    assert moe[0] is dense[0] and moe[1] is dense[1]
+    assert moe[2].__name__ == "Qwen3VLVideoProcessor"
+
+
+def test_a_sibling_with_another_processor_is_not_taken(monkeypatch):
+    """The sibling's image processor belongs to the processor, not to the
+    type: a type that names another processor keeps its refusal, and the
+    refusal names the missing part."""
+    from transformers.models.auto import processing_auto
+
+    monkeypatch.setattr(
+        frontend, "IMAGE_SIBLINGS", {"beam_test_vl": "qwen3_vl"}, raising=False
+    )
+    monkeypatch.setitem(
+        processing_auto.PROCESSOR_MAPPING_NAMES, "beam_test_vl", "SomeOtherProcessor"
+    )
+    with pytest.raises(ValueError, match="image processor"):
+        frontend.classes_for("beam_test_vl")
+
+
+def test_the_refusal_names_the_missing_part(monkeypatch):
+    """A type with an image processor but no processor (resnet) is refused
+    for the processor alone; the MoE type without its sibling for the
+    image processor."""
+    with pytest.raises(ValueError, match="maps no processor for model type") as exc:
+        frontend.classes_for("resnet")
+    assert "image processor" not in str(exc.value)
+    monkeypatch.setattr(frontend, "IMAGE_SIBLINGS", {}, raising=False)
+    with pytest.raises(ValueError, match="maps no image processor for model type"):
+        frontend.classes_for("qwen3_vl_moe")
+
+
+def test_every_family_type_resolves():
+    """Every model type the package serves has a processor and an image
+    processor class in the installed transformers, through its sibling
+    where it has one; the sibling table names served types only."""
+    from mlx_beam_vision.families import FAMILIES
+
+    for model_type in FAMILIES:
+        classes = frontend.classes_for(model_type)
+        assert isinstance(classes[0], type) and isinstance(classes[1], type), model_type
+    for moe, dense in frontend.IMAGE_SIBLINGS.items():
+        assert moe in FAMILIES and dense in FAMILIES
 
 
 def test_a_mapping_value_becomes_one_class_name():
