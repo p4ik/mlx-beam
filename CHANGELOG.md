@@ -12,6 +12,14 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   instead of assuming token 0, and counts acceptances from after the
   warm-up.
 
+### Fixed
+- Messages: a user message with a text, image or thinking block before a
+  `tool_result` block was accepted and passed to the renderer as user then
+  tool, which mistral-common and the Devstral template refuse and a Gemma
+  4 template drops silently; it is now a 400 that names the block, as
+  Anthropic answers it - tool results come first, text and images after
+  them.
+
 ## [0.1.0a11] - 2026-10-11
 
 ### Fixed
