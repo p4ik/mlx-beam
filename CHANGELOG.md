@@ -24,7 +24,9 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   processor to the type, and the vision tower refused the type before the
   processor was built. The loader now takes the dense sibling's image
   processor, which that processor is built with, the tower accepts the
-  type, and a refusal names the part that is missing.
+  type, and a refusal names the part that is missing. A dense Qwen3-VL
+  checkpoint whose vision config carries transformers' type name
+  `qwen3_vl_vision` was refused the same way and is accepted now.
 
 ## [0.1.0a11] - 2026-10-11
 

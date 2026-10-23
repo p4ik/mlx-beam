@@ -27,8 +27,9 @@ the wheel (`tools/vendor.toml`, part `mlx-vlm-vision`).
 
 `moe type` - `qwen3_vl/vision.py`: the tower's type check takes
 `qwen3_vl_moe` and `qwen3_vl_moe_vision` (Qwen3-VL-MoE's family name and
-transformers' name for its vision config) beside the dense and Qwen3.5
-names. `families.FAMILIES` routes the type to this tower; without the
-entry a checkpoint whose vision_config names its type was refused before
-its processor was built. Tests: `tests/test_qwen3_vl.py`
+transformers' name for its vision config) and `qwen3_vl_vision`
+(transformers' name for the dense vision config) beside the dense and
+Qwen3.5 names. `families.FAMILIES` routes the types to this tower; without
+the entry a checkpoint whose vision_config names its type was refused
+before its processor was built. Tests: `tests/test_qwen3_vl.py`
 (`test_the_tower_takes_the_moe_type_of_its_family`).

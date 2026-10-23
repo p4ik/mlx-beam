@@ -193,11 +193,16 @@ def test_tower_encodes_per_image_with_deepstack():
 
 def test_the_tower_takes_the_moe_type_of_its_family():
     """A Qwen3-VL-MoE checkpoint names its vision config by the family
-    (`qwen3_vl_moe`) or by transformers' class (`qwen3_vl_moe_vision`);
-    the tower is the dense one and builds for both."""
-    for model_type in ("qwen3_vl_moe", "qwen3_vl_moe_vision"):
+    (`qwen3_vl_moe`) or by transformers' class (`qwen3_vl_moe_vision`), a
+    dense one by transformers' class too (`qwen3_vl_vision`); the tower is
+    the dense one and builds for all three."""
+    for family, model_type in (
+        ("qwen3_vl_moe", "qwen3_vl_moe"),
+        ("qwen3_vl_moe", "qwen3_vl_moe_vision"),
+        ("qwen3_vl", "qwen3_vl_vision"),
+    ):
         config = {
-            "model_type": "qwen3_vl_moe",
+            "model_type": family,
             "vision_config": {
                 **TOWER_CONFIG["vision_config"],
                 "model_type": model_type,
