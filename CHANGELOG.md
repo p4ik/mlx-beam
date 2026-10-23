@@ -6,6 +6,12 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Changed
+- The adversarial-draft test derives its draft token from the model (a
+  token outside the target's top-k at every position the verify compares)
+  instead of assuming token 0, and counts acceptances from after the
+  warm-up.
+
 ## [0.1.0a11] - 2026-10-11
 
 ### Fixed

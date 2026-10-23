@@ -386,6 +386,34 @@ def chi_square(counts, expected):
     return sum((c - e) ** 2 / e for c, e in zip(counts, expected, strict=True))
 
 
+def top_k(model, tokens, k):
+    """The target's top-k after `tokens`, from a full forward: token to its
+    probability renormalised over the k (what a top-k draw sees)."""
+    logits = model(mx.array([tokens]))[0, -1]
+    logprobs = logits - mx.logsumexp(logits)
+    top = mx.argsort(-logprobs)[:k].tolist()
+    return dict(zip(top, mx.softmax(logprobs[mx.array(top)]).tolist(), strict=True))
+
+
+def adversarial_draft(model, prompt, k, depth, vocab):
+    """The smallest token outside the target's top-k at every context the
+    verify compares a first draft against in a top-k request of `depth`
+    tokens from `prompt`: the prompt extended by one to `depth` top-k
+    tokens. Fails when every token is in one of those top-k."""
+    taken = set()
+    level = {tuple(prompt): top_k(model, prompt, k)}
+    for _ in range(depth):
+        level = {
+            (*c, a): top_k(model, [*c, a], k) for c, top in level.items() for a in top
+        }
+        for top in level.values():
+            taken.update(top)
+    free = sorted(set(range(vocab)) - taken)
+    if not free:
+        pytest.fail(f"every token is in a top-{k} the verify compares against")
+    return free[0]
+
+
 # Chi-square critical values at p = 0.001 by degrees of freedom.
 CRITICAL_001 = {
     1: 10.83, 2: 13.82, 3: 16.27, 4: 18.47, 5: 20.52, 6: 22.46, 7: 24.32,
@@ -396,38 +424,41 @@ CRITICAL_001 = {
 
 def test_committed_draws_follow_the_target_under_an_adversarial_draft():
     """Chi-square over the first two tokens of 2048 seeds, drafted wrong on
-    purpose (always token 0, never in the top): the first token is a plain
-    step's draw, the second the verify's; their joint distribution is the
-    target's own, top-k-filtered at each position. Every pair falls in a
-    bucket, buckets with an expected count under 5 are pooled."""
+    purpose: a token outside the target's top-k at every position the
+    verify compares in these requests, derived from the model because its
+    random weights may change with the MLX version. The first token is a
+    plain step's draw, the second the verify's; their joint distribution is
+    the target's own, top-k-filtered at each position. Every pair falls in
+    a bucket, buckets with an expected count under 5 are pooled. The
+    counters are read after the warm-up, which compares at contexts of its
+    own."""
     model = tiny_qwen35()
     prompt = [3, 7, 11, 13]
-    proposer = FixedDraftProposer([0, 0, 0])
+    k, depth = 4, 2
+    vocab = TINY_QWEN35_WRAPPED["text_config"]["vocab_size"]
+    wrong = adversarial_draft(model, prompt, k, depth, vocab)
+    proposer = FixedDraftProposer([wrong] * 3)
     engine = Engine(model, proposer=proposer, max_draft_tokens=3)
     engine.warmup_tokens = [1]
     n = 2048
     pairs = []
     with engine:
         engine.speculator.regulator.fixed = 3  # never parks on the losses
+        cycles, accepted = engine.speculator.cycles, engine.speculator.accepted
         for seed in range(n):
-            p = SamplingParams(temperature=1.0, top_k=4, seed=seed)
+            p = SamplingParams(temperature=1.0, top_k=k, seed=seed)
             out = collect(
-                engine.submit(GenerationRequest(prompt, max_tokens=2, sampling=p))
+                engine.submit(GenerationRequest(prompt, max_tokens=depth, sampling=p))
             )
             pairs.append(tuple(out))
-        assert engine.speculator.cycles >= n and engine.speculator.accepted == 0
+        assert engine.speculator.cycles - cycles >= n
+        assert engine.speculator.accepted - accepted == 0
 
-    def top4(tokens):
-        logits = model(mx.array([tokens]))[0, -1]
-        logprobs = logits - mx.logsumexp(logits)
-        top = mx.argsort(-logprobs)[:4].tolist()
-        return dict(zip(top, mx.softmax(logprobs[mx.array(top)]).tolist(), strict=True))
-
-    firsts = top4(prompt)
+    firsts = top_k(model, prompt, k)
     expected = {
         (a, b): n * pa * pb
         for a, pa in firsts.items()
-        for b, pb in top4([*prompt, a]).items()
+        for b, pb in top_k(model, [*prompt, a], k).items()
     }
     assert set(pairs) <= set(expected)
     counts = {key: pairs.count(key) for key in expected}
