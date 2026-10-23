@@ -72,3 +72,4 @@ only-include = ["mlx_beam_vision", "tests", "README.md", "LICENSE", "NOTICE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["exactness: bit-exact comparisons on tiny models (Apple silicon only)"]
