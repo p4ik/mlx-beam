@@ -32,4 +32,4 @@ transformers' name for its vision config) and `qwen3_vl_vision`
 Qwen3.5 names. `families.FAMILIES` routes the types to this tower; without
 the entry a checkpoint whose vision_config names its type was refused
 before its processor was built. Tests: `tests/test_qwen3_vl.py`
-(`test_the_tower_takes_the_moe_type_of_its_family`).
+(`test_the_tower_takes_every_vision_type_name_of_its_family`).

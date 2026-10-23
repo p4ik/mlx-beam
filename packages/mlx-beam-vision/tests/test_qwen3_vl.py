@@ -191,7 +191,7 @@ def test_tower_encodes_per_image_with_deepstack():
     assert d["family"] == "qwen3_vl" and d["deepstack_layers"] == 1
 
 
-def test_the_tower_takes_the_moe_type_of_its_family():
+def test_the_tower_takes_every_vision_type_name_of_its_family():
     """A Qwen3-VL-MoE checkpoint names its vision config by the family
     (`qwen3_vl_moe`) or by transformers' class (`qwen3_vl_moe_vision`), a
     dense one by transformers' class too (`qwen3_vl_vision`); the tower is
