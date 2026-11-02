@@ -145,12 +145,17 @@ def _convert_message(m: Any, i: int) -> list[dict]:
             out.append(turn)
             parts.clear(), thinking.clear(), tool_calls.clear()
 
+    # Text before a tool_result would render as a user turn before the tool
+    # turn, which the templates refuse; Anthropic refuses that order too.
+    first_part: str | None = None
     for j, block in enumerate(content):
         kind = block.get("type") if isinstance(block, dict) else None
         here = f"{where}.content[{j}]"
         if kind == "text":
+            first_part = first_part or here
             parts.append({"type": "text", "text": str(block.get("text", ""))})
         elif kind == "thinking":
+            first_part = first_part or here
             thinking.append(str(block.get("thinking", "")))
         elif kind == "redacted_thinking":
             continue  # nothing to render: the trace is not ours to read
@@ -174,6 +179,13 @@ def _convert_message(m: Any, i: int) -> list[dict]:
                 raise ApiError(
                     f"{here}: tool_result belongs to the user", param="messages"
                 )
+            if first_part is not None:
+                raise ApiError(
+                    f"{here}: a tool_result block must come before every text, "
+                    f"image and thinking block of its message; {first_part} "
+                    "precedes it",
+                    param=first_part,
+                )
             flush()
             out.append(
                 {
@@ -183,6 +195,7 @@ def _convert_message(m: Any, i: int) -> list[dict]:
                 }
             )
         elif kind == "image":
+            first_part = first_part or here
             parts.append(_image_part(block, here))
         elif kind == "document":
             raise unsupported("document blocks", "messages")
