@@ -1,5 +1,10 @@
 import json
 import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -441,3 +446,129 @@ def test_a_flag_beats_the_kv_config_file(tmp_path):
         ).group_size
         == 64
     )
+
+
+def test_serve_flags_prompt_cache_dir(tmp_path):
+    from mlx_beam.cli import StartupError, prepare_prompt_cache_dir
+
+    args = serve_args(
+        "--prompt-cache-dir",
+        str(tmp_path / "cache"),
+        "--prompt-cache-save-seconds",
+        "2.5",
+        "--prompt-cache-disk-bytes",
+        "1024",
+    )
+    assert args.prompt_cache_dir == str(tmp_path / "cache")
+    assert (
+        args.prompt_cache_save_seconds == 2.5 and args.prompt_cache_disk_bytes == 1024
+    )
+    plain = serve_args()
+    assert plain.prompt_cache_dir is None and plain.prompt_cache_save_seconds == 8.0
+    assert plain.prompt_cache_disk_bytes == 100 * 1024**3
+    with pytest.raises(SystemExit):
+        serve_args("--prompt-cache-disk-bytes", "0")
+    with pytest.raises(SystemExit):
+        serve_args("--prompt-cache-save-seconds", "-1")
+    made = prepare_prompt_cache_dir(str(tmp_path / "cache" / "prompt"))
+    assert made.is_dir() and stat.S_IMODE(made.stat().st_mode) == 0o700
+    assert prepare_prompt_cache_dir(str(made)) == made
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    with pytest.raises(StartupError, match="0700"):
+        prepare_prompt_cache_dir(str(shared))
+    a_file = tmp_path / "file"
+    a_file.write_text("x")
+    with pytest.raises(StartupError, match="not a directory"):
+        prepare_prompt_cache_dir(str(a_file))
+    root = Path(__file__).resolve().parent.parent
+    check = subprocess.run(
+        [sys.executable, str(root / "tools" / "gen_config_reference.py"), "--check"],
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
+
+
+def test_the_model_identity_covers_shards_in_subfolders(tmp_path):
+    """A tower shard in a subfolder, named by the index: rewriting it alone
+    changes the model part of the identity, and with it the namespace."""
+    from mlx_beam.cli import cache_identity
+    from mlx_beam.engine import KVPolicy, persist
+
+    model = tmp_path / "model"
+    (model / "vision").mkdir(parents=True)
+    (model / "config.json").write_text('{"model_type": "x"}')
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001.safetensors",
+                    "v": "vision/model.safetensors",
+                }
+            }
+        )
+    )
+    (model / "model-00001.safetensors").write_bytes(bytes(100))
+    (model / "vision" / "model.safetensors").write_bytes(bytes(50))
+    first = cache_identity(model, None, None)
+    assert cache_identity(model, None, None) == first
+    (model / "vision" / "model.safetensors").write_bytes(bytes(60))
+    changed = cache_identity(model, None, None)
+    assert changed["model"] != first["model"]
+
+    def ns(identity):
+        return persist.namespace(persist.namespace_parts(identity, KVPolicy(), []))
+
+    assert ns(changed) != ns(first)
+    assert [w[:2] for w in first["model"]["weights"]] == [
+        ["model-00001.safetensors", 100],
+        ["vision/model.safetensors", 50],
+    ]
+    assert first["model"]["config"] and first["model"]["index"]
+    assert first["model"]["snapshot"] is None and first["model"]["kv_config"] is None
+    assert first["vision"] is None and first["head_digest"] is None
+    assert first["engine"] and first["mlx"]
+
+
+def test_the_vision_identity_names_the_processor_settings(monkeypatch, tmp_path):
+    """The identity of an image entry carries the libraries that compute
+    the features and a digest of the processor's effective settings."""
+    import tests
+    from mlx_beam.cli import cache_identity
+
+    monkeypatch.setattr(tests, "__version__", "0.1", raising=False)
+
+    class Frontend:
+        def __init__(self, settings):
+            self.processor = SimpleNamespace(
+                image_processor=SimpleNamespace(to_dict=lambda: settings)
+            )
+            self.renderer = None
+
+        def describe(self):
+            return {
+                "provider": "stub",
+                "family": "f",
+                "processor": {"source": "checkpoint", "class": "P"},
+            }
+
+    (tmp_path / "config.json").write_text("{}")
+    first = cache_identity(tmp_path, Frontend({"size": 224, "mean": [0.5]}), None)
+    vision = first["vision"]
+    assert set(vision["libraries"]) == {
+        "transformers",
+        "torch",
+        "torchvision",
+        "pillow",
+        "mistral-common",
+    }
+    assert all(v is None or isinstance(v, str) for v in vision["libraries"].values())
+    assert vision["package"] == "0.1"
+    assert isinstance(vision["settings"], str) and len(vision["settings"]) == 64
+    assert vision["provider"] == "stub" and vision["family"] == "f"
+    assert vision["preprocessor_config"] is None and vision["processor_config"] is None
+    other = cache_identity(tmp_path, Frontend({"size": 256, "mean": [0.5]}), None)
+    assert other["vision"]["settings"] != vision["settings"]
+    assert other["model"] == first["model"]

@@ -180,6 +180,10 @@ class Engine:
         proposer: Any = None,
         max_draft_tokens: int = 3,
         exact_verify: str = "off",
+        prompt_cache_dir: str | None = None,
+        prompt_cache_save_seconds: float = 8.0,
+        prompt_cache_disk_bytes: int = 100 * 1024**3,
+        cache_identity: dict | None = None,
     ):
         self.model = model
         self.model_key = model_key
@@ -273,6 +277,23 @@ class Engine:
             max_entries=prompt_cache_size,
             max_bytes=prompt_cache_bytes if prompt_cache_bytes else 1 << 63,
         )
+        # The store on disk: None without a directory. The identity names
+        # the model files, the mlx and mlx-beam versions, the vision
+        # frontend and the draft head; the worker derives the namespace.
+        self.prompt_cache_dir = prompt_cache_dir
+        self.prompt_cache_save_seconds = prompt_cache_save_seconds
+        self.prompt_cache_disk_bytes = prompt_cache_disk_bytes
+        self.cache_identity = cache_identity
+        if prompt_cache_dir is not None:
+            if cache_identity is None:
+                raise ValueError("prompt_cache_dir needs a cache_identity")
+            missing = [k for k in ("model", "mlx", "engine") if k not in cache_identity]
+            if missing:
+                raise ValueError(f"cache_identity lacks {', '.join(missing)}")
+        self._persist: dict | None = (
+            None if prompt_cache_dir is None else self._persist_zero()
+        )
+        self._persist_loaded = False
         self._inbox: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -338,7 +359,13 @@ class Engine:
                 raise EngineDead("engine warm-up did not finish in time")
         return self
 
-    def stop(self, timeout: float = 10.0) -> None:
+    def stop(self, timeout: float | None = None) -> None:
+        """Ask the worker to end and wait for it: the join covers a running
+        generator step plus, with a store on disk, the save budget."""
+        if timeout is None:
+            timeout = 10.0 + (
+                self.prompt_cache_save_seconds if self._persist is not None else 0.0
+            )
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
@@ -603,6 +630,8 @@ class Engine:
             "prompt_cache": {
                 **self.prefix_store.describe(),
                 "store_failures": self.store_failures,
+                # The store on disk: None without --prompt-cache-dir.
+                "persistent": self._persist_health(),
             },
             "sampling": self._samplers.describe(),
             # None: no proposer configured, every row decodes plainly.
@@ -610,6 +639,45 @@ class Engine:
                 self.speculator.describe() if self.speculator is not None else None
             ),
         }
+
+    def _persist_zero(self) -> dict:
+        return {
+            "dir": self.prompt_cache_dir,
+            "namespace": None,
+            "loading": False,
+            "loaded_entries": 0,
+            "loaded_bytes": 0,
+            "load_ms": 0,
+            "skipped": {
+                "incompatible": 0,
+                "partial": 0,
+                "corrupt": 0,
+                "over_budget": 0,
+            },
+            "sidecars_dropped": 0,
+            "saved_entries": 0,
+            "saved_bytes": 0,
+            "save_ms": 0,
+            "save_skipped_entries": 0,
+            "save_skipped_no_space": 0,
+            "save_skipped_over_cap": 0,
+            "save_skipped_unsupported": 0,
+            "last_save": None,
+            "disk_cap_bytes": self.prompt_cache_disk_bytes,
+            "budget_wait_ms": 0,
+            "namespaces_evicted": 0,
+            "namespace_bytes_evicted": 0,
+            "sweep_skipped_deadline": 0,
+            "disk_bytes": 0,
+            "disk_bytes_total": 0,
+            "other_namespaces": 0,
+            "failures": 0,
+        }
+
+    def _persist_health(self) -> dict | None:
+        if self._persist is None:
+            return None
+        return {**self._persist, "skipped": dict(self._persist["skipped"])}
 
     # -- the worker -------------------------------------------------------
 

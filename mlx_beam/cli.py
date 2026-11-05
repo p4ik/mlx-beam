@@ -302,6 +302,29 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="RAM budget in bytes for the stored prefixes (default: unlimited); "
         "the store's own limit, separate from the caches of running requests",
     )
+    cache.add_argument(
+        "--prompt-cache-dir",
+        metavar="DIR",
+        help="directory the store is written to on a clean stop and read back "
+        "from after start, one folder per model revision and KV layout "
+        "(default: none; the store lives in RAM only)",
+    )
+    cache.add_argument(
+        "--prompt-cache-save-seconds",
+        type=_non_negative_float,
+        metavar="SECONDS",
+        default=8.0,
+        help="time budget for writing the store on a stop; system entries go "
+        "first, then conversations newest first, the rest is dropped",
+    )
+    cache.add_argument(
+        "--prompt-cache-disk-bytes",
+        type=_positive_int,
+        default=100 * 1024**3,
+        help="cap on the whole --prompt-cache-dir across model revisions and "
+        "layouts: when a save would exceed it, other folders go, the least "
+        "recently saved first, never one another process holds",
+    )
     p.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -352,6 +375,16 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
     if x < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return x
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        x = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if x < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
     return x
 
 
@@ -499,6 +532,33 @@ def policy_with_package_prefill(policy, args, model_path: Path, log):
         "kv prefill %r from the package manifest (measured for %s)", mode, entry["file"]
     )
     return replace(policy, prefill=mode, prefill_source="manifest")
+
+
+def prepare_prompt_cache_dir(path: str) -> Path:
+    """The directory --prompt-cache-dir names, created with mode 0700; one
+    that exists must be ours and private, or the server does not start."""
+    return Path(path)
+
+
+def cache_identity(model_path: Path, frontend, proposer) -> dict:
+    """What a stored entry must match beyond its tokens: the model's files,
+    the mlx and mlx-beam versions, the vision frontend's preprocessing and
+    the draft head's digest."""
+    vision = None
+    if frontend is not None:
+        vision = {
+            **frontend.describe(),
+            "libraries": {},
+            "package": None,
+            "settings": None,
+        }
+    return {
+        "model": {},
+        "mlx": None,
+        "engine": None,
+        "vision": vision,
+        "head_digest": None,
+    }
 
 
 def proposer_from_args(args, model, model_path: Path, log):

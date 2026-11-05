@@ -1,19 +1,32 @@
 """The engine on a tiny random-weight hybrid: concurrent requests, cancel,
-prompt cache reuse, health with evidence, and a dying worker that says so."""
+prompt cache reuse, health with evidence, a dying worker that says so, and
+the prompt cache that outlives a restart through --prompt-cache-dir."""
 
+import fcntl
+import json
+import logging
+import math
+import os
+import re
+import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import pytest
 
 from mlx_beam._vendor.mlx_lm.models import qwen3_next
+from mlx_beam._vendor.mlx_lm.models.cache import CacheList, KVCache
 from mlx_beam.engine import (
     Engine,
     EngineDead,
     GenerationRequest,
     KVPolicy,
+    persist,
 )
+from mlx_beam.engine.kv import describe_caches, for_store, make_request_cache
+from mlx_beam.engine.prefix import HEAD
 from mlx_beam.engine.request import SamplingParams
 from tests.test_vendor_mlx_lm import TINY_HYBRID
 from tests.test_vendor_optiq_kv import tiny_llama
@@ -22,6 +35,14 @@ from tests.test_vendor_optiq_kv import tiny_llama
 def tiny_hybrid(seed=0):
     mx.random.seed(seed)
     model = qwen3_next.Model(qwen3_next.ModelArgs(**TINY_HYBRID))
+    mx.eval(model.parameters())
+    return model
+
+
+def tiny_hybrid_q(seed=0):
+    """`tiny_hybrid` with a head dim a quantization group of 64 divides."""
+    mx.random.seed(seed)
+    model = qwen3_next.Model(qwen3_next.ModelArgs(**{**TINY_HYBRID, "head_dim": 64}))
     mx.eval(model.parameters())
     return model
 
@@ -524,3 +545,810 @@ def test_a_failing_store_costs_the_entry_not_the_engine(monkeypatch):
         assert h["alive"] and h["prompt_cache"]["store_failures"] == 1
         # And the next request runs as if nothing happened.
         assert len(collect(engine.submit(GenerationRequest([3, 7], max_tokens=2)))) == 2
+
+
+# -- the store on disk --------------------------------------------------------
+
+# A fixed identity for the tiny models, which have no files on disk.
+IDENTITY = {
+    "model": {
+        "snapshot": None,
+        "config": "c0ffee",
+        "index": None,
+        "kv_config": None,
+        "weights": [["model.safetensors", 1, 1]],
+    },
+    "mlx": mx.__version__,
+    "engine": "test",
+    "vision": None,
+    "head_digest": None,
+}
+
+SYS = list(range(1, 13))
+U1, U2, U3 = [20, 21, 22, 23], [30, 31, 32, 33], [40, 41, 42, 43]
+
+
+class Clock:
+    """A counting clock for `persist`: `sleep(dt)` advances it by `dt`, and
+    the `release_at`-th sleep runs `release` (a lock given up meanwhile)."""
+
+    def __init__(self, release_at=None, release=None):
+        self.now = 1000.0
+        self.sleeps = 0
+        self.release_at = release_at
+        self.release = release
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, dt):
+        self.sleeps += 1
+        self.now += dt
+        if self.release is not None and self.sleeps == self.release_at:
+            self.release()
+
+
+def fake_clock(monkeypatch, **kw):
+    clock = Clock(**kw)
+    monkeypatch.setattr(persist, "monotonic", clock.monotonic)
+    monkeypatch.setattr(persist, "sleep", clock.sleep)
+    return clock
+
+
+def hold(path):
+    """An exclusive flock on `path` from this thread; the fd keeps it."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def run(engine, tokens, max_tokens=4, boundaries=(), system_end=None):
+    stream = engine.submit(
+        GenerationRequest(
+            list(tokens),
+            max_tokens=max_tokens,
+            boundaries=boundaries,
+            system_end=system_end,
+        )
+    )
+    return [e.token for e in stream], stream.prompt_cached
+
+
+def persistent_engine(model, tmp_path, identity=IDENTITY, **kw):
+    kw.setdefault("kv_policy", KVPolicy(bits=8))
+    return Engine(model, prompt_cache_dir=str(tmp_path), cache_identity=identity, **kw)
+
+
+def persistent(engine):
+    return engine.health()["prompt_cache"]["persistent"]
+
+
+def wait_loaded(engine, timeout=60.0):
+    """The worker reads the store after the readiness; health says when."""
+    deadline = time.monotonic() + timeout
+    while persistent(engine)["loading"]:
+        assert engine.alive, engine.health()["error"]
+        assert time.monotonic() < deadline, "the store did not finish loading"
+        time.sleep(0.01)
+
+
+def turns(engine, upto):
+    """A conversation of up to three turns over a system block: the prompts,
+    the answers and the tokens the cache covered per turn."""
+    s = len(SYS)
+    p1 = SYS + U1
+    a1, c1 = run(engine, p1, boundaries=[s], system_end=s)
+    if upto == 1:
+        return [p1], [a1], [c1]
+    p2 = p1 + a1 + U2
+    a2, c2 = run(engine, p2, boundaries=[s, len(p1 + a1)], system_end=s)
+    if upto == 2:
+        return [p1, p2], [a1, a2], [c1, c2]
+    p3 = p2 + a2 + U3
+    a3, c3 = run(engine, p3, boundaries=[s, len(p1 + a1), len(p2 + a2)], system_end=s)
+    return [p1, p2, p3], [a1, a2, a3], [c1, c2, c3]
+
+
+def namespaces(tmp_path):
+    return sorted(d for d in tmp_path.iterdir() if d.is_dir())
+
+
+def the_namespace(tmp_path):
+    """The one namespace folder a stopped engine left, with its manifest."""
+    found = namespaces(tmp_path)
+    assert len(found) == 1, found
+    assert (found[0] / "manifest.json").is_file()
+    return found[0]
+
+
+def manifest(ns_dir):
+    return json.loads((ns_dir / "manifest.json").read_text())
+
+
+def disk_total(tmp_path):
+    return sum(f.stat().st_size for f in tmp_path.rglob("*") if f.is_file())
+
+
+def assert_same_state(x, y):
+    if isinstance(x, mx.array):
+        assert isinstance(y, mx.array)
+        assert (x.dtype, x.shape) == (y.dtype, y.shape)
+        assert mx.array_equal(x, y)
+    elif isinstance(x, (list, tuple)):
+        assert type(x) is type(y) and len(x) == len(y)
+        for u, v in zip(x, y, strict=True):
+            assert_same_state(u, v)
+    else:
+        assert x == y
+
+
+def assert_same_entry(got, kept):
+    """Bit-equal: every array, every scalar, the classes, the checkpoints."""
+    assert got.length == kept.length and got.cache_type == kept.cache_type
+    assert [type(c) for c in got.cache] == [type(c) for c in kept.cache]
+    for a, b in zip(got.cache, kept.cache, strict=True):
+        assert_same_state(a.state, b.state)
+    assert sorted(got.checkpoints) == sorted(kept.checkpoints)
+    for pos in kept.checkpoints:
+        assert set(got.checkpoints[pos]) == set(kept.checkpoints[pos])
+        for layer in kept.checkpoints[pos]:
+            assert_same_state(got.checkpoints[pos][layer], kept.checkpoints[pos][layer])
+    assert got.nbytes == kept.nbytes
+
+
+def test_the_store_survives_a_restart_bit_exact(tmp_path):
+    """Engine A stops after turn 2; B starts on A's directory and serves
+    turn 3 from the file as a warm engine would: the conversation entry
+    comes back bit-equal, the hit covers the same tokens, the answer is
+    the same."""
+    model = tiny_hybrid_q()
+    with Engine(model, kv_policy=KVPolicy(bits=8)) as ref:
+        _, answers_r, cached_r = turns(ref, 3)
+    with persistent_engine(model, tmp_path) as a:
+        prompts, answers, _ = turns(a, 2)
+        key = prompts[1] + answers[1]
+        kept = a.prefix_store._trie.get(a.model_key, key)
+    ns = the_namespace(tmp_path)
+    m = manifest(ns)
+    assert len(m["entries"]) >= 2
+    with persistent_engine(model, tmp_path) as b:
+        wait_loaded(b)
+        assert persistent(b)["loaded_entries"] >= 2
+        rec = next(
+            e
+            for e in m["entries"]
+            if e["cache_type"] == "assistant" and e["length"] == len(key)
+        )
+        got_key, got = persist.read_entry(str(ns / rec["file"]), rec)
+        assert got_key == key
+        assert_same_entry(got, kept)
+        out, cached = run(
+            b,
+            key + U3,
+            boundaries=[len(SYS), len(prompts[0] + answers[0]), len(key)],
+            system_end=len(SYS),
+        )
+    assert cached == cached_r[2] and out == answers_r[2]
+
+
+def test_a_changed_configuration_is_a_miss(tmp_path):
+    """Another KV layout, other model files or another mlx-beam version is
+    another namespace: nothing loads, the old one is counted as foreign. A
+    manifest of another format, and an image entry written under another
+    vision package, are misses inside the namespace."""
+    model = tiny_hybrid_q()
+    policy = KVPolicy(bits=8)
+    with persistent_engine(model, tmp_path) as a:
+        prompts, answers, _ = turns(a, 2)
+        # An image entry: negative ids in its key, written with this run's
+        # vision identity (none).
+        a.prefix_store.insert(
+            a.model_key, [-5, -6, 3, 7, 9], for_store(make_request_cache(model, policy))
+        )
+    p3 = prompts[1] + answers[1] + U3
+    bounds = [len(SYS), len(prompts[0] + answers[0]), len(prompts[1] + answers[1])]
+    saved = manifest(the_namespace(tmp_path))
+    text_entries = sum(1 for e in saved["entries"] if not e["image"])
+    assert text_entries == len(saved["entries"]) - 1
+
+    def copy(name):
+        target = tmp_path.parent / f"{tmp_path.name}-{name}"
+        shutil.copytree(tmp_path, target)
+        return target
+
+    with persistent_engine(model, copy("bits"), kv_policy=KVPolicy(bits=4)) as b:
+        wait_loaded(b)
+        h = persistent(b)
+        assert h["loaded_entries"] == 0 and h["other_namespaces"] == 1
+        out, cached = run(b, p3, boundaries=bounds, system_end=len(SYS))
+        assert cached == 0 and len(out) == 4
+    for name, change in (
+        ("model", {"model": {**IDENTITY["model"], "config": "deadbeef"}}),
+        ("engine", {"engine": "other"}),
+    ):
+        with persistent_engine(model, copy(name), identity={**IDENTITY, **change}) as c:
+            wait_loaded(c)
+            h = persistent(c)
+            assert h["loaded_entries"] == 0 and h["other_namespaces"] == 1
+    bumped = copy("format")
+    ns = the_namespace(bumped)
+    m = manifest(ns)
+    m["format"] = persist.FORMAT + 1
+    (ns / "manifest.json").write_text(json.dumps(m))
+    with persistent_engine(model, bumped) as d:
+        wait_loaded(d)
+        h = persistent(d)
+        assert h["loaded_entries"] == 0
+        assert h["skipped"]["incompatible"] == len(m["entries"])
+    with persistent_engine(
+        model, copy("vision"), identity={**IDENTITY, "vision": {"package": "2.0"}}
+    ) as e:
+        wait_loaded(e)
+        h = persistent(e)
+        assert h["skipped"]["incompatible"] == 1
+        assert h["loaded_entries"] == text_entries
+
+
+def test_a_corrupt_entry_is_a_miss_and_the_rest_loads(tmp_path):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        prompts, answers, _ = turns(a, 2)
+    ns = the_namespace(tmp_path)
+    m = manifest(ns)
+    key = prompts[1] + answers[1]
+    rec = next(e for e in m["entries"] if e["length"] == len(key))
+    damaged = ns / rec["file"]
+    damaged.write_bytes(damaged.read_bytes()[: rec["bytes"] // 2])
+    leftover = ns / "abc.1.4242.new.safetensors"
+    leftover.write_bytes(b"not a tensor file")
+    with persistent_engine(model, tmp_path) as b:
+        wait_loaded(b)
+        h = persistent(b)
+        assert h["skipped"]["corrupt"] == 1 and h["skipped"]["partial"] == 1
+        assert h["loaded_entries"] == len(m["entries"]) - 1
+        assert not damaged.exists() and not leftover.exists()
+        # The conversation is gone; the system block still serves.
+        _, cached = run(
+            b,
+            key + U3,
+            boundaries=[len(SYS), len(prompts[0] + answers[0]), len(key)],
+            system_end=len(SYS),
+        )
+        assert cached == len(SYS)
+
+
+def test_the_head_sidecar_round_trips_and_a_foreign_head_is_dropped(tmp_path):
+    """The draft head's history in a checkpoint comes back for the same
+    head (its digest) and is dropped, counted, for another - the entry
+    itself stays."""
+    from tests.test_speculative import (
+        OracleProposer,
+        plain_transcript,
+        run_speculative,
+        tiny_qwen35,
+    )
+
+    class HeadStub(OracleProposer):
+        def __init__(self, digest):
+            super().__init__(lambda call: 0)
+            self.digest = digest
+            self.resumed = []
+
+        def snapshot(self, uid):
+            return [
+                mx.full((1, 1, 4, 8), 1.5),
+                mx.full((1, 1, 4, 8), -2.5, dtype=mx.float16),
+                mx.arange(32, dtype=mx.float32)[None, None],
+            ]
+
+        def begin(self, uid, prompt_len, snapshot):
+            self.resumed.append(snapshot)
+
+        def describe(self):
+            return {"kind": "stub", "digest": self.digest}
+
+    def engine_with(digest):
+        stub = HeadStub(digest)
+        engine = run_speculative(
+            model,
+            stub,
+            prompt_cache_dir=str(tmp_path),
+            cache_identity={**IDENTITY, "head_digest": digest},
+        )
+        return engine, stub
+
+    model = tiny_qwen35()
+    prompt = [3, 7, 11, 13, 5]
+    truth = plain_transcript(model, prompt, 6)
+    a, stub = engine_with("head-1")
+    with a:
+        stub.start(truth)
+        out = collect(a.submit(GenerationRequest(prompt, max_tokens=6)))
+    key = prompt + out
+    b, stub = engine_with("head-1")
+    with b:
+        wait_loaded(b)
+        hit = b.prefix_store.fetch(b.model_key, key + [9, 9])
+        assert hit is not None and hit.covered == len(key)
+        head = hit.checkpoints[len(key)].get(HEAD)
+        assert head is not None
+        assert_same_state(head, stub.snapshot(0))
+        assert persistent(b)["sidecars_dropped"] == 0
+    c, _ = engine_with("head-2")
+    with c:
+        wait_loaded(c)
+        h = persistent(c)
+        assert h["sidecars_dropped"] == 1 and h["loaded_entries"] == 1
+        hit = c.prefix_store.fetch(c.model_key, key + [9, 9])
+        assert hit is not None and HEAD not in hit.checkpoints[len(key)]
+
+
+def test_nothing_touches_the_disk_without_the_flag(tmp_path):
+    model = tiny_hybrid()
+    with Engine(model) as engine:
+        run(engine, [3, 7, 11])
+        assert engine.health()["prompt_cache"]["persistent"] is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_save_respects_free_space(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    engine = persistent_engine(model, tmp_path)
+    with engine:
+        wait_loaded(engine)
+        run(engine, SYS + U1)
+
+        class Full:
+            f_bavail = 0
+            f_frsize = 4096
+
+        monkeypatch.setattr(os, "statvfs", lambda path: Full())
+    h = persistent(engine)
+    assert h["save_skipped_no_space"] == 1 and h["failures"] == 0
+    assert h["saved_entries"] == 0
+    ns = the_namespace(tmp_path)
+    assert not (ns / "manifest.json").exists()
+    assert not engine.alive and engine.health()["error"] is None
+
+
+def test_health_reports_the_persistent_store(tmp_path):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as engine:
+        h = persistent(engine)
+    assert h["dir"] == str(tmp_path)
+    assert set(h) == {
+        "dir",
+        "namespace",
+        "loading",
+        "loaded_entries",
+        "loaded_bytes",
+        "load_ms",
+        "skipped",
+        "sidecars_dropped",
+        "saved_entries",
+        "saved_bytes",
+        "save_ms",
+        "save_skipped_entries",
+        "save_skipped_no_space",
+        "save_skipped_over_cap",
+        "save_skipped_unsupported",
+        "last_save",
+        "disk_cap_bytes",
+        "budget_wait_ms",
+        "namespaces_evicted",
+        "namespace_bytes_evicted",
+        "sweep_skipped_deadline",
+        "disk_bytes",
+        "disk_bytes_total",
+        "other_namespaces",
+        "failures",
+    }
+    assert set(h["skipped"]) == {"incompatible", "partial", "corrupt", "over_budget"}
+    assert isinstance(h["loading"], bool)
+    assert h["last_save"] is None or isinstance(h["last_save"], str)
+    assert h["namespace"] is None or isinstance(h["namespace"], str)
+    counters = {
+        k: v
+        for k, v in h.items()
+        if k not in ("dir", "namespace", "loading", "last_save", "skipped")
+    }
+    assert all(
+        isinstance(v, int) and not isinstance(v, bool) for v in counters.values()
+    )
+    assert h["disk_cap_bytes"] == 100 * 1024**3
+
+
+def test_an_unsupported_cache_class_is_skipped_at_save(tmp_path, caplog):
+    model = tiny_hybrid_q()
+    a = persistent_engine(model, tmp_path)
+    with a:
+        wait_loaded(a)
+        run(a, SYS + U1, boundaries=[len(SYS)], system_end=len(SYS))
+        kv = KVCache()
+        k = mx.zeros((1, 1, 4, 8))
+        kv.update_and_fetch(k, k)
+        a.prefix_store.insert(a.model_key, [50, 51, 52], [CacheList(kv)])
+        assert a.health()["prompt_cache"]["entries"] == 3
+    h = persistent(a)
+    assert h["save_skipped_unsupported"] == 1 and h["saved_entries"] == 2
+    ns = the_namespace(tmp_path)
+    m = manifest(ns)
+    assert sorted(e["length"] for e in m["entries"]) == [len(SYS), len(SYS + U1) + 4]
+    assert "CacheList" in caplog.text
+
+
+def test_the_loader_reads_only_what_the_caps_keep(tmp_path, monkeypatch):
+    """A smaller store at the restart: the manifest's order and sizes say
+    what the caps would evict; those files are not even read."""
+    model = tiny_hybrid_q()
+    prompts = [list(range(1, 9)), list(range(9, 17)), list(range(17, 25))]
+    keys = []
+    with persistent_engine(model, tmp_path, prompt_cache_size=8) as a:
+        wait_loaded(a)
+        for prompt in prompts:
+            out, _ = run(a, prompt)
+            keys.append(prompt + out)
+    reads = []
+    real = persist.read_entry
+
+    def counting(path, expected):
+        reads.append(path)
+        return real(path, expected)
+
+    monkeypatch.setattr(persist, "read_entry", counting)
+    with persistent_engine(model, tmp_path, prompt_cache_size=2) as b:
+        wait_loaded(b)
+        h = persistent(b)
+        assert h["skipped"]["over_budget"] == 1 and h["loaded_entries"] == 2
+        assert len(reads) == 2
+        assert not b.prefix_store.has(b.model_key, keys[0])
+        assert all(b.prefix_store.has(b.model_key, k) for k in keys[1:])
+
+
+def own_namespace(model, policy=None, identity=IDENTITY):
+    policy = policy or KVPolicy(bits=8)
+    applied = describe_caches(make_request_cache(model, policy))
+    return persist.namespace(persist.namespace_parts(identity, policy, applied))
+
+
+def test_a_second_process_on_the_namespace_is_refused(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    ns = own_namespace(model)
+    (tmp_path / ns).mkdir(mode=0o700)
+    fd = hold(str(tmp_path / ns / "lock"))
+    clock = fake_clock(monkeypatch)
+    try:
+        engine = persistent_engine(model, tmp_path)
+        with pytest.raises(EngineDead, match=re.escape(str(tmp_path / ns))):
+            engine.start()
+    finally:
+        os.close(fd)
+    assert clock.sleeps == math.ceil(persist.LOCK_WAIT_S / 0.1)
+    assert clock.now - 1000.0 >= persist.LOCK_WAIT_S
+    assert not engine.health()["alive"]
+
+
+def test_a_lock_released_in_time_lets_the_engine_start(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1)
+    saved = persistent(a)["saved_entries"]
+    assert saved == 1
+    ns = the_namespace(tmp_path)
+    fd = hold(str(ns / "lock"))
+    monkeypatch.setattr(persist, "LOCK_WAIT_S", 2.0)
+    clock = fake_clock(
+        monkeypatch, release_at=5, release=lambda: fcntl.flock(fd, fcntl.LOCK_UN)
+    )
+    try:
+        with persistent_engine(model, tmp_path) as b:
+            assert b.alive
+            wait_loaded(b)
+            assert persistent(b)["loaded_entries"] == saved
+    finally:
+        os.close(fd)
+    assert clock.sleeps == 5
+
+
+def foreign_namespace(tmp_path, name, saved_at, files):
+    ns = tmp_path / name
+    ns.mkdir(mode=0o700)
+    (ns / "lock").touch()
+    (ns / "manifest.json").write_text(
+        json.dumps({"format": persist.FORMAT, "saved_at": saved_at, "entries": []})
+    )
+    for file, size in files.items():
+        (ns / file).write_bytes(bytes(size))
+    return ns
+
+
+def listing(path):
+    return sorted((f.relative_to(path), f.stat().st_size) for f in path.rglob("*"))
+
+
+def test_the_oldest_foreign_namespace_falls_under_the_cap(tmp_path, monkeypatch):
+    """Three foreign namespaces, the oldest with an old generation beside the
+    one its manifest names: the sweep counts every file, and takes the
+    oldest namespace whole - its data and manifest, never its lock."""
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1)
+    own = persistent(a)["disk_bytes"]
+    assert own > 0
+    old = foreign_namespace(
+        tmp_path, "f-old", 1, {"aa.0.safetensors": 4000, "aa.1.safetensors": 4000}
+    )
+    mid = foreign_namespace(tmp_path, "f-mid", 2, {"bb.1.safetensors": 4000})
+    new = foreign_namespace(tmp_path, "f-new", 3, {"cc.1.safetensors": 4000})
+    before = {p: listing(p) for p in (mid, new)}
+    reports, totals = [], []
+    real = persist.sweep
+
+    def observed(dir, own_ns, cap_bytes, deadline, log):
+        totals.append(disk_total(tmp_path))
+        report = real(dir, own_ns, cap_bytes, deadline, log)
+        reports.append(report)
+        return report
+
+    monkeypatch.setattr(persist, "sweep", observed)
+    cap = own + 12000
+    with persistent_engine(model, tmp_path, prompt_cache_disk_bytes=cap) as b:
+        wait_loaded(b)
+    assert reports and reports[0].total_before == totals[0]
+    assert reports[0].total_before >= own + 16000
+    assert sorted(f.name for f in old.iterdir()) == ["lock"]
+    assert {p: listing(p) for p in (mid, new)} == before
+    assert disk_total(tmp_path) <= cap
+    h = persistent(b)
+    assert h["namespaces_evicted"] == 1 and h["namespace_bytes_evicted"] == 8000
+    assert h["other_namespaces"] == 2 and h["disk_bytes_total"] <= cap
+    assert h["disk_bytes_total"] == disk_total(tmp_path)
+
+
+def test_the_own_and_a_locked_namespace_never_fall(tmp_path, caplog):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1)
+    own = persistent(a)["disk_bytes"]
+    own_ns = the_namespace(tmp_path)
+    generation = manifest(own_ns)["generation"]
+    locked = foreign_namespace(tmp_path, "f-locked", 1, {"dd.1.safetensors": 4000})
+    fd = hold(str(locked / "lock"))
+    was = listing(locked)
+    try:
+        with persistent_engine(
+            model, tmp_path, prompt_cache_disk_bytes=own + 2000
+        ) as b:
+            wait_loaded(b)
+    finally:
+        os.close(fd)
+    h = persistent(b)
+    assert h["failures"] == 0 and h["namespaces_evicted"] == 0
+    assert manifest(own_ns)["generation"] == generation + 1
+    assert listing(locked) == was
+    assert h["disk_bytes_total"] > h["disk_cap_bytes"]
+    assert h["disk_bytes_total"] == disk_total(tmp_path)
+    assert "over the cap" in caplog.text
+
+
+def test_a_new_generation_leaves_the_old_file_until_the_manifest_turns(
+    tmp_path, monkeypatch
+):
+    """A key that comes back with other checkpoints gets a new file name;
+    the old file stays until the new manifest is published. A save that
+    dies in between leaves the old state whole and a stray new file."""
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        out, _ = run(a, SYS + U1)
+        key = SYS + U1 + out
+        kept = a.prefix_store._trie.get(a.model_key, key)
+    ns = the_namespace(tmp_path)
+    (rec,) = manifest(ns)["entries"]
+    first = ns / rec["file"]
+    assert first.name.endswith(".1.safetensors")
+    first_bytes = first.read_bytes()
+
+    def boom(ns_dir, m):
+        raise OSError("disk went away")
+
+    with persistent_engine(model, tmp_path) as b:
+        wait_loaded(b)
+        entry = b.prefix_store._trie.get(b.model_key, key)
+        checkpoints = dict(entry.checkpoints)
+        checkpoints[5] = checkpoints[max(checkpoints)]
+        b.prefix_store.insert(b.model_key, key, entry.cache, checkpoints)
+        monkeypatch.setattr(persist, "write_manifest", boom)
+    monkeypatch.undo()
+    assert persistent(b)["failures"] == 1
+    second = ns / first.name.replace(".1.safetensors", ".2.safetensors")
+    assert first.read_bytes() == first_bytes and second.exists()
+    assert manifest(ns)["generation"] == 1
+    with persistent_engine(model, tmp_path) as c:
+        wait_loaded(c)
+        h = persistent(c)
+        assert h["loaded_entries"] == 1 and h["skipped"]["partial"] == 1
+        got_key, got = persist.read_entry(str(first), rec)
+        assert got_key == key
+        assert_same_entry(got, kept)
+        assert not second.exists()
+
+
+def test_two_concurrent_saves_end_under_the_cap(tmp_path, monkeypatch):
+    """Two engines of different namespaces stop at once into one directory
+    whose cap holds one of them: neither fails, and a sweep with no lock
+    held afterwards brings the directory under the cap."""
+    model = tiny_hybrid_q()
+    scratch = tmp_path / "scratch"
+    with persistent_engine(model, scratch) as probe:
+        run(probe, SYS + U1)
+    one = persistent(probe)["disk_bytes"]
+    cap = one + one // 2
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    engines = [
+        persistent_engine(
+            model,
+            shared,
+            identity={**IDENTITY, "engine": name},
+            prompt_cache_disk_bytes=cap,
+        )
+        for name in ("one", "two")
+    ]
+    for engine in engines:
+        engine.start()
+        wait_loaded(engine)
+        run(engine, SYS + U1)
+    barrier = threading.Barrier(2)
+    real = persist.save_store
+
+    def together(*args, **kwargs):
+        barrier.wait(timeout=30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(persist, "save_store", together)
+    with ThreadPoolExecutor(2) as pool:
+        for future in [pool.submit(e.stop) for e in engines]:
+            future.result(timeout=60)
+    for engine in engines:
+        assert not engine.alive and engine.health()["error"] is None
+        assert persistent(engine)["failures"] == 0
+        assert persistent(engine)["saved_entries"] == 1
+    assert disk_total(shared) <= cap + 2 * one
+    report = persist.sweep(
+        str(shared), "none", cap, persist.monotonic() + 5, logging.getLogger("test")
+    )
+    assert report.total_after <= cap and report.evicted >= 1
+    assert disk_total(shared) <= cap
+
+
+def test_the_sweep_keeps_the_save_deadline(tmp_path, monkeypatch, caplog):
+    """One monotonic deadline for the whole save: the sweep waits for the
+    budget lock only until it, then gives up and says so; a lock that
+    frees in time is taken with the save's own deadline, not a fresh one."""
+    model = tiny_hybrid_q()
+    clock = fake_clock(monkeypatch)
+    starts, deadlines = [], []
+    real_save, real_sweep, real_write = (
+        persist.save_store,
+        persist.sweep,
+        persist.write_entry,
+    )
+
+    def save(*args, **kwargs):
+        starts.append(clock.now)
+        return real_save(*args, **kwargs)
+
+    def sweep(dir, own_ns, cap_bytes, deadline, log):
+        deadlines.append(deadline)
+        return real_sweep(dir, own_ns, cap_bytes, deadline, log)
+
+    def write(*args, **kwargs):
+        n = real_write(*args, **kwargs)
+        clock.now += 0.3
+        return n
+
+    monkeypatch.setattr(persist, "save_store", save)
+    monkeypatch.setattr(persist, "sweep", sweep)
+    monkeypatch.setattr(persist, "write_entry", write)
+    a = persistent_engine(model, tmp_path, prompt_cache_save_seconds=0.5)
+    with a:
+        wait_loaded(a)
+        run(a, SYS + U1)
+        fd = hold(str(tmp_path / "budget.lock"))
+    h = persistent(a)
+    assert h["sweep_skipped_deadline"] == 1 and h["budget_wait_ms"] == 200
+    assert h["saved_entries"] == 1 and h["save_skipped_entries"] == 0
+    ns = the_namespace(tmp_path)
+    assert (ns / "manifest.json").exists()
+    assert "budget lock" in caplog.text
+    assert deadlines[-1] == starts[-1] + 0.5
+    # Freed at the first sleep: the run goes on under the save's deadline.
+    clock.release_at, clock.release = clock.sleeps + 1, lambda: fcntl.flock(
+        fd, fcntl.LOCK_UN
+    )
+    b = persistent_engine(model, tmp_path, prompt_cache_save_seconds=0.5)
+    with b:
+        wait_loaded(b)
+    os.close(fd)
+    h = persistent(b)
+    assert h["sweep_skipped_deadline"] == 0 and h["budget_wait_ms"] == 100
+    assert deadlines[-1] == starts[-1] + 0.5
+
+
+def test_the_sweep_at_start_has_its_own_deadline(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1)
+    saved = persistent(a)["saved_entries"]
+    fd = hold(str(tmp_path / "budget.lock"))
+    clock = fake_clock(monkeypatch)
+    try:
+        with persistent_engine(model, tmp_path) as b:
+            wait_loaded(b)
+            h = persistent(b)
+            assert h["sweep_skipped_deadline"] == 1
+            assert clock.sleeps == math.ceil(persist.LOCK_WAIT_S / 0.1)
+            assert h["loaded_entries"] == saved and b.alive
+        clock = fake_clock(
+            monkeypatch, release_at=1, release=lambda: fcntl.flock(fd, fcntl.LOCK_UN)
+        )
+        with persistent_engine(model, tmp_path) as c:
+            wait_loaded(c)
+            assert persistent(c)["sweep_skipped_deadline"] == 0
+            assert persistent(c)["budget_wait_ms"] == 100
+    finally:
+        os.close(fd)
+
+
+def test_a_stopped_engine_frees_its_namespace_for_the_next_one(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    monkeypatch.setattr(persist, "LOCK_WAIT_S", 0.3)
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1)
+    saved = persistent(a)["saved_entries"]
+    with persistent_engine(model, tmp_path) as b:
+        assert b.alive
+        wait_loaded(b)
+        assert persistent(b)["loaded_entries"] == saved
+    real = persist.read_manifest
+
+    def unreadable(ns_dir):
+        raise OSError("manifest unreadable")
+
+    monkeypatch.setattr(persist, "read_manifest", unreadable)
+    with persistent_engine(model, tmp_path) as c:
+        wait_loaded(c)
+        assert persistent(c)["failures"] == 1 and persistent(c)["loaded_entries"] == 0
+        run(c, SYS + U2)
+    monkeypatch.setattr(persist, "read_manifest", real)
+    with persistent_engine(model, tmp_path) as d:
+        assert d.alive
+        wait_loaded(d)
+        assert persistent(d)["loaded_entries"] == 1
+
+
+def test_an_unchanged_store_is_not_rewritten_on_stop(tmp_path, monkeypatch):
+    model = tiny_hybrid_q()
+    with persistent_engine(model, tmp_path) as a:
+        run(a, SYS + U1, boundaries=[len(SYS)], system_end=len(SYS))
+    ns = the_namespace(tmp_path)
+    before = manifest(ns)
+    assert len(before["entries"]) == 2
+    writes = []
+    real = persist.write_entry
+
+    def counting(*args, **kwargs):
+        writes.append(args[0])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(persist, "write_entry", counting)
+    with persistent_engine(model, tmp_path) as b:
+        wait_loaded(b)
+    assert writes == []
+    h = persistent(b)
+    assert h["saved_entries"] == 0 and h["saved_bytes"] == 0 and h["failures"] == 0
+    after = manifest(ns)
+    assert sorted(e["file"] for e in after["entries"]) == sorted(
+        e["file"] for e in before["entries"]
+    )
+    assert after["generation"] == before["generation"] + 1
