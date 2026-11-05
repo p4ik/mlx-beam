@@ -14,10 +14,10 @@ from mlx_beam._vendor.mlx_lm.tool_parsers import atem, harmony
 from mlx_beam.api import chat
 from mlx_beam.api.reasoning import effort_capability
 from mlx_beam.api.text import TextAssembler, initial_state
-from mlx_beam.engine.request import TokenEvent
 from mlx_beam.engine.thinking import ReasoningLimits, ThinkingBudget
 from tests.stub_tokenizer import StubDetokenizer
 from tests.test_thinking import Steps
+from tests.tracked import limits_for, tracked_events
 
 TEMPLATES = Path(__file__).parent / "fixtures" / "templates"
 
@@ -192,8 +192,11 @@ def test_muse_opener_tokens_follow_the_vocabulary():
 
 
 class ScriptTokenizer:
-    """A tokenizer whose token i decodes to piece i of the script: the text
-    the model would produce, cut where the test wants token boundaries."""
+    """A tokenizer whose ids decode to the pieces of a script: the text the
+    model would produce, cut where the test wants token boundaries. One id
+    per distinct piece (the budget's matcher compares ids, so a marker
+    written twice has one), the stop id for `""`, and the family's label
+    and label end, so the limits derive for a script without them."""
 
     has_chat_template = True
     has_thinking = True
@@ -202,7 +205,6 @@ class ScriptTokenizer:
     chat_template = ""
 
     def __init__(self, wrapped, pieces):
-        self._pieces = [*pieces, ""]  # the last id is the stop token
         for name in (
             "think_family",
             "think_start",
@@ -215,36 +217,69 @@ class ScriptTokenizer:
             "tool_parser",
             "structural_markers",
             "frame_start",
-            "answer_opener_tokens",
         ):
             setattr(self, name, getattr(wrapped, name))
-        self.eos_token_ids = set()
+        family = tu.FAMILY_MARKERS.get(self.think_family, {})
+        label = family.get("reasoning_label", "")
+        extras = [w for w in (label, self.think_label_end or "") if w]
+        self._pieces = list(dict.fromkeys([*pieces, "", *extras]))
+        self._ids = {w: i for i, w in enumerate(self._pieces)}
+        self.eos = self._ids[""]
+        self.eos_token_ids = {self.eos}
+        self.think_start_tokens = self.encode(self.think_start)
+        self.think_end_tokens = self.encode(self.think_end)
+        self.think_label_end_tokens = self.encode(self.think_label_end or "")
+        self.reasoning_label_tokens = self.encode(label)
+        self.think_close_tokens = self.encode(family.get("close", "")) or None
+        self.answer_opener_tokens = self.encode(family.get("answer_opener", "")) or None
 
     @property
     def detokenizer(self):
         return StubDetokenizer(self._pieces)
 
+    def ids(self, pieces):
+        return [self._ids[p] for p in pieces]
+
+    def encode(self, text, add_special_tokens=False):
+        """`text` tiled with the pieces, longest first; () when it cannot be."""
+        by_length = sorted((p for p in self._pieces if p), key=len, reverse=True)
+        out = []
+        while text:
+            piece = next((p for p in by_length if text.startswith(p)), None)
+            if piece is None:
+                return ()
+            out.append(self._ids[piece])
+            text = text[len(piece) :]
+        return tuple(out)
+
     def decode(self, ids):
         return "".join(self._pieces[i] for i in ids)
 
+    def _rfind(self, tokens, marker):
+        return max((i for i, t in enumerate(tokens) if t == marker[0]), default=-1)
+
     def rfind_think_start(self, tokens, start=None, end=None):
-        return -1
+        return self._rfind(tokens, self.think_start_tokens or (-1,))
 
     def rfind_think_end(self, tokens, start=None, end=None):
-        return -1
+        return self._rfind(tokens, self.think_end_tokens or (-1,))
 
 
-def run(tok, pieces, tools=None, tools_enabled=True):
+def run(tok, pieces, tools=None, tools_enabled=True, prompt=()):
     asm = TextAssembler(
-        tok, prompt_tokens=[], tools=tools, streaming=False, tools_enabled=tools_enabled
+        tok,
+        prompt_tokens=list(prompt),
+        tools=tools,
+        streaming=False,
+        tools_enabled=tools_enabled,
     )
     content = reasoning = ""
     calls = []
-    # The stop token (the last piece, an EOS) is never text.
-    for i in range(len(pieces) + 1):
-        d = asm.feed(
-            TokenEvent(i, -0.1, finish_reason="stop" if i == len(pieces) else None)
-        )
+    # The events as the engine would build them, the stop token (the `""`
+    # piece, an eos) appended: it is never text.
+    events = tracked_events(limits_for(tok, list(prompt)), tok.ids(pieces), eos=tok.eos)
+    for ev in events:
+        d = asm.feed(ev)
         content += d.content
         reasoning += d.reasoning
         calls += d.tool_calls
@@ -335,6 +370,29 @@ def test_muse_stream_routes_self_user_and_a_tool_recipient():
         ScriptTokenizer(MUSE, pieces), pieces, TOOLS, tools_enabled=False
     )
     assert not calls and content.startswith("<atem:function_calls>")
+
+
+def test_a_prompt_ending_in_an_answer_head_counts_what_the_budget_booked():
+    """A prompt that ends inside the head of the answer's label (Harmony's
+    `<|channel|>final` before `<|message|>`) is a seeded block to the
+    budget: it counts what follows up to the end marker, and usage reports
+    that count - the assembler routes the text as the answer all the same."""
+    tok = ScriptTokenizer(
+        HARMONY, ["<|channel|>", "final", "<|message|>", "Hello", "<|end|>"]
+    )
+    prompt = tok.ids(["<|channel|>", "final"])
+    assert initial_state(tok, prompt) == ("label", "<|channel|>final")
+    assert limits_for(tok, prompt).seeded is True
+    content, reasoning, _, asm = run(
+        tok, ["<|message|>", "Hello", "<|end|>"], prompt=prompt
+    )
+    assert content == "Hello" and reasoning == ""
+    tracker = ThinkingBudget(limits_for(tok, prompt))
+    for t in tok.ids(["<|message|>", "Hello", "<|end|>"]) + [tok.eos]:
+        tracker.observe(t, None)
+    # `<|message|>` and `Hello`; the end marker leaves the block uncounted.
+    assert tracker.reasoning_tokens == 2
+    assert asm.reasoning_tokens == 2
 
 
 def test_parsers_refuse_what_is_not_a_call():

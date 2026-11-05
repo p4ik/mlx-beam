@@ -902,12 +902,15 @@ class Engine:
             thinking = self._budgets.get(r.uid)
             if thinking is None:
                 continue
+            before = thinking.reasoning_tokens
             thinking.observe(r.token, r.finish_reason)
             self._observed.setdefault(r.uid, collections.deque()).append(
                 (
                     thinking.last_forced,
                     thinking.thinking_truncated,
                     thinking.in_reasoning,
+                    thinking.last_suppressed,
+                    thinking.reasoning_tokens - before,
                 )
             )
 
@@ -1157,8 +1160,8 @@ class Engine:
                     # The budget saw this token in _on_step, before the step
                     # after it ran; what it said then is this token's.
                     seen = self._observed.get(r.uid)
-                    forced, truncated, in_reasoning = (
-                        seen.popleft() if seen else (False, False, False)
+                    forced, truncated, in_reasoning, suppressed, counted = (
+                        seen.popleft() if seen else (False, False, False, False, 0)
                     )
                     cut = r.finish_reason == "length"
                     s.put(
@@ -1174,6 +1177,8 @@ class Engine:
                             thinking_truncated=truncated,
                             response_truncated=cut and not in_reasoning,
                             forced=forced,
+                            suppressed=suppressed,
+                            reasoning_counted=counted,
                         )
                     )
                     if r.finish_reason is not None:

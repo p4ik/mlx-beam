@@ -208,6 +208,14 @@ def make_state_machine(tokenizer, stop_words, tools: bool = True) -> TextStateMa
                 transitions.setdefault("normal", []).append((opener, "label"))
         transitions["label"] = [(tokenizer.think_end, "normal")]
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+        structural = getattr(tokenizer, "structural_markers", None) or ()
+        if (
+            tokenizer.think_start.startswith("<")
+            and tokenizer.think_end not in structural
+        ):
+            # A stray end marker in the answer (a channel the budget left
+            # without its opener) is cut like a structural marker, never shown.
+            transitions.setdefault("normal", []).append((tokenizer.think_end, "normal"))
     elif thinking:
         transitions.setdefault("normal", []).append(
             (tokenizer.think_start, "reasoning")
@@ -439,8 +447,8 @@ class TextAssembler:
         # the text where it was, structural ones included.
         self._raw = raw
         self._detok = tokenizer.detokenizer
-        # The automaton always runs, so reasoning is counted in every mode;
-        # routing off puts the markers back into the text where they were cut.
+        # The automaton always runs, whatever the routing; routing off puts
+        # the markers back into the text where they were cut.
         self._sm = make_state_machine(tokenizer, stop_words, tools=tools_enabled)
         start, seeded = initial_state(tokenizer, prompt_tokens)
         self._state = self._sm.make_state(start)
@@ -449,10 +457,8 @@ class TextAssembler:
         self._think_start = getattr(tokenizer, "think_start", None) or ""
         self._think_end = getattr(tokenizer, "think_end", None) or ""
         self._label_end = getattr(tokenizer, "think_label_end", None) or ""
-        # The opener's label so far, until its line end shows up, and how
-        # many tokens it took (they count as reasoning only if it opens one).
+        # The opener's label so far, until its line end shows up.
         self._label = seeded[len(self._think_start) :] if start == "label" else ""
-        self._label_tokens = 0
         # A think block the template opened: with routing off the client
         # sees its opener once, up front - not for a raw prompt the client
         # wrote itself (completions), where the opener is already theirs.
@@ -494,6 +500,7 @@ class TextAssembler:
         self._stop_words = sorted(stop_words or [], key=len, reverse=True)
         self._tail = ""
         self._pieces: list = []
+        # What the budget booked, summed over the events: the one count.
         self.reasoning_tokens = 0
         # From the engine's last event: which limit cut what.
         self.thinking_truncated = False
@@ -504,9 +511,11 @@ class TextAssembler:
         if self.stopped:
             return TextDelta()
         self.tokens += 1
+        self.reasoning_tokens += event.reasoning_counted
         self.thinking_truncated |= event.thinking_truncated
         self.response_truncated |= event.response_truncated
         delta = TextDelta()
+        booked = len(self.pending_events)
 
         if event.finish_reason == "stop":
             # An eos token is never shown. The last token of a stop
@@ -596,11 +605,10 @@ class TextAssembler:
             self._flush_tools(delta)
             if self._made_tool_call:
                 delta.finish_reason = "tool_calls"
-            return delta
+            return self._hide(event, delta, booked)
         if current == "label":
             # The label is the opener's, not text; with routing off the
             # client gets the block as the model wrote it, label included.
-            self.reasoning_tokens += 1
             shown = ""
             if not self._route:
                 # With routing off the block goes out as the model wrote
@@ -611,12 +619,10 @@ class TextAssembler:
                 delta.content = shown
             if self._prev != "label":
                 self._label = ""
-                self._label_tokens = 0
                 # Which opener it was (the segment carried it): a call that
                 # does not parse is handed back behind the same one.
                 openers = getattr(self._tokenizer, "think_openers", None) or ()
                 self._label_opener = next((o for o in openers if o in segment), None)
-            self._label_tokens += 1
             label = self._label
             rest = self._after_label(clean)
             parts = [("label", clean)]
@@ -636,18 +642,13 @@ class TextAssembler:
                     if self._route:
                         delta.reasoning = rest
                 elif target == "tool":
-                    self.reasoning_tokens -= self._label_tokens
                     self._tool_text = label + self._label_end + rest
                     self._tool_opener = self._label_opener
                     if shown:
                         delta.content = delta.content[: -len(shown)]
-                else:
-                    # The label opened the answer: its tokens were no reasoning.
-                    self.reasoning_tokens -= self._label_tokens
-                    if not shown:  # with routing off `clean` already holds it
-                        delta.content += rest
+                elif not shown:  # the label opened the answer; with routing
+                    delta.content += rest  # off `clean` already holds it
         elif current == "reasoning":
-            self.reasoning_tokens += 1
             entered = self._prev not in ("reasoning", "label")
             head = before if entered and markers else ""
             body = after if entered and markers else clean
@@ -736,6 +737,19 @@ class TextAssembler:
             # Only calls that really parsed make this a tool-call turn; a
             # cut-off one keeps the engine's reason and its text.
             delta.finish_reason = "tool_calls"
+        return self._hide(event, delta, booked)
+
+    def _hide(self, event: TokenEvent, delta: TextDelta, booked: int) -> TextDelta:
+        """With routing on, a block the budget closed at once shows nothing:
+        the event's text is dropped - its opener, label, forced close and
+        tail would be reasoning or answer text - and what this call booked
+        is no content (logprobs.content follows the message content).
+        Routing off keeps the block, as the model wrote it."""
+        if event.suppressed and self._route:
+            delta.content = delta.reasoning = ""
+            self.pending_events[booked:] = [
+                (e, False) for e, _ in self.pending_events[booked:]
+            ]
         return delta
 
     def _flush_tools(self, delta: TextDelta) -> None:

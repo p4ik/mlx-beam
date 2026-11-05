@@ -204,6 +204,14 @@ class TokenEvent:
     # The budget put this token there, not the model: part of a forced
     # close, up to and including the end marker.
     forced: bool = False
+    # The budget closed this block at once (opener, head and close): its
+    # tokens count nothing, and with routing on none of their text is
+    # shown. For a family whose head decides the flag starts at the head's end.
+    suppressed: bool = False
+    # What the budget booked as reasoning at this token: one inside a
+    # block, the whole head at a label's end, nothing for a suppressed
+    # block or outside one. usage.reasoning_tokens is the sum over the stream.
+    reasoning_counted: int = 0
 
 
 @dataclass(frozen=True)

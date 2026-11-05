@@ -98,6 +98,7 @@ class ChannelStubTokenizer(StubTokenizer):
     """Gemma 4's family: the marker opens a channel, a label up to the line
     end names it, and the label may come as either of two tokens."""
 
+    think_family = "channel"
     think_start = "<|channel>"
     think_end = "<channel|>"
     think_label_end = "\n"

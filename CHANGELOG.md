@@ -11,6 +11,18 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   token outside the target's top-k at every position the verify compares)
   instead of assuming token 0, and counts acceptances from after the
   warm-up.
+- `usage.reasoning_tokens` (`completion_tokens_details` on chat completions,
+  `output_tokens_details` on responses) is what the reasoning budget
+  counted, carried per token from the engine; the text assembler no longer
+  keeps a count of its own. Four cases change: a labelled head the stream
+  leaves before its end (Harmony's channel) counts nothing where it counted
+  its tokens; a stop word that ends the stream inside a think block counts
+  its last token; a prompt that ends inside the head of a label that opens
+  the answer or a tool call (Harmony's `<|channel|>final` before
+  `<|message|>`) counts what follows up to the end marker, as the budget
+  does; and a tool call written inside a think block counts, with the text
+  after it, up to the block's end marker. The raw completions endpoint runs
+  no budget and reports 0.
 
 ### Fixed
 - Messages: a user message with a text, image or thinking block before a
@@ -27,6 +39,15 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   type, and a refusal names the part that is missing. A dense Qwen3-VL
   checkpoint whose vision config carries transformers' type name
   `qwen3_vl_vision` was refused the same way and is accepted now.
+- Gemma 4: with a reasoning budget of 0 the opener `<|channel>` was masked,
+  and a model that opened a channel anyway wrote its head without the
+  opener - `thought`, a line break and `<channel|>`, or `<channel|>` alone -
+  as answer text (since 0.1.0a1). For this family the budget now lets the
+  opener through and closes the block at once, every time; such a block is
+  no reasoning: `usage.reasoning_tokens` stays 0 and nothing of it reaches
+  the answer. A stray end marker in the answer is cut like the structural
+  markers of the other labelled families. The raw completions endpoint
+  keeps what was cut.
 
 ## [0.1.0a11] - 2026-10-11
 
