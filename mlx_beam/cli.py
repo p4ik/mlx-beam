@@ -669,8 +669,35 @@ def cache_identity(model_path: Path, frontend, proposer) -> dict:
             "settings": _settings_digest(frontend),
         }
     if proposer is not None:
-        identity["head_digest"] = proposer.describe().get("digest")
+        identity["head_digest"] = _head_digest(model_path, proposer.describe())
     return identity
+
+
+def _head_digest(model_path: Path, info: dict) -> str | None:
+    """What a draft head's sidecar must match: the head's files by path,
+    size and mtime - the weights' measure, no reading - the package
+    manifest's SHA-256 when it names one, and the quantization the loader
+    gave them. None for a proposer without files of its own."""
+    from mlx_beam.package import part, read_manifest
+
+    files = info.get("files")
+    if not files:
+        return None
+    stats = []
+    for name in files:
+        st = (model_path / name).stat()
+        stats.append([name, st.st_size, st.st_mtime_ns])
+    mtp = part(read_manifest(model_path), "mtp") or {}
+    parts = {
+        "files": stats,
+        "sha256": mtp.get("sha256"),
+        "form": info.get("form"),
+        "bits": info.get("bits"),
+        "group_size": info.get("group_size"),
+        "norms_shifted": info.get("norms_shifted"),
+    }
+    canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def proposer_from_args(args, model, model_path: Path, log):

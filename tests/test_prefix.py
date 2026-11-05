@@ -693,14 +693,14 @@ def test_entries_are_saved_system_first_then_newest(tmp_path, monkeypatch):
     ]
     assert [k for k, _ in store.entries()] == [[1, 2, 3], [7, 8, 9], [1, 2, 3, 4, 5]]
     clock = fake_clock(monkeypatch)
-    real = persist.write_entry
+    real = persist.write_tensors
 
     def slow(*args, **kwargs):
         n = real(*args, **kwargs)
         clock.now += 5.0
         return n
 
-    monkeypatch.setattr(persist, "write_entry", slow)
+    monkeypatch.setattr(persist, "write_tensors", slow)
     report = persist.save_store(
         store, str(tmp_path), "ns", {}, 1.0, 10**12, logging.getLogger("t")
     )

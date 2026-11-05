@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import stat
 import subprocess
@@ -530,6 +531,41 @@ def test_the_model_identity_covers_shards_in_subfolders(tmp_path):
     assert first["model"]["snapshot"] is None and first["model"]["kv_config"] is None
     assert first["vision"] is None and first["head_digest"] is None
     assert first["engine"] and first["mlx"]
+
+
+@pytest.mark.parametrize("layout", ["beam", "shards"])
+def test_the_head_digest_follows_the_files_without_reading_them(
+    tmp_path, layout, monkeypatch
+):
+    """With a directory the identity names the draft head's files by path,
+    size and mtime, as it names the weights, plus the manifest's SHA-256
+    when it has one: a touch on a head file changes the digest, and nothing
+    hashes the file for it."""
+    import mlx_beam.package as package
+    from mlx_beam.cli import cache_identity
+    from mlx_beam.engine.proposer import load_bundled_head
+    from tests.test_speculative import synthetic_head_checkpoint, tiny_qwen35
+
+    model = tiny_qwen35()
+    path = synthetic_head_checkpoint(tmp_path, model, layout)
+    _, info = load_bundled_head(model, path)
+    proposer = SimpleNamespace(describe=lambda: info)
+    hashed = []
+    original = package.sha256_of
+
+    def counting(file):
+        hashed.append(Path(file).name)
+        return original(file)
+
+    monkeypatch.setattr(package, "sha256_of", counting)
+    first = cache_identity(path, None, proposer)
+    assert first["head_digest"]
+    head_file = path / info["files"][0]
+    assert head_file.name not in hashed
+    st = head_file.stat()
+    os.utime(head_file, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    second = cache_identity(path, None, proposer)
+    assert second["head_digest"] != first["head_digest"]
 
 
 def test_the_vision_identity_names_the_processor_settings(monkeypatch, tmp_path):

@@ -12,7 +12,6 @@ the draft then agrees with the target exactly when both argmaxes agree.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -31,7 +30,7 @@ from mlx_beam._vendor.mlx_lm.models.rope_utils import (
     SuScaledRoPE,
     YarnRoPE,
 )
-from mlx_beam.package import part, read_manifest, sha256_of, verify_part_file
+from mlx_beam.package import part, read_manifest, verify_part_file
 
 logger = logging.getLogger("beam.proposer")
 
@@ -444,23 +443,6 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[nn.Module, dict]:
     if not packed:
         nn.quantize(head, class_predicate=_quant_predicate(bits, group_size))
     mx.eval(head.parameters())
-    verified = bool(manifest.get("file")) and bool(manifest.get("sha256"))
-    # What the head's history in a store entry depends on: the files and
-    # the quantization the loader gave them.
-    digest = hashlib.sha256(
-        json.dumps(
-            {
-                "files": (
-                    [manifest["sha256"]] if verified else [sha256_of(f) for f in files]
-                ),
-                "form": form,
-                "bits": bits,
-                "group_size": group_size,
-                "norms_shifted": shifted,
-            },
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
     return head, {
         "kind": "mtp",
         "form": form,
@@ -477,8 +459,7 @@ def load_bundled_head(model: Any, model_path: Path) -> tuple[nn.Module, dict]:
         # file was hashed against the manifest (bundled_head_files refuses a
         # part without a file, so a hash there was always checked).
         "manifest": bool(manifest),
-        "verified": verified,
-        "digest": digest,
+        "verified": bool(manifest.get("file")) and bool(manifest.get("sha256")),
     }
 
 

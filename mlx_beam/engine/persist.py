@@ -270,7 +270,7 @@ def tensor_specs(arrays: dict[str, mx.array]) -> dict:
     return {n: {"shape": list(a.shape), "dtype": _dtype(a)} for n, a in arrays.items()}
 
 
-def _write(path: str, arrays: dict, metadata: dict) -> int:
+def write_tensors(path: str, arrays: dict, metadata: dict) -> int:
     """Through a temporary name with the pid, fsync, then into place."""
     directory, name = os.path.split(path)
     stem = name[: -len(".safetensors")] if name.endswith(".safetensors") else name
@@ -297,7 +297,7 @@ def write_entry(
 ) -> int:
     """Write the entry to `path` (never a name a manifest holds); the size."""
     arrays, metadata = entry_to_tensors(key, entry, head_digest, vision)
-    return _write(path, arrays, metadata)
+    return write_tensors(path, arrays, metadata)
 
 
 def read_entry(path: str, expected: dict) -> tuple[list[int], Entry]:
@@ -638,7 +638,7 @@ def save_store(
             continue
         name = f"{key_sha(key)}.{gen}.safetensors"
         arrays, metadata = entry_to_tensors(key, entry, head_digest, vision)
-        size = write_entry(os.path.join(ns_dir, name), key, entry, head_digest, vision)
+        size = write_tensors(os.path.join(ns_dir, name), arrays, metadata)
         entry.file = name
         records[id(entry)] = {
             "file": name,

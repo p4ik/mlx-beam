@@ -1236,7 +1236,7 @@ def test_the_sweep_keeps_the_save_deadline(tmp_path, monkeypatch, caplog):
     real_save, real_sweep, real_write = (
         persist.save_store,
         persist.sweep,
-        persist.write_entry,
+        persist.write_tensors,
     )
 
     def save(*args, **kwargs):
@@ -1254,7 +1254,7 @@ def test_the_sweep_keeps_the_save_deadline(tmp_path, monkeypatch, caplog):
 
     monkeypatch.setattr(persist, "save_store", save)
     monkeypatch.setattr(persist, "sweep", sweep)
-    monkeypatch.setattr(persist, "write_entry", write)
+    monkeypatch.setattr(persist, "write_tensors", write)
     a = persistent_engine(model, tmp_path, prompt_cache_save_seconds=0.5)
     with a:
         wait_loaded(a)
@@ -1340,13 +1340,13 @@ def test_an_unchanged_store_is_not_rewritten_on_stop(tmp_path, monkeypatch):
     before = manifest(ns)
     assert len(before["entries"]) == 2
     writes = []
-    real = persist.write_entry
+    real = persist.write_tensors
 
     def counting(*args, **kwargs):
         writes.append(args[0])
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(persist, "write_entry", counting)
+    monkeypatch.setattr(persist, "write_tensors", counting)
     with persistent_engine(model, tmp_path) as b:
         wait_loaded(b)
     assert writes == []
