@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import queue
+import struct
 import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -142,7 +144,7 @@ class GenerationRequest:
                     "in one call"
                 )
 
-    @property
+    @cached_property
     def cache_key(self) -> list[int]:
         """What the prefix store keys on: the tokens, with every image
         span's positions replaced by ids derived from the image's digest -
@@ -153,7 +155,8 @@ class GenerationRequest:
         images share a key only if every one of those hashes collides, not
         when one slice of the digest does. Every token rotated at other
         than its index - an image's grid, the text after it - is keyed on
-        its positions as well (`keyed`)."""
+        its positions as well (`keyed`). Computed once and held: admission
+        and the store read the same list, so it is never changed."""
         key = list(self.tokens)
         for span in self.spans:
             digest = bytes.fromhex(span.digest) if span.digest else b""
@@ -183,10 +186,13 @@ def keyed(base: int, index: int, pos: tuple[int, int, int]) -> int:
     the text after an image, an image's own grid, positions a library
     caller set - has another key. One rule for the prompt, an image span
     and a generated continuation, or the store's key and the lookup's
-    part ways. `hash` is stable within a process, where the store lives."""
+    part ways. A fixed hash, not `hash()`: the key goes to disk with the
+    entry and must read the same in every process and version."""
     if pos == (index, index, index):
         return base
-    return -1 - (hash((base, *pos)) % (2**31))
+    packed = struct.pack("<qqqq", base, *pos)
+    h = hashlib.blake2b(packed, digest_size=4).digest()
+    return -1 - (int.from_bytes(h, "little") % (2**31))
 
 
 @dataclass(frozen=True)

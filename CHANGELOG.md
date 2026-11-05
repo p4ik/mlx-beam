@@ -6,6 +6,23 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
 
 ## [Unreleased]
 
+### Added
+- The prompt cache can outlive a restart: with `--prompt-cache-dir` the
+  engine writes its store on a clean stop (within
+  `--prompt-cache-save-seconds`, system entries first, then conversations
+  newest first) and reads it back once it is ready. An entry is taken only
+  for the same model files, KV layout, format, MLX version and mlx-beam
+  version (an image entry also needs the same vision packages and
+  processor settings); anything partial, damaged or from another
+  configuration is a miss and is removed. A second process on the same
+  configuration is refused at start. The directory is capped by
+  `--prompt-cache-disk-bytes` (default 100 GB): when a save would exceed
+  it, whole caches of other configurations go, the least recently saved
+  first, never one another process holds.
+  `/health.prompt_cache.persistent` reports what was loaded, saved,
+  skipped and evicted. The key of a token rotated at other positions
+  (after an image) is now a fixed hash, the same in every process.
+
 ## [0.1.0a12] - 2026-11-05
 
 ### Changed

@@ -1,8 +1,11 @@
 """The `beam` command line."""
 
 import argparse
+import hashlib
 import json
+import os
 import platform
+import stat
 import sys
 from pathlib import Path
 
@@ -302,6 +305,29 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         help="RAM budget in bytes for the stored prefixes (default: unlimited); "
         "the store's own limit, separate from the caches of running requests",
     )
+    cache.add_argument(
+        "--prompt-cache-dir",
+        metavar="DIR",
+        help="directory the store is written to on a clean stop and read back "
+        "from after start, one folder per model revision and KV layout "
+        "(default: none; the store lives in RAM only)",
+    )
+    cache.add_argument(
+        "--prompt-cache-save-seconds",
+        type=_non_negative_float,
+        metavar="SECONDS",
+        default=8.0,
+        help="time budget for writing the store on a stop; system entries go "
+        "first, then conversations newest first, the rest is dropped",
+    )
+    cache.add_argument(
+        "--prompt-cache-disk-bytes",
+        type=_positive_int,
+        default=100 * 1024**3,
+        help="cap on the whole --prompt-cache-dir across model revisions and "
+        "layouts: when a save would exceed it, other folders go, the least "
+        "recently saved first, never one another process holds",
+    )
     p.add_argument(
         "--trust-remote-code",
         action="store_true",
@@ -352,6 +378,16 @@ def _positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from None
     if x < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return x
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        x = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if x < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
     return x
 
 
@@ -501,6 +537,169 @@ def policy_with_package_prefill(policy, args, model_path: Path, log):
     return replace(policy, prefill=mode, prefill_source="manifest")
 
 
+def prepare_prompt_cache_dir(path: str) -> Path:
+    """The directory --prompt-cache-dir names, created with mode 0700; one
+    that exists must be ours and private, or the server does not start:
+    the cache is the conversations in another form."""
+    directory = Path(path)
+    if not directory.exists():
+        directory.mkdir(parents=True, mode=0o700)
+        directory.chmod(0o700)
+        return directory
+    if not directory.is_dir():
+        raise StartupError(f"--prompt-cache-dir {path}: not a directory")
+    st = directory.stat()
+    if st.st_uid != os.getuid():
+        raise StartupError(
+            f"--prompt-cache-dir {path}: owned by uid {st.st_uid}, the server runs "
+            f"as uid {os.getuid()}"
+        )
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        raise StartupError(
+            f"--prompt-cache-dir {path}: mode {mode:04o} lets others in; make it 0700"
+        )
+    return directory
+
+
+# The packages that compute an image's features; each may change what the
+# same picture becomes without the frontend package changing.
+VISION_LIBRARIES = ("transformers", "torch", "torchvision", "pillow", "mistral-common")
+
+
+def _named_version(package: str, version) -> str:
+    if not version or version == "0.0.0+unknown":
+        raise StartupError(
+            f"{package} names no version ({version!r}); a build without one cannot "
+            "own a prompt cache namespace"
+        )
+    return version
+
+
+def _installed(name: str) -> str | None:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return None
+
+
+def _settings_digest(frontend) -> str:
+    """SHA-256 of the processor's effective image settings: the image
+    processor's `to_dict()`, or mistral-common's image config."""
+    import dataclasses
+
+    renderer = getattr(frontend, "renderer", None)
+    if renderer is not None:
+        try:
+            config = renderer.tokenizer.instruct_tokenizer.image_encoder.image_config
+        except AttributeError as e:
+            raise StartupError(
+                f"the renderer {type(renderer).__name__} names no image settings: {e}"
+            ) from None
+        settings = (
+            dataclasses.asdict(config)
+            if dataclasses.is_dataclass(config)
+            else vars(config)
+        )
+    else:
+        processor = getattr(
+            getattr(frontend, "processor", None), "image_processor", None
+        )
+        if processor is None or not hasattr(processor, "to_dict"):
+            raise StartupError(
+                "the frontend's processor names no image settings "
+                "(no image_processor.to_dict)"
+            )
+        settings = processor.to_dict()
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def cache_identity(model_path: Path, frontend, proposer) -> dict:
+    """What a stored entry must match beyond its tokens: the model's files
+    (hashed config and index, every weight file by path, size and mtime -
+    no reading), the mlx and mlx-beam versions, the vision frontend's
+    preprocessing and the draft head's digest."""
+    import importlib
+
+    import mlx.core as mx
+
+    from mlx_beam.package import sha256_of
+
+    def digest(name: str) -> str | None:
+        file = model_path / name
+        return sha256_of(file) if file.is_file() else None
+
+    weights = []
+    for file in sorted(model_path.rglob("*.safetensors")):
+        st = file.stat()
+        weights.append(
+            [file.relative_to(model_path).as_posix(), st.st_size, st.st_mtime_ns]
+        )
+    # A Hugging Face snapshot carries its commit in the path; a local path
+    # has none, its files tell.
+    snapshot = model_path.name if model_path.parent.name == "snapshots" else None
+    identity = {
+        "model": {
+            "snapshot": snapshot,
+            "config": digest("config.json"),
+            "index": digest("model.safetensors.index.json"),
+            "kv_config": digest("kv_config.json"),
+            "weights": weights,
+        },
+        "mlx": mx.__version__,
+        "engine": _named_version("mlx-beam", __version__),
+        "vision": None,
+        "head_digest": None,
+    }
+    if frontend is not None:
+        described = frontend.describe()
+        top = type(frontend).__module__.partition(".")[0]
+        package = getattr(importlib.import_module(top), "__version__", None)
+        identity["vision"] = {
+            "provider": described.get("provider"),
+            "family": described.get("family"),
+            "processor": described.get("processor"),
+            "preprocessor_config": digest("preprocessor_config.json"),
+            "processor_config": digest("processor_config.json"),
+            "package": _named_version(top, package),
+            "libraries": {name: _installed(name) for name in VISION_LIBRARIES},
+            "settings": _settings_digest(frontend),
+        }
+    if proposer is not None:
+        identity["head_digest"] = _head_digest(model_path, proposer.describe())
+    return identity
+
+
+def _head_digest(model_path: Path, info: dict) -> str | None:
+    """What a draft head's sidecar must match: the head's files by path,
+    size and mtime - the weights' measure, no reading - the package
+    manifest's SHA-256 when it names one, and the quantization the loader
+    gave them. None for a proposer without files of its own."""
+    from mlx_beam.package import part, read_manifest
+
+    files = info.get("files")
+    if not files:
+        return None
+    stats = []
+    for name in files:
+        st = (model_path / name).stat()
+        stats.append([name, st.st_size, st.st_mtime_ns])
+    mtp = part(read_manifest(model_path), "mtp") or {}
+    parts = {
+        "files": stats,
+        "sha256": mtp.get("sha256"),
+        "form": info.get("form"),
+        "bits": info.get("bits"),
+        "group_size": info.get("group_size"),
+        "norms_shifted": info.get("norms_shifted"),
+    }
+    canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def proposer_from_args(args, model, model_path: Path, log):
     """The proposer `--draft-model` names, or None. A checkpoint that ships
     a head but was started without the flag gets a hint, not a default."""
@@ -599,6 +798,8 @@ def serve(args) -> int:
         )
         check_allowed_origins(args.allowed_origins)
         probe_port(args.host, args.port)
+        if args.prompt_cache_dir:
+            prepare_prompt_cache_dir(args.prompt_cache_dir)
     except (StartupError, ValueError, OSError) as e:
         log.error("%s", e)
         return 3
@@ -664,6 +865,26 @@ def serve(args) -> int:
         # The model's generation_config.json holds a value out of range.
         log.error("request defaults: %s", e)
         return 3
+    # A separate package may serve this checkpoint's images (entry point
+    # group mlx_beam.modalities); without one the core is text only. Loaded
+    # before the engine: the store's identity names the frontend.
+    frontend, vision_refused = modalities.load_frontend(
+        model,
+        model_path,
+        json.loads((model_path / "config.json").read_text()),
+        tokenizer,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if frontend is not None and template_source in ("flag", "default"):
+        # The flag's template renders image requests too, not only text.
+        frontend.chat_template = tokenizer.chat_template
+    identity = None
+    if args.prompt_cache_dir:
+        try:
+            identity = cache_identity(model_path, frontend, proposer)
+        except (StartupError, OSError) as e:
+            log.error("--prompt-cache-dir %s: %s", args.prompt_cache_dir, e)
+            return 3
     engine = Engine(
         model,
         model_key=args.model,
@@ -681,6 +902,10 @@ def serve(args) -> int:
         proposer=proposer,
         exact_verify=args.exact_verify,
         max_draft_tokens=args.max_draft_tokens,
+        prompt_cache_dir=args.prompt_cache_dir or None,
+        prompt_cache_save_seconds=args.prompt_cache_save_seconds,
+        prompt_cache_disk_bytes=args.prompt_cache_disk_bytes,
+        cache_identity=identity,
     )
     try:
         engine.start()
@@ -689,18 +914,6 @@ def serve(args) -> int:
         return 3
     if engine.speculator is not None:
         log.info("speculative: %s", engine.speculator.describe()["proposer"])
-    # A separate package may serve this checkpoint's images (entry point
-    # group mlx_beam.modalities); without one the core is text only.
-    frontend, vision_refused = modalities.load_frontend(
-        model,
-        model_path,
-        json.loads((model_path / "config.json").read_text()),
-        tokenizer,
-        trust_remote_code=args.trust_remote_code,
-    )
-    if frontend is not None and template_source in ("flag", "default"):
-        # The flag's template renders image requests too, not only text.
-        frontend.chat_template = tokenizer.chat_template
     served = Served(
         engine,
         tokenizer,

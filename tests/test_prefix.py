@@ -4,14 +4,35 @@ The acceptance: a hybrid that resumes from a checkpoint decodes the same
 tokens as a cold run, and the store never hands out a state it cannot vouch
 for."""
 
+import logging
+
 import mlx.core as mx
+import pytest
 
 from mlx_beam._vendor.mlx_lm.models.cache import KVCache
 from mlx_beam.api import chat
-from mlx_beam.engine import Engine, GenerationRequest
-from mlx_beam.engine.prefix import PrefixStore, cut_back
+from mlx_beam.engine import Engine, GenerationRequest, KVPolicy, persist
+from mlx_beam.engine import prefix as prefix_module
+from mlx_beam.engine.persist import (
+    CorruptEntry,
+    IncompatibleEntry,
+    read_entry,
+    write_entry,
+)
+from mlx_beam.engine.prefix import HEAD, Entry, PrefixStore, cut_back, window_layers
 from tests.stub_tokenizer import THINK_END, THINK_START, StubTokenizer
-from tests.test_engine import tiny_hybrid
+from tests.test_engine import (
+    IDENTITY,
+    assert_same_entry,
+    assert_same_state,
+    fake_clock,
+    manifest,
+    the_namespace,
+    tiny_hybrid,
+    tiny_hybrid_q,
+    wait_loaded,
+)
+from tests.test_model_classes import SYSTEM, A, B, plain, tiny
 from tests.test_vendor_optiq_kv import tiny_llama
 
 
@@ -488,3 +509,201 @@ def test_a_cancelled_prefill_is_stored_under_the_positions_it_computed():
     assert hit is not None
     offsets = [c.offset for c in hit.cache]
     assert hit.covered == 4 and offsets == [4] * len(offsets), (hit.covered, offsets)
+
+
+# -- the store on disk --------------------------------------------------------
+
+
+def kv_entry(n, cache_type="assistant"):
+    """An entry of one plain layer over `n` tokens."""
+    kv = KVCache()
+    k = mx.random.normal((1, 1, n, 8))
+    v = mx.random.normal((1, 1, n, 8))
+    kv.update_and_fetch(k, v)
+    mx.eval(kv.keys, kv.values)
+    return Entry([kv], n, {}, cache_type)
+
+
+def test_an_entry_round_trips_through_the_file(tmp_path):
+    """Quantized layers as packed triples, recurrent state, a boundary
+    checkpoint and the head's sidecar: every array and scalar comes back
+    as it was written."""
+    model = tiny_hybrid_q()
+    prompt = list(range(1, 25))
+    with Engine(model, kv_policy=KVPolicy(bits=8)) as engine:
+        out, _ = run(engine, prompt, boundaries=[12])
+        entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
+    key = prompt + out
+    head = [
+        mx.full((1, 1, 3, 8), 1.5),
+        mx.full((1, 1, 3, 8), -2.0, dtype=mx.float16),
+        mx.arange(32, dtype=mx.float32)[None, None],
+    ]
+    entry.checkpoints[12][HEAD] = head
+    entry.nbytes += sum(a.nbytes for a in head)
+    assert {type(c).__name__ for c in entry.cache} == {
+        "MergeableQuantizedKVCache",
+        "ArraysCache",
+    }
+    path = tmp_path / "e.1.safetensors"
+    n = write_entry(str(path), key, entry, head_digest="head-1")
+    got_key, got = read_entry(str(path), {"bytes": n, "head_digest": "head-1"})
+    assert got_key == key
+    assert_same_entry(got, entry)
+    assert got.file == "e.1.safetensors"
+    assert n == path.stat().st_size > 0
+
+
+def test_a_damaged_or_partial_file_is_refused(tmp_path):
+    entry = kv_entry(10)
+    key = list(range(10))
+    good = tmp_path / "good.1.safetensors"
+    n = write_entry(str(good), key, entry)
+    assert n > 0
+    half = tmp_path / "half.1.safetensors"
+    half.write_bytes(good.read_bytes()[: n // 2])
+    with pytest.raises(CorruptEntry):
+        read_entry(str(half), {"bytes": n // 2})
+    with pytest.raises(CorruptEntry):
+        read_entry(str(half), {"bytes": n})
+    with pytest.raises(IncompatibleEntry):
+        read_entry(
+            str(good),
+            {"bytes": n, "tensors": {"key": {"shape": [11], "dtype": "int64"}}},
+        )
+    # A file that was never published: a .new leftover, no manifest names it.
+    ns = tmp_path / "ns"
+    ns.mkdir()
+    stray = ns / "x.1.42.new.safetensors"
+    stray.write_bytes(b"not a tensor file")
+    report = persist.load_store(
+        PrefixStore(), str(tmp_path), "ns", {}, "m", None, logging.getLogger("t")
+    )
+    assert report.partial == 1 and report.entries == 0
+    assert not stray.exists()
+
+
+def test_an_image_entry_needs_the_same_vision_identity(tmp_path):
+    entry = kv_entry(4)
+    image_key = [-5, -6, 3, 7]  # two image ids, as cache_key builds them
+    path = tmp_path / "img.1.safetensors"
+    n = write_entry(str(path), image_key, entry, vision={"package": "1.0"})
+    assert n > 0
+    with pytest.raises(IncompatibleEntry):
+        read_entry(str(path), {"vision": {"package": "2.0"}})
+    got_key, _ = read_entry(str(path), {"vision": {"package": "1.0"}})
+    assert got_key == image_key
+    text = tmp_path / "text.1.safetensors"
+    write_entry(str(text), [3, 7, 9, 11], entry, vision={"package": "1.0"})
+    got_key, _ = read_entry(str(text), {"vision": {"package": "2.0"}})
+    assert got_key == [3, 7, 9, 11]
+
+
+def counting_restore(monkeypatch):
+    restored = []
+    real = prefix_module.restore_window
+
+    def counting(c, snap):
+        restored.append(snap)
+        real(c, snap)
+
+    monkeypatch.setattr(prefix_module, "restore_window", counting)
+    return restored
+
+
+@pytest.mark.exactness
+@pytest.mark.parametrize(
+    "name, policy",
+    [
+        ("muse_glimmer", None),
+        ("muse_glimmer", KVPolicy(bits=8, group_size=32)),
+        ("gpt_oss", None),
+    ],
+)
+def test_a_rotated_window_round_trips_with_its_checkpoint(
+    tmp_path, monkeypatch, name, policy
+):
+    """A sliding layer that rotated before the boundary: the file carries
+    the ring and its scalars, the boundary snapshot restores after the
+    restart, and the continuation is the warm engine's."""
+    model = tiny(name)
+    n = len(SYSTEM)
+    kw = {} if policy is None else {"kv_policy": policy}
+    with Engine(model, **kw) as ref:
+        run(ref, SYSTEM + A, boundaries=[n])
+        tokens_r, cached_r = run(ref, SYSTEM + B, boundaries=[n])
+    assert cached_r == n
+    a = Engine(model, prompt_cache_dir=str(tmp_path), cache_identity=IDENTITY, **kw)
+    with a:
+        wait_loaded(a)
+        out_a, _ = run(a, SYSTEM + A, boundaries=[n])
+        kept = a.prefix_store._trie.get(a.model_key, SYSTEM + A + out_a)
+    windows = window_layers(kept.cache)
+    assert windows and all(not kept.cache[i].is_trimmable() for i in windows)
+    ns = the_namespace(tmp_path)
+    (rec,) = manifest(ns)["entries"]
+    got_key, got = read_entry(str(ns / rec["file"]), rec)
+    assert got_key == SYSTEM + A + out_a
+    assert_same_entry(got, kept)
+    for i in windows:
+        assert_same_state(got.checkpoints[n][i], kept.checkpoints[n][i])
+    restored = counting_restore(monkeypatch)
+    b = Engine(model, prompt_cache_dir=str(tmp_path), cache_identity=IDENTITY, **kw)
+    with b:
+        wait_loaded(b)
+        tokens_b, cached_b = run(b, SYSTEM + B, boundaries=[n])
+    assert cached_b == n == cached_r and tokens_b == tokens_r
+    assert len(restored) == len(windows)
+    for snap, i in zip(restored, windows, strict=True):
+        assert_same_state(snap, got.checkpoints[n][i])
+    if policy is None:
+        assert plain(model, SYSTEM + B, 4) == tokens_b
+
+
+@pytest.mark.parametrize("name", ["muse_glimmer", "gpt_oss"])
+def test_a_system_entry_is_taken_whole_after_a_restart(tmp_path, monkeypatch, name):
+    model = tiny(name)
+    n = len(SYSTEM)
+    with Engine(model) as ref:
+        run(ref, SYSTEM + A, boundaries=[n], system_end=n)
+        tokens_r, cached_r = run(ref, SYSTEM + B, boundaries=[n], system_end=n)
+    assert cached_r == n
+    with Engine(model, prompt_cache_dir=str(tmp_path), cache_identity=IDENTITY) as a:
+        wait_loaded(a)
+        run(a, SYSTEM + A, boundaries=[n], system_end=n)
+    assert len(manifest(the_namespace(tmp_path))["entries"]) == 2
+    restored = counting_restore(monkeypatch)
+    with Engine(model, prompt_cache_dir=str(tmp_path), cache_identity=IDENTITY) as b:
+        wait_loaded(b)
+        tokens_b, cached_b = run(b, SYSTEM + B, boundaries=[n], system_end=n)
+    assert cached_b == n and restored == [] and tokens_b == tokens_r
+
+
+def test_entries_are_saved_system_first_then_newest(tmp_path, monkeypatch):
+    """Within the budget the system entries go first, then the newest
+    conversations; what does not fit is counted, not written."""
+    store = PrefixStore()
+    store.insert("m", [1, 2, 3], kv_entry(3, "system").cache, cache_type="system")
+    store.insert("m", [1, 2, 3, 4, 5], kv_entry(5).cache)
+    store.insert("m", [7, 8, 9], kv_entry(3).cache)
+    assert [e.cache_type for _, e in store.entries()] == [
+        "system",
+        "assistant",
+        "assistant",
+    ]
+    assert [k for k, _ in store.entries()] == [[1, 2, 3], [7, 8, 9], [1, 2, 3, 4, 5]]
+    clock = fake_clock(monkeypatch)
+    real = persist.write_tensors
+
+    def slow(*args, **kwargs):
+        n = real(*args, **kwargs)
+        clock.now += 5.0
+        return n
+
+    monkeypatch.setattr(persist, "write_tensors", slow)
+    report = persist.save_store(
+        store, str(tmp_path), "ns", {}, 1.0, 10**12, logging.getLogger("t")
+    )
+    assert report.entries == 1 and report.skipped_entries == 2
+    m = manifest(tmp_path / "ns")
+    assert [(e["cache_type"], e["length"]) for e in m["entries"]] == [("system", 3)]

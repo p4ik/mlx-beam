@@ -6,6 +6,12 @@ and width axes, the text after it continues from the block's largest
 position, fewer than its token count. The engine hands the prompt's
 positions in and shifts the decode by the delta they leave."""
 
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -378,3 +384,71 @@ def test_the_hybrid_trunk_takes_the_positions_too():
         )
     assert [e.token for e in events] == expected
     np.testing.assert_allclose([e.logprob for e in events], expected_lp, atol=1e-4)
+
+
+def test_a_rotated_position_keys_the_same_in_every_process():
+    """The key of a rotated token goes to disk with the entry: a fixed hash
+    of the id and the positions, the same in every process and version."""
+    from mlx_beam.engine.request import keyed
+
+    h = hashlib.blake2b(struct.pack("<qqqq", 151655, 4, 5, 6), digest_size=4).digest()
+    expected = -1 - (int.from_bytes(h, "little") % 2**31)
+    assert expected == -699550022
+    assert keyed(151655, 3, (4, 5, 6)) == expected
+    assert keyed(151655, 3, (3, 3, 3)) == 151655
+    code = (
+        "from mlx_beam.engine.request import keyed; print(keyed(151655, 3, (4, 5, 6)))"
+    )
+    for seed in ("0", "12345"):
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert int(out.stdout) == expected
+
+
+def test_the_cache_key_is_computed_once_per_request(monkeypatch):
+    """The key is derived once and held by the request: admission and the
+    store read the same value instead of hashing every rotated position
+    twice."""
+    from mlx_beam.engine import request as request_module
+    from mlx_beam.engine.proposer import trunk
+    from mlx_beam.engine.request import ImageSpan
+
+    mx.random.seed(5)
+    model = qwen3_vl.Model(qwen3_vl.ModelArgs("qwen3_vl", VL_CONFIG))
+    mx.eval(model.parameters())
+    _, _, embed = trunk(model)
+    span = ImageSpan(2, 6, embed(mx.array(TOKENS[2:6])), "cd" * 32)
+    rotated = []
+    real = request_module.keyed
+
+    def counting(base, index, pos):
+        if index < len(TOKENS) and tuple(pos) != (index, index, index):
+            rotated.append(index)
+        return real(base, index, pos)
+
+    monkeypatch.setattr(request_module, "keyed", counting)
+    with Engine(model) as engine:
+        events = list(
+            engine.submit(
+                GenerationRequest(
+                    TOKENS,
+                    positions=mx.array(POSITIONS),
+                    rope_delta=DELTA,
+                    spans=(span,),
+                    max_tokens=3,
+                )
+            )
+        )
+    assert len(events) == 3
+    expected = sum(
+        1
+        for i, pos in enumerate(zip(*POSITIONS.tolist(), strict=True))
+        if tuple(pos) != (i, i, i)
+    )
+    assert expected == 5
+    assert len(rotated) == expected

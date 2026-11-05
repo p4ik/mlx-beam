@@ -784,6 +784,29 @@ def test_bundled_head_loads_quantized_with_shifted_norms(tmp_path, layout):
     assert mx.allclose(head.norm.weight, raw["mtp.norm.weight"] + 1.0)
 
 
+@pytest.mark.parametrize("layout", ["mtp_file", "shards"])
+def test_loading_a_bundled_head_hashes_none_of_its_files(tmp_path, layout, monkeypatch):
+    """Without a package manifest to check against, the loader reads the
+    head's files once, as weights: no start hashes a head file - in the
+    shard layout that would be a whole shard."""
+    import mlx_beam.engine.proposer as proposer_module
+    import mlx_beam.package as package
+
+    model = tiny_qwen35()
+    path = synthetic_head_checkpoint(tmp_path, model, layout)
+    hashed = []
+    original = package.sha256_of
+
+    def counting(file):
+        hashed.append(Path(file).name)
+        return original(file)
+
+    monkeypatch.setattr(package, "sha256_of", counting)
+    monkeypatch.setattr(proposer_module, "sha256_of", counting, raising=False)
+    _, info = load_bundled_head(model, path)
+    assert info["files"] and hashed == []
+
+
 def test_manifest_sets_bits_and_norm_convention_and_checks_the_hash(tmp_path):
     """The package manifest is the source for the head's quantization and
     norm convention; a head whose bytes do not match the manifest is refused."""

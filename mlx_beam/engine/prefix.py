@@ -9,7 +9,9 @@ the shared length - full-attention layers trim to any position, recurrent
 layers only to a checkpoint, and a sliding-window layer that has rotated
 past the boundary (its ring buffer overwrote the tokens a trim would need)
 only to a checkpoint as well - and prefills the rest. Plain-attention
-models need no checkpoints; every position is a boundary for them.
+models need no checkpoints; every position is a boundary for them. With
+a directory the store is written on a clean stop and read back after the
+start, entries bit for bit (`persist`).
 """
 
 from __future__ import annotations
@@ -118,6 +120,9 @@ class Entry:
     checkpoints: dict[int, dict]
     cache_type: str
     nbytes: int = 0
+    # The file an entry was read from or written to; None for one the
+    # process computed and has not written.
+    file: str | None = None
 
     def __post_init__(self):
         self.nbytes = sum(c.nbytes for c in self.cache) + sum(
@@ -266,11 +271,14 @@ class PrefixStore:
         cache: list[Any],
         checkpoints: dict[int, dict] | None = None,
         cache_type: str = "assistant",
+        file: str | None = None,
     ) -> None:
         # extract() hands out lazy slices of the batch buffers; evaluated
         # here they own their bytes and the batch can be released.
         mx.eval(*_cache_arrays(cache))
-        entry = Entry(cache, len(tokens), dict(checkpoints or {}), cache_type)
+        entry = Entry(
+            cache, len(tokens), dict(checkpoints or {}), cache_type, file=file
+        )
         prev = self._trie.add(model, tokens, entry)
         if prev is not None:
             self._forget(model, tokens, prev)
@@ -393,6 +401,13 @@ class PrefixStore:
                 return
             model, key = victim
             self._nbytes -= self._trie.pop(model, key).nbytes
+
+    def entries(self):
+        """(key, entry) in the order a save writes them: system entries,
+        then assistant entries, newest first within a type."""
+        for kind in reversed(_ORDER):
+            for model, key in reversed(self._lru[kind]):
+                yield key, self._trie.get(model, key)
 
     def describe(self) -> dict:
         s = self.stats
