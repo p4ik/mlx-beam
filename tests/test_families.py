@@ -799,3 +799,99 @@ def test_muse_opener_survives_the_trimmed_leading_space():
     content, reasoning, calls, _ = run(ScriptTokenizer(MUSE, pieces), pieces, TOOLS)
     assert reasoning == "" and content == ""
     assert calls[0]["function"]["arguments"] == '{"city": "Kiel"}'
+
+
+def test_responses_errors_name_the_responses_fields():
+    """A refused effort word or budget on Responses is reported under the
+    field of that surface, not under the chat name it is read into."""
+    from mlx_beam.api import responses
+    from mlx_beam.api.errors import ApiError
+
+    with pytest.raises(ApiError) as e:
+        responses.parse_responses_request(
+            {"input": "hi", "reasoning": {"effort": "bogus"}}, "m"
+        )
+    assert "reasoning.effort" in str(e.value)
+    assert "reasoning_effort" not in str(e.value)
+    assert e.value.param == "reasoning.effort"
+    with pytest.raises(ApiError) as e:
+        responses.parse_responses_request(
+            {"input": "hi", "reasoning": {"max_tokens": -1}}, "m"
+        )
+    assert e.value.param == "reasoning.max_tokens"
+    assert "reasoning.max_tokens must be at least 0" in str(e.value)
+
+
+def test_the_ladder_refusal_names_the_responses_field():
+    """A template that rejects every effort level: the refusal names the
+    field of the surface the word came in on."""
+    from mlx_beam.api import responses
+    from tests.test_reasoning import LevelTokenizer
+
+    tok = LevelTokenizer()
+    tok.accepted = ()
+    req = responses.parse_responses_request(
+        {"input": "hi", "reasoning": {"effort": "high"}}, "m"
+    )
+    err = _refused(tok, req.chat)
+    assert "high, xhigh, medium" in str(err)
+    assert err.param == "reasoning.effort"
+
+
+def test_an_effort_word_lifts_the_server_default_on_responses():
+    """A server default that switched thinking off and an effort word in
+    the request: the word asks for thinking, as it does on chat."""
+    from mlx_beam.api import responses
+    from mlx_beam.api.defaults import RequestDefaults
+
+    d = RequestDefaults.resolve(
+        flags={"chat_template_args": {"enable_thinking": False}}
+    )
+    req = responses.parse_responses_request(
+        {"input": "hi", "reasoning": {"effort": "low"}}, "m", d
+    )
+    assert "enable_thinking" not in req.chat.template_kwargs
+    assert initial_state(MUSE, chat.build_prompt(MUSE, req.chat)) == ("frame", "")
+
+
+def test_a_refusal_from_the_server_default_names_the_switch():
+    """Thinking off by the server's default on a model that cannot switch
+    it: the 400 says so and names the switch of the surface - the bound
+    alone runs into the same 400. A request that switched it off itself
+    gets the hint without the default."""
+    from mlx_beam.api import messages, responses
+    from mlx_beam.api.defaults import RequestDefaults
+    from tests.stub_tokenizer import StubTokenizer
+
+    class NoSwitch(StubTokenizer):
+        thinking_switch = None
+
+    d = RequestDefaults.resolve(
+        flags={"chat_template_args": {"enable_thinking": False}}
+    )
+    user = [{"role": "user", "content": "hi"}]
+    for tok in (MUSE, NoSwitch()):
+        cases = (
+            (
+                chat.parse_chat_request({"messages": user}, "m", d),
+                "enable_thinking: true",
+            ),
+            (
+                responses.parse_responses_request({"input": "hi"}, "m", d).chat,
+                "enable_thinking: true",
+            ),
+            (
+                messages.parse_messages_request(
+                    {"max_tokens": 8, "messages": user}, "m", d
+                ).chat,
+                "thinking: {type: enabled}",
+            ),
+        )
+        for req, switch in cases:
+            err = _refused(tok, req)
+            assert "server's default" in str(err)
+            assert switch in str(err)
+            assert "or bound it" not in str(err)
+    # Switched off by the request itself: no default to speak of.
+    req = chat.parse_chat_request({"messages": user, "enable_thinking": False}, "m", d)
+    assert "default" not in str(_refused(MUSE, req))

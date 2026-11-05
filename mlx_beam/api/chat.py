@@ -99,7 +99,9 @@ class ChatRequest:
     thinking_requested: bool | None = None
 
 
-def _number(body, key, default, lo=None, hi=None, kind=float):
+def _number(body, key, default, lo=None, hi=None, kind=float, name=None):
+    """`name`: the field as the surface spells it, when that is not `key`."""
+    name = name or key
     value = body.get(key, default)
     if value is None:
         return default
@@ -108,10 +110,11 @@ def _number(body, key, default, lo=None, hi=None, kind=float):
         or not isinstance(value, (int, float))
         or not math.isfinite(value)
     ):
-        raise ApiError(f"{key} must be a finite number", param=key)
+        raise ApiError(f"{name} must be a finite number", param=name)
     value = kind(value)
     if (lo is not None and value < lo) or (hi is not None and value > hi):
-        raise ApiError(f"{key} must be between {lo} and {hi}", param=key)
+        bound = f"at least {lo}" if hi is None else f"between {lo} and {hi}"
+        raise ApiError(f"{name} must be {bound}", param=name)
     return value
 
 
@@ -392,14 +395,17 @@ def parse_chat_request(
     )
 
 
-def parse_thinking(aliases: dict) -> tuple[str | None, bool | None]:
+def parse_thinking(
+    aliases: dict, field: str = "reasoning_effort"
+) -> tuple[str | None, bool | None]:
     """(effort word, enable_thinking) from the resolved aliases: an effort
-    of none switches thinking off, a word asks for it (and, in
-    parse_chat_request, lifts a server default that switched it off)."""
+    of none switches thinking off, a word asks for it (and, in the parsers,
+    lifts a server default that switched it off). A refusal of the word
+    names `field`, the surface's own."""
     thinking = aliases.get("enable_thinking")
     if "reasoning_effort" not in aliases:
         return None, thinking
-    level = normalise_effort(aliases["reasoning_effort"])
+    level = normalise_effort(aliases["reasoning_effort"], field)
     if level is None:
         return None, False if thinking is None else thinking
     return level, thinking
@@ -514,7 +520,7 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
             raise ApiError(
                 f"the chat template accepts none of the {effort_kwarg} levels "
                 f"{', '.join([level, *rungs])}: {e}",
-                param="reasoning_effort",
+                param=effort_field(req.surface),
             ) from None
     if not tokens:
         raise ApiError("the prompt is empty", param="messages")
@@ -526,7 +532,8 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     if not req.images:
         req.assistant_start = _assistant_start(render, tokens, settled)
     if kwargs.get("enable_thinking") is False:
-        no_switch(tokenizer, req.surface)
+        # Off without a word from the request: the server's default did it.
+        no_switch(tokenizer, req.surface, by_default=req.thinking_requested is None)
     opener = getattr(tokenizer, "answer_opener_tokens", None)
     if opener and kwargs.get("enable_thinking") is False and not req.tools:
         # A family whose template has no switch (Harmony): the answer is
@@ -538,49 +545,72 @@ def build_prompt(tokenizer, req: ChatRequest, frontend=None) -> list[int]:
     return tokens
 
 
-# Per surface: the hint with an effort level, the hint with the bound only,
-# and the field the refusal names. Messages has no effort field.
-_NO_SWITCH_HINTS = {
+# Per surface: the effort field (None where the surface has none), the
+# bound, the switch as a client writes it, and the field a refusal names.
+_SURFACE_FIELDS = {
     "chat": (
-        "ask for less with reasoning_effort: low or bound it with "
+        "reasoning_effort",
         "max_reasoning_tokens",
-        "bound it with max_reasoning_tokens",
+        "enable_thinking: true",
         "enable_thinking",
     ),
     "messages": (
         None,
-        "bound it with thinking: {type: enabled, budget_tokens: N} instead",
+        "thinking.budget_tokens",
+        "thinking: {type: enabled}",
         "thinking",
     ),
     "responses": (
-        "ask for less with reasoning.effort: low or bound it with "
+        "reasoning.effort",
         "reasoning.max_tokens",
-        "bound it with reasoning.max_tokens",
+        "enable_thinking: true",
         "reasoning.effort",
     ),
 }
 
 
-def no_switch(tokenizer, surface: str) -> None:
+def effort_field(surface: str) -> str:
+    """The field a refused effort word is reported under: the surface's
+    own, or the chat name where the surface has none (Messages gets a
+    word from a server default only)."""
+    effort = _SURFACE_FIELDS.get(surface, _SURFACE_FIELDS["chat"])[0]
+    return effort or "reasoning_effort"
+
+
+def no_switch(tokenizer, surface: str, by_default: bool = False) -> None:
     """A model that thinks but cannot be told not to: its template has no
     switch and the family's answer cannot be opened in the prompt either
     (Muse keeps reasoning inside a primed answer, measured). The request
     is refused rather than answered with a block in disguise; the hint
     names the surface's own fields, an effort level only where the
-    template takes a word."""
+    template takes a word. `by_default`: the server's default switched
+    thinking off, not the request - the hint names the switch, and the
+    bound as what applies once it is on (the bound alone keeps the
+    default and runs into this refusal again)."""
     if not getattr(tokenizer, "has_thinking", False) or (
         getattr(tokenizer, "thinking_switch", "template") is not None
     ):
         return
-    with_effort, bound, param = _NO_SWITCH_HINTS.get(surface, _NO_SWITCH_HINTS["chat"])
-    hint = bound
-    if with_effort and effort_capability(tokenizer).takes_words:
-        hint = with_effort
-    raise ApiError(
-        "this model cannot switch its reasoning off: the chat template "
-        f"has no switch for it; {hint}",
-        param=param,
-    )
+    effort, bound, switch, param = _SURFACE_FIELDS.get(surface, _SURFACE_FIELDS["chat"])
+    takes_words = effort is not None and effort_capability(tokenizer).takes_words
+    if by_default:
+        ways = f"switch it on with {switch}"
+        if takes_words:
+            ways += f" or ask for it with {effort}: low"
+        message = (
+            "this model cannot switch its reasoning off, and the server's "
+            f"default switches it off: {ways}; with it, {bound} bounds the "
+            "reasoning"
+        )
+    else:
+        hint = f"bound it with {bound}"
+        if takes_words:
+            hint = f"ask for less with {effort}: low or {hint}"
+        message = (
+            "this model cannot switch its reasoning off: the chat template "
+            f"has no switch for it; {hint}"
+        )
+    raise ApiError(message, param=param)
 
 
 def _assistant_start(render, tokens: list[int], extra: dict) -> int:

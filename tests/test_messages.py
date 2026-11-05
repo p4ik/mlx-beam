@@ -408,3 +408,19 @@ def test_stop_sequences_end_the_text_and_name_the_sequence():
     final = responder.complete(iter(ev), 0)
     assert final["stop_reason"] == "stop_sequence" and final["stop_sequence"] == "w11"
     assert final["content"] == [{"type": "text", "text": "w10 "}]
+
+
+def test_a_budget_below_the_floor_names_thinking_budget_tokens():
+    """The floor is reported under the field as the client wrote it, with
+    the floor itself (the parser's error; the envelope carries no param)."""
+    with pytest.raises(ApiError) as e:
+        messages.parse_messages_request(
+            {
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "w1"}],
+                "thinking": {"type": "enabled", "budget_tokens": -1},
+            },
+            "m",
+        )
+    assert "thinking.budget_tokens must be at least 0" in str(e.value)
+    assert e.value.param == "thinking.budget_tokens"

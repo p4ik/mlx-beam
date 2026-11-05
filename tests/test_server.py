@@ -822,3 +822,130 @@ def test_an_unexpected_error_is_a_500_with_a_traceback(server, monkeypatch, capl
     ]
     assert len(failed) == 2
     assert all(r.exc_info and r.exc_info[0] is RuntimeError for r in failed)
+
+
+def _responses_stream(server, body: dict) -> bytes:
+    status, ctype, raw = call(server, "POST", "/v1/responses", {**body, "stream": True})
+    assert status == 200 and ctype.startswith("text/event-stream")
+    return raw
+
+
+def _failing_after_the_first_delta(monkeypatch):
+    """The engine fails after its first token: an item is open."""
+    import mlx_beam.server as srv
+
+    def events(self, first, result, comment=True):
+        yield first
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(srv.Handler, "_events", events)
+
+
+def _refused_before_the_first_token(monkeypatch):
+    """The worker refuses the request after the 200 went out."""
+    import mlx_beam.server as srv
+    from mlx_beam.engine import ContextTooLong
+
+    def await_first(self, result, keepalive):
+        raise ContextTooLong("the prompt does not fit")
+
+    monkeypatch.setattr(srv.Handler, "_await_first", await_first)
+
+
+def test_a_responses_stream_that_fails_ends_with_response_failed(server, monkeypatch):
+    """An error after the first delta: the open item is closed, then
+    response.failed carries the partial text and the error, and the error
+    event has type and sequence_number like every other event."""
+    _failing_after_the_first_delta(monkeypatch)
+    raw = _responses_stream(server, {"input": "w1", "max_output_tokens": 4})
+    payloads = sse_payloads(raw)
+    assert "[DONE]" not in payloads  # a guard: a Responses stream never had one
+    events = [json.loads(p) for p in payloads]
+    assert [e.get("type") for e in events][-2:] == ["response.failed", "error"]
+    assert "event: response.failed" in raw.decode()
+    failed, error = events[-2]["response"], events[-1]
+    assert failed["status"] == "failed" and failed["error"]["message"]
+    assert failed["output"][0]["status"] == "incomplete"
+    assert failed["output"][0]["content"][0]["text"]
+    assert error["message"] == failed["error"]["message"]
+    assert error["code"] == failed["error"]["code"]
+    assert [e.get("sequence_number") for e in events] == list(range(1, len(events) + 1))
+
+
+def test_a_responses_stream_refused_before_its_first_token_opens_then_fails(
+    server, monkeypatch, caplog
+):
+    """The 200 is on the wire before the worker answers; a refusal then
+    still opens the lifecycle before it fails - the SDK's stream helper
+    takes nothing before response.created."""
+    import logging
+
+    _refused_before_the_first_token(monkeypatch)
+    with caplog.at_level(logging.ERROR, logger="mlx_beam.server"):
+        raw = _responses_stream(server, {"input": "w1", "max_output_tokens": 4})
+    events = [json.loads(p) for p in sse_payloads(raw)]
+    assert [e.get("type") for e in events] == [
+        "response.created",
+        "response.in_progress",
+        "response.failed",
+        "error",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
+    failed = events[2]["response"]
+    assert failed["status"] == "failed" and failed["output"] == []
+    assert failed["error"]["code"] == "context_length_exceeded"
+    assert events[3]["code"] == "context_length_exceeded"
+    assert "the prompt does not fit" in events[3]["message"]
+    # A refusal is not the server's fault: no traceback in the log.
+    assert not [r for r in caplog.records if r.name == "mlx_beam.server" and r.exc_info]
+
+
+def _through_the_sdk_stream_helper(events: list[dict]) -> list:
+    """Every payload once through the OpenAI SDK's stream helper, in order;
+    what the helper hands back per payload."""
+    from openai._models import construct_type
+    from openai._types import omit
+    from openai.lib.streaming.responses._responses import ResponseStreamState
+    from openai.types.responses import ResponseStreamEvent
+
+    state = ResponseStreamState(input_tools=omit, text_format=omit)
+    out = []
+    for payload in events:
+        try:
+            out.append(
+                state.handle_event(
+                    construct_type(type_=ResponseStreamEvent, value=payload)
+                )
+            )
+        except RuntimeError as e:
+            pytest.fail(f"the stream helper refused {payload.get('type')!r}: {e}")
+    return out
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [_failing_after_the_first_delta, _refused_before_the_first_token],
+    ids=["after the first delta", "before the first token"],
+)
+def test_a_failed_responses_stream_feeds_the_openai_stream_helper(
+    server, monkeypatch, failing
+):
+    """The server's payloads through the SDK's stream helper: it takes the
+    sequence, and hands the failed response and the error event back as
+    they are (its snapshot has no branch for either)."""
+    import importlib.metadata
+
+    print("openai", importlib.metadata.version("openai"))
+    failing(monkeypatch)
+    raw = _responses_stream(server, {"input": "w1", "max_output_tokens": 4})
+    events = [json.loads(p) for p in sse_payloads(raw)]
+    assert [e.get("type") for e in events][-2:] == ["response.failed", "error"]
+    handled = _through_the_sdk_stream_helper(events)
+    failed, error = handled[-2], handled[-1]
+    assert len(failed) == 1 and failed[0].type == "response.failed"
+    assert failed[0].response.status == "failed"
+    assert failed[0].response.error.message
+    if failing is _failing_after_the_first_delta:
+        assert failed[0].response.output[0].content[0].text
+    assert len(error) == 1 and error[0].type == "error"
+    assert error[0].message == failed[0].response.error.message

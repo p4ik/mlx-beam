@@ -66,6 +66,21 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   server `--max-reasoning-tokens 0` and ran without thinking, silently; the
   request's switch now lifts the server's 0 - a server budget above 0 stays
   the bound, and a budget in the request beats both.
+- Responses and Messages: a refused `reasoning.effort` or
+  `reasoning.max_tokens` was reported under the chat field names, Messages'
+  `thinking.budget_tokens` as `budget_tokens`; the messages and `param` now
+  name the field of the surface.
+- A value below a floor was reported as `between 0 and None` on every
+  surface; it now says `at least`.
+- Responses: an effort word now lifts a server default that switched
+  thinking off, as it does on chat completions.
+- A refusal of thinking off that comes from the server's default says so and
+  names the switch that turns it back on; an error inside a Responses
+  stream, before or after the first token, ends with `response.failed` and
+  an `error` event that carries `type` and `sequence_number` like every
+  other event, and a stream that fails before its first token still opens
+  with `response.created` and `response.in_progress`, as the OpenAI SDK's
+  stream helper expects.
 
 ## [0.1.0a11] - 2026-10-11
 
