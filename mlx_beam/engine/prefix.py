@@ -9,7 +9,9 @@ the shared length - full-attention layers trim to any position, recurrent
 layers only to a checkpoint, and a sliding-window layer that has rotated
 past the boundary (its ring buffer overwrote the tokens a trim would need)
 only to a checkpoint as well - and prefills the rest. Plain-attention
-models need no checkpoints; every position is a boundary for them.
+models need no checkpoints; every position is a boundary for them. With
+a directory the store is written on a clean stop and read back after the
+start, entries bit for bit (`persist`).
 """
 
 from __future__ import annotations

@@ -13,13 +13,14 @@ import threading
 import time
 import traceback
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from typing import Any
 
 import mlx.core as mx
 
 from mlx_beam._vendor.mlx_lm.generate import BatchGenerator, StopSequences
 from mlx_beam._vendor.mlx_lm.sample_utils import make_logits_processors
-from mlx_beam.engine import exact
+from mlx_beam.engine import exact, persist
 from mlx_beam.engine.arrays import materialize
 from mlx_beam.engine.kv import (
     KVPolicy,
@@ -281,7 +282,11 @@ class Engine:
         # the model files, the mlx and mlx-beam versions, the vision
         # frontend and the draft head; the worker derives the namespace.
         self.prompt_cache_dir = prompt_cache_dir
+        # Default 8 s: placeholder, a launcher's 20 s stop less a running
+        # prefill call and the process end; the lab run measures save_ms.
         self.prompt_cache_save_seconds = prompt_cache_save_seconds
+        # Default 100 GB: the SSD tier's design figure, placeholder until a
+        # lab run sizes a store on disk.
         self.prompt_cache_disk_bytes = prompt_cache_disk_bytes
         self.cache_identity = cache_identity
         if prompt_cache_dir is not None:
@@ -293,7 +298,11 @@ class Engine:
         self._persist: dict | None = (
             None if prompt_cache_dir is None else self._persist_zero()
         )
+        # Set once the worker has read the folder: a stop before that must
+        # not write an empty store over it.
         self._persist_loaded = False
+        self._namespace: str | None = None
+        self._namespace_parts: dict | None = None
         self._inbox: queue.Queue = queue.Queue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -678,6 +687,130 @@ class Engine:
         if self._persist is None:
             return None
         return {**self._persist, "skipped": dict(self._persist["skipped"])}
+
+    # -- the store on disk ------------------------------------------------
+
+    def _lock_namespace(self) -> int:
+        """The namespace from the identity, the policy and the layout the
+        warm-up built; held for the worker's lifetime. Before the
+        readiness, so a held namespace fails start()."""
+        parts = persist.namespace_parts(
+            self.cache_identity, self.kv_policy, self._applied_caches
+        )
+        self._namespace_parts = parts
+        self._namespace = persist.namespace(parts)
+        self._persist["namespace"] = self._namespace[:12]
+        self._persist["loading"] = True
+        return persist.lock_namespace(self.prompt_cache_dir, self._namespace)
+
+    def _note_sweep(self, sw: persist.SweepReport) -> None:
+        p = self._persist
+        p["budget_wait_ms"] += sw.waited_ms
+        p["namespaces_evicted"] += sw.evicted
+        p["namespace_bytes_evicted"] += sw.evicted_bytes
+        p["sweep_skipped_deadline"] += 1 if sw.skipped_deadline else 0
+        p["disk_bytes"] = sw.own_bytes
+        p["disk_bytes_total"] = sw.total_after
+        p["other_namespaces"] = sw.other_namespaces
+
+    def _load_persistent(self) -> None:
+        """The folder into the store, after the readiness: a request that
+        arrives meanwhile waits in the inbox. Then the sweep, with a
+        deadline of its own."""
+        p = self._persist
+        try:
+            report = persist.load_store(
+                self.prefix_store,
+                self.prompt_cache_dir,
+                self._namespace,
+                self._namespace_parts,
+                self.model_key,
+                self.cache_identity.get("head_digest"),
+                logger,
+                vision=self.cache_identity.get("vision"),
+            )
+        except Exception:  # noqa: BLE001 - counted; the engine serves cold
+            p["failures"] += 1
+            logger.exception(
+                "prompt cache: loading from %s failed", self.prompt_cache_dir
+            )
+        else:
+            p["loaded_entries"] = report.entries
+            p["loaded_bytes"] = report.bytes
+            p["load_ms"] = report.ms
+            for name in ("incompatible", "partial", "corrupt", "over_budget"):
+                p["skipped"][name] += getattr(report, name)
+            p["sidecars_dropped"] += report.sidecars_dropped
+            p["failures"] += report.failures
+            p["disk_bytes"] = report.disk_bytes
+            logger.info(
+                "prompt cache: loaded %d entries (%.1f MB) in %d ms from %s, "
+                "skipped %d/%d/%d/%d (incompatible/partial/corrupt/over budget)",
+                report.entries,
+                report.bytes / 2**20,
+                report.ms,
+                self.prompt_cache_dir,
+                report.incompatible,
+                report.partial,
+                report.corrupt,
+                report.over_budget,
+            )
+        try:
+            sw = persist.sweep(
+                self.prompt_cache_dir,
+                self._namespace,
+                self.prompt_cache_disk_bytes,
+                persist.monotonic() + persist.LOCK_WAIT_S,
+                logger,
+            )
+        except Exception:  # noqa: BLE001 - counted; the cap waits for the next run
+            p["failures"] += 1
+            logger.exception(
+                "prompt cache: the sweep of %s failed", self.prompt_cache_dir
+            )
+        else:
+            self._note_sweep(sw)
+        p["loading"] = False
+
+    def _save_persistent(self) -> None:
+        p = self._persist
+        try:
+            report = persist.save_store(
+                self.prefix_store,
+                self.prompt_cache_dir,
+                self._namespace,
+                self._namespace_parts,
+                self.prompt_cache_save_seconds,
+                self.prompt_cache_disk_bytes,
+                logger,
+                head_digest=self.cache_identity.get("head_digest"),
+                vision=self.cache_identity.get("vision"),
+            )
+        except Exception:  # noqa: BLE001 - counted; the old state stays published
+            p["failures"] += 1
+            logger.exception("prompt cache: saving to %s failed", self.prompt_cache_dir)
+            return
+        p["saved_entries"] = report.entries
+        p["saved_bytes"] = report.bytes
+        p["save_ms"] = report.ms
+        p["save_skipped_entries"] += report.skipped_entries
+        p["save_skipped_no_space"] += report.skipped_no_space
+        p["save_skipped_over_cap"] += report.skipped_over_cap
+        p["save_skipped_unsupported"] += report.skipped_unsupported
+        p["failures"] += report.failures
+        p["disk_bytes"] = report.disk_bytes
+        if not (report.skipped_no_space or report.skipped_over_cap):
+            p["last_save"] = datetime.now(UTC).isoformat(timespec="seconds")
+        if report.sweep is not None:
+            self._note_sweep(report.sweep)
+        logger.info(
+            "prompt cache: saved %d entries (%.1f MB) in %d ms to %s, skipped %d",
+            report.entries,
+            report.bytes / 2**20,
+            report.ms,
+            self.prompt_cache_dir,
+            report.skipped_entries + report.skipped_unsupported,
+        )
 
     # -- the worker -------------------------------------------------------
 
@@ -1157,9 +1290,16 @@ class Engine:
             **self._gen_args,
         )
         self._gen = gen
+        lock_fd = None
+        clean = False
         try:
             self._warmup(gen)
+            if self._persist is not None:
+                lock_fd = self._lock_namespace()
             self._ready.set()
+            if self._persist is not None:
+                self._load_persistent()
+                self._persist_loaded = True
             while not self._stop.is_set():
                 # Admit what is waiting; block only when there is nothing to do.
                 try:
@@ -1255,6 +1395,17 @@ class Engine:
                         self._budgets.pop(r.uid, None)
                         self._observed.pop(r.uid, None)
                         self._forget_row(r.uid)
+            clean = True
         finally:
-            gen.close()
-            self._gen = None
+            try:
+                # A worker that died writes nothing; a stop before the
+                # folder was read would publish an empty store over it.
+                if clean and self._persist_loaded:
+                    self._save_persistent()
+            finally:
+                gen.close()
+                self._gen = None
+                if lock_fd is not None:
+                    # The lock is the worker's: freed after the save, so the
+                    # namespace can be taken again in this process.
+                    persist.unlock_namespace(lock_fd)

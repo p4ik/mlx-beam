@@ -906,8 +906,8 @@ def test_the_save_respects_free_space(tmp_path, monkeypatch):
     h = persistent(engine)
     assert h["save_skipped_no_space"] == 1 and h["failures"] == 0
     assert h["saved_entries"] == 0
-    ns = the_namespace(tmp_path)
-    assert not (ns / "manifest.json").exists()
+    found = namespaces(tmp_path)
+    assert len(found) == 1 and not (found[0] / "manifest.json").exists()
     assert not engine.alive and engine.health()["error"] is None
 
 
@@ -1081,6 +1081,8 @@ def test_the_oldest_foreign_namespace_falls_under_the_cap(tmp_path, monkeypatch)
     mid = foreign_namespace(tmp_path, "f-mid", 2, {"bb.1.safetensors": 4000})
     new = foreign_namespace(tmp_path, "f-new", 3, {"cc.1.safetensors": 4000})
     before = {p: listing(p) for p in (mid, new)}
+    old_bytes = sum(size for _, size in listing(old))
+    assert old_bytes > 8000  # the two generations and the manifest
     reports, totals = [], []
     real = persist.sweep
 
@@ -1100,7 +1102,8 @@ def test_the_oldest_foreign_namespace_falls_under_the_cap(tmp_path, monkeypatch)
     assert {p: listing(p) for p in (mid, new)} == before
     assert disk_total(tmp_path) <= cap
     h = persistent(b)
-    assert h["namespaces_evicted"] == 1 and h["namespace_bytes_evicted"] == 8000
+    assert h["namespaces_evicted"] == 1
+    assert h["namespace_bytes_evicted"] == old_bytes
     assert h["other_namespaces"] == 2 and h["disk_bytes_total"] <= cap
     assert h["disk_bytes_total"] == disk_total(tmp_path)
 
@@ -1217,8 +1220,10 @@ def test_two_concurrent_saves_end_under_the_cap(tmp_path, monkeypatch):
     report = persist.sweep(
         str(shared), "none", cap, persist.monotonic() + 5, logging.getLogger("test")
     )
-    assert report.total_after <= cap and report.evicted >= 1
-    assert disk_total(shared) <= cap
+    assert report.total_after <= cap and disk_total(shared) <= cap
+    # Two states never fit: one of the runs took the other's namespace.
+    evicted = sum(persistent(e)["namespaces_evicted"] for e in engines)
+    assert evicted + report.evicted == 1
 
 
 def test_the_sweep_keeps_the_save_deadline(tmp_path, monkeypatch, caplog):

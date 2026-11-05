@@ -100,8 +100,13 @@ Off unless asked; a checkpoint that bundles a draft head says so at start.
 |---|---|---|---|
 | `--prompt-cache-size` | integer ≥ 1 | `16` | <span class="hint" tabindex="0" data-tip="stored prefixes: a number of entries, not a size in bytes">stored prefixes</span> |
 | `--prompt-cache-bytes` | integer ≥ 1 | — | <span class="hint" tabindex="0" data-tip="RAM budget in bytes for the stored prefixes (default: unlimited); the store&#x27;s own limit, separate from the caches of running requests">RAM budget in bytes for the stored prefixes</span> |
+| `--prompt-cache-dir` | `DIR` | — | <span class="hint" tabindex="0" data-tip="directory the store is written to on a clean stop and read back from after start, one folder per model revision and KV layout (default: none; the store lives in RAM only)">directory the store is written to on a clean stop and read back from after start, one folder per model revision and KV layout</span> |
+| `--prompt-cache-save-seconds` | `SECONDS` | `8.0` | <span class="hint" tabindex="0" data-tip="time budget for writing the store on a stop; system entries go first, then conversations newest first, the rest is dropped">time budget for writing the store on a stop</span> |
+| `--prompt-cache-disk-bytes` | integer ≥ 1 | `107374182400` | <span class="hint" tabindex="0" data-tip="cap on the whole --prompt-cache-dir across model revisions and layouts: when a save would exceed it, other folders go, the least recently saved first, never one another process holds">cap on the whole --prompt-cache-dir across model revisions and layouts</span> |
 
 <!-- /generated -->
+
+`--prompt-cache-dir` keeps the prompt cache across restarts: on a clean stop the engine writes its store there, one folder per model revision and KV layout with a manifest and one file per entry, and reads it back after the start. The folder grows to the size of the store in RAM (`--prompt-cache-bytes`) per configuration, and whole folders of other configurations are removed when the directory would exceed `--prompt-cache-disk-bytes`. The files hold the conversations in another form: the directory is created with mode 0700 and must stay private.
 
 ## Request: fields a call may send
 

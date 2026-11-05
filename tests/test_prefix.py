@@ -534,11 +534,13 @@ def test_an_entry_round_trips_through_the_file(tmp_path):
         out, _ = run(engine, prompt, boundaries=[12])
         entry = engine.prefix_store._trie.get(engine.model_key, prompt + out)
     key = prompt + out
-    entry.checkpoints[12][HEAD] = [
+    head = [
         mx.full((1, 1, 3, 8), 1.5),
         mx.full((1, 1, 3, 8), -2.0, dtype=mx.float16),
         mx.arange(32, dtype=mx.float32)[None, None],
     ]
+    entry.checkpoints[12][HEAD] = head
+    entry.nbytes += sum(a.nbytes for a in head)
     assert {type(c).__name__ for c in entry.cache} == {
         "MergeableQuantizedKVCache",
         "ArraysCache",
