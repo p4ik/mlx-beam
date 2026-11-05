@@ -24,6 +24,7 @@ from mlx_beam.api.chat import (
     completion_details,
     parse_sampling,
     parse_thinking,
+    requested_thinking,
 )
 from mlx_beam.api.chat import to_generation_request as chat_to_generation_request
 from mlx_beam.api.defaults import RequestDefaults
@@ -267,6 +268,7 @@ def parse_responses_request(
         template_kwargs=template_kwargs,
         images=images or [],
         surface="responses",
+        thinking_requested=requested_thinking(thinking, level),
     )
     return ResponsesRequest(
         chat=chat,

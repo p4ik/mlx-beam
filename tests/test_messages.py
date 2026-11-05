@@ -84,6 +84,7 @@ def test_request_blocks_become_messages_and_tools_map():
     assert c.model == "m" and c.max_tokens == 5 and c.stop == ["w9"]
     assert c.sampling.temperature == 0.5 and c.sampling.top_k == 5
     assert c.max_reasoning_tokens == 32 and c.template_kwargs["enable_thinking"] is True
+    assert c.thinking_requested is True
     assert [m["role"] for m in c.messages] == [
         "system",
         "user",
@@ -104,6 +105,17 @@ def test_request_blocks_become_messages_and_tools_map():
     assert c.tools[0]["function"]["parameters"] == TOOLS[0]["input_schema"]
     # cache_control and metadata are accepted and ignored: the store
     # caches at every boundary by itself, nothing is keyed on a client's id.
+    # The switch alone, without a budget, is still the request's own.
+    req = messages.parse_messages_request(
+        {
+            "max_tokens": 5,
+            "messages": [{"role": "user", "content": "w1"}],
+            "thinking": {"type": "enabled"},
+        },
+        "served",
+    )
+    assert req.chat.thinking_requested is True
+    assert req.chat.max_reasoning_tokens is None
 
 
 def test_refusals_are_explicit():

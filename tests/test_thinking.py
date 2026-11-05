@@ -5,6 +5,9 @@ from dataclasses import replace
 import mlx.core as mx
 import pytest
 
+from mlx_beam.api import chat, messages, responses
+from mlx_beam.api.defaults import RequestDefaults
+from mlx_beam.api.errors import ApiError
 from mlx_beam.api.text import TextAssembler, route_label
 from mlx_beam.engine import ContextTooLong, Engine, GenerationRequest, ReasoningLimits
 from mlx_beam.engine.thinking import ThinkingBudget, budget
@@ -26,11 +29,13 @@ from tests.stub_tokenizer import (
     SELF2,
     SELFSP,
     SP,
+    THINK_START,
     TO,
     USER,
     ChannelStubTokenizer,
     MuseStubTokenizer,
     S,
+    StubTokenizer,
 )
 from tests.test_engine import collect, tiny_hybrid
 from tests.tracked import limits_for, tracked_events
@@ -245,19 +250,15 @@ def test_prompt_cap_is_a_limit_the_request_may_only_lower():
             )
 
 
+class Seeding(StubTokenizer):
+    """Opens the block at the prompt end unless told not to, Qwen-style."""
+
+    def apply_chat_template(self, messages, enable_thinking=True, **kw):
+        ids = super().apply_chat_template(messages, **kw)
+        return ids + [THINK_START] if enable_thinking else ids
+
+
 def test_chat_budget_switches_thinking_off_or_refuses(monkeypatch):
-    from mlx_beam.api import chat
-    from mlx_beam.api.defaults import RequestDefaults
-    from mlx_beam.api.errors import ApiError
-    from tests.stub_tokenizer import THINK_START, StubTokenizer
-
-    class Seeding(StubTokenizer):
-        """Opens the block at the prompt end unless told not to, Qwen-style."""
-
-        def apply_chat_template(self, messages, enable_thinking=True, **kw):
-            ids = super().apply_chat_template(messages, **kw)
-            return ids + [THINK_START] if enable_thinking else ids
-
     class Stubborn(Seeding):
         def apply_chat_template(self, messages, **kw):
             kw.pop("enable_thinking", None)
@@ -296,6 +297,104 @@ def test_chat_budget_switches_thinking_off_or_refuses(monkeypatch):
     # 300 minus the reserve of 100 minus the close's tail (the stub's close
     # is the marker alone, so 1).
     assert gen.reasoning.max_tokens == 199
+
+
+MSGS = [{"role": "user", "content": "w1"}]
+
+
+def _served(surface, fields, defaults, max_context=2000):
+    """The parsed request and its generation request on the Seeding stub:
+    one user turn, sent in on `surface` with `fields` added."""
+    if surface == "chat":
+        req = chat.parse_chat_request({"messages": MSGS, **fields}, "m", defaults)
+    elif surface == "messages":
+        req = messages.parse_messages_request(
+            {"messages": MSGS, **fields}, "m", defaults
+        )
+    else:
+        req = responses.parse_responses_request(
+            {"input": "w1", **fields}, "m", defaults
+        )
+    api = {"chat": chat, "messages": messages, "responses": responses}[surface]
+    gen = api.to_generation_request(Seeding(), req, defaults, max_context=max_context)
+    return getattr(req, "chat", req), gen
+
+
+def test_an_explicit_switch_lifts_a_server_budget_of_zero():
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 0})
+    cases = [
+        ("chat", {"enable_thinking": True}),
+        ("chat", {"reasoning_effort": "low"}),
+        ("chat", {"chat_template_kwargs": {"enable_thinking": True}}),
+        ("messages", {"thinking": {"type": "enabled"}}),
+        ("responses", {"reasoning": {"effort": "low"}}),
+        ("responses", {"enable_thinking": True}),
+    ]
+    for surface, fields in cases:
+        req, gen = _served(surface, fields, d)
+        # A reserve of 0 leaves no room cap: nothing bounds the block.
+        assert gen.reasoning.max_tokens is None, (surface, fields)
+        # The prompt kept its opener; the template was not told to drop it.
+        assert gen.reasoning.seeded, (surface, fields)
+        assert req.template_kwargs.get("enable_thinking") is not False, (
+            surface,
+            fields,
+        )
+
+
+def test_the_effective_switch_decides():
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 0})
+    # The switch beats the effort word; chat_template_kwargs beats the alias.
+    for fields in (
+        {"reasoning_effort": "low", "enable_thinking": False},
+        {"enable_thinking": True, "chat_template_kwargs": {"enable_thinking": False}},
+    ):
+        req, gen = _served("chat", fields, d)
+        assert req.thinking_requested is False, fields
+        assert gen.reasoning.max_tokens == 0, fields
+    req, _ = _served("chat", {}, d)
+    assert req.thinking_requested is None
+    req, gen = _served("messages", {"thinking": {"type": "disabled"}}, d)
+    assert req.thinking_requested is False and gen.reasoning.max_tokens == 0
+
+
+def test_a_server_budget_above_zero_still_bounds_an_explicit_switch():
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 8192})
+    _, gen = _served(
+        "chat", {"enable_thinking": True, "max_tokens": 20000}, d, max_context=30000
+    )
+    assert gen.reasoning.max_tokens == 8192
+
+
+def test_a_budget_in_the_request_beats_the_default():
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 0})
+    _, gen = _served("chat", {"max_reasoning_tokens": 30, "enable_thinking": True}, d)
+    assert gen.reasoning.max_tokens == 30
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 8192})
+    _, gen = _served("chat", {"max_reasoning_tokens": 30}, d)
+    assert gen.reasoning.max_tokens == 30
+
+
+def test_without_a_switch_the_zero_default_stays():
+    d = RequestDefaults.resolve(flags={"max_reasoning_tokens": 0})
+    for fields in ({}, {"reasoning_effort": "none"}):
+        _, gen = _served("chat", fields, d)
+        assert gen.reasoning.max_tokens == 0 and THINK_START not in gen.tokens, fields
+
+
+def test_the_room_still_caps_an_explicit_switch():
+    # The reserve takes all the room: 0, whatever the switch says.
+    d = RequestDefaults.resolve(
+        flags={"max_reasoning_tokens": 0, "min_response_tokens": 512}
+    )
+    _, gen = _served("chat", {"enable_thinking": True, "max_tokens": 400}, d)
+    assert gen.reasoning.max_tokens == 0
+    # Room left: 400 minus the reserve of 300 minus the close's tail (1).
+    d = RequestDefaults.resolve(
+        flags={"max_reasoning_tokens": 0, "min_response_tokens": 300}
+    )
+    _, gen = _served("chat", {"enable_thinking": True, "max_tokens": 400}, d)
+    assert gen.reasoning.max_tokens == 99
 
 
 @pytest.mark.parametrize("limit", [1, 2, 3, 4, 6])

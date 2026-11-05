@@ -162,7 +162,10 @@ def add_serve_arguments(p: argparse.ArgumentParser) -> None:
         type=_count,
         help="reasoning tokens (what usage.reasoning_tokens counts) when the "
         "client sends no max_reasoning_tokens; the think block is closed by "
-        "force at the budget (default: unbounded)",
+        "force at the budget (default: unbounded); 0 switches reasoning off "
+        "for requests that do not ask for it - a request that switches "
+        "thinking on (enable_thinking, an effort word, thinking.type enabled) "
+        "is bound by its room alone",
     )
     limits.add_argument(
         "--min-response-tokens",
