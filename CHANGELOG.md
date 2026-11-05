@@ -15,14 +15,14 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   `output_tokens_details` on responses) is what the reasoning budget
   counted, carried per token from the engine; the text assembler no longer
   keeps a count of its own. Four cases change: a labelled head the stream
-  leaves before its end (Harmony's channel) counts nothing where it counted
-  its tokens; a stop word that ends the stream inside a think block counts
-  its last token; a prompt that ends inside the head of a label that opens
-  the answer or a tool call (Harmony's `<|channel|>final` before
-  `<|message|>`) counts what follows up to the end marker, as the budget
-  does; and a tool call written inside a think block counts, with the text
-  after it, up to the block's end marker. The raw completions endpoint runs
-  no budget and reports 0.
+  leaves before its end (Harmony's channel, Muse's recipient) counts nothing
+  where it counted its tokens; a stop word that ends the stream inside a
+  think block counts its last token; a prompt that ends inside the head of a
+  label that opens the answer or a tool call (Harmony's `<|channel|>final`
+  before `<|message|>`) counts what follows up to the end marker, as the
+  budget does; and a tool call written inside a think block counts, with the
+  text after it, up to the block's end marker. The raw completions endpoint
+  runs no budget and reports 0.
 
 ### Fixed
 - Messages: a user message with a text, image or thinking block before a
@@ -48,6 +48,19 @@ PEP 440 with SemVer meaning (`0.y` may break, `0.y.z` fixes).
   the answer. A stray end marker in the answer is cut like the structural
   markers of the other labelled families. The raw completions endpoint
   keeps what was cut.
+- Muse: the reasoning budget read ` to=self` anywhere in an answer as the
+  start of a think block, so an answer that wrote it (code with `to=self`)
+  was counted as reasoning and closed by force when the budget ran out;
+  `=self` was masked after every ` to`, and a recipient written as ` to`
+  `=` `self` opened a block the budget did not count (since 0.1.0a7). The
+  budget now takes the recipient only where the family puts one - right
+  after `<|start|>assistant` - in every form the vocabulary writes it,
+  routes it as the text automaton does (`self` is reasoning, `user` the
+  answer, any other name a tool), and counts what `usage.reasoning_tokens`
+  counts. A recipient that means reasoning while no block fits is no
+  longer masked: the block is closed at once at the head's end and counts
+  nothing, as a Gemma 4 channel is; a recipient that names a tool or the
+  answer is never touched.
 
 ## [0.1.0a11] - 2026-10-11
 

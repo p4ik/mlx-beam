@@ -46,6 +46,18 @@ class ReasoningLimits:
     # whose block is closed at once instead and counts nothing (Gemma 4's
     # channel, whose model writes the head without a masked opener).
     mask_opener: bool = True
+    # A family whose textual opener is the frame's (Muse's ` to=` right
+    # after `<|start|>assistant`): the frame's tokens, and whether the
+    # prompt ends with them, so the opener may be the first token.
+    frame: tuple[int, ...] = ()
+    at_frame: bool = False
+    # Whether the opener itself is a reasoning token: a marker (`<|channel|>`)
+    # is, a textual opener the assembler holds as a prefix (` to`) is not -
+    # the budget counts what usage.reasoning_tokens counts.
+    opener_counted: bool = True
+    # Frame family: whether the head written so far can still be an opener
+    # (` to` followed by `=`); None never aborts a head.
+    head_may_open: Callable[[tuple[int, ...]], bool] | None = None
 
 
 def budget(
@@ -141,7 +153,11 @@ class ThinkingBudget:
     The budget is a hard cap for single- and multi-token markers: the opener
     is masked when the remaining allowance could not hold a block, a close
     the model starts on its own is completed rather than second-guessed, and
-    a forced close disarms so a reopened block is judged afresh."""
+    a forced close disarms so a reopened block is judged afresh. A family
+    whose opener is plain text (Muse's ` to=`) reads it right after the
+    message's frame only and judges the head at its end. It counts what the
+    API's usage counts: the head after the opener, the block, the counted
+    part of the close."""
 
     def __init__(self, limits: ReasoningLimits):
         self.limits = limits
@@ -150,6 +166,10 @@ class ThinkingBudget:
         self._end = _Matcher(limits.end)
         self._label_end = _Matcher(limits.label_end)
         self._label: list[int] = []
+        # A frame family: the window in which the opener is the frame's -
+        # open at the frame, shut by the first token that is no opener.
+        self._frame = _Matcher(limits.frame)
+        self._window = limits.at_frame
         # Set while the label written so far means reasoning and its header
         # leaves no room for the free token the arming counts on (a form
         # longer than the canonical one): the step that ends the label
@@ -188,12 +208,16 @@ class ThinkingBudget:
         # Lazy scalar: the model began the close itself on the free token.
         self._closed = None
         self._close_counted = close_counted(limits)
-        # What a block costs before its first free token: the opener, and
-        # for a labelled family the label with its end - Harmony's header
-        # is three counted tokens, not one (observe books them together).
-        self._entry = 1
+        # What a block costs before its first free token: the opener when
+        # it counts, and for a labelled family the shortest head with its
+        # end - Harmony's header is three counted tokens, Muse's two, the
+        # channel's one (observe books them together).
+        self._opener_cost = 1 if limits.opener_counted else 0
+        self._entry = self._opener_cost
         if limits.labels:
             self._entry += len(limits.labels[0]) + len(limits.label_end)
+        elif limits.label_end:
+            self._entry += 1 + len(limits.label_end)
         self._one_hot: dict[int, mx.array] = {}
         # What the mask cuts to keep a block from forming: the opener's last
         # token - or, for a family whose opener is shared by every channel
@@ -331,41 +355,86 @@ class ThinkingBudget:
             # name opens no block, and its tokens count for nothing.
             self._label.append(token)
             if self._label_end.feed(token):
-                label = tuple(self._label[: -len(self.limits.label_end)])
-                fired = self._close_on_end
-                self._close_on_end = False
-                if self._means_reasoning(label):
-                    self._state = "reasoning"
-                    self._count(1 + len(self._label))
-                    if fired:
-                        # This step's logits forced the close's first token:
-                        # armed from here without a free token, the queue
-                        # goes on from its second.
-                        self._arm(free=0)
-                        self._pos = 1
-                        self._closed = mx.array(False)
-                    self._gate_opener()
-                    self._maybe_arm()
-                else:
-                    self._state = "normal"
-                self._label = []
+                self._end_head()
+            elif self._head_aborts():
+                # ` to` followed by text, not by a recipient: no head.
+                self._leave_head()
             else:
                 self._close_on_end = self._header_overruns()
+        elif self.limits.frame:
+            self._at_frame(token)
         elif self._start.feed(token):
-            if self.limits.labels:
-                self._state = "label"
-                self._label = []
-            else:
-                self._state = "reasoning"
-                if not self.limits.mask_opener and self._no_room():
-                    # The opener came through unmasked into a block the
-                    # budget has no room for: closed at once, counted nothing.
-                    self._suppressed = self.last_suppressed = True
-                self._count(1)
-                self._gate_opener()
-                self._maybe_arm()
+            self._open()
         if finish_reason == "length" and self.in_reasoning:
             self.thinking_truncated = True
+
+    def _at_frame(self, token: int) -> None:
+        """A frame family outside a block: the frame opens the window, in
+        which only the opener keeps it open; any other token is the
+        answer's text and shuts it until the next frame."""
+        if self._frame.feed(token):
+            self._window = True
+            self._start = _Matcher(self.limits.start)
+        elif self._window:
+            if self._start.feed(token):
+                self._open()
+            elif not self._start.matched:
+                self._window = False
+
+    def _open(self) -> None:
+        """The opener is complete: a labelled family reads the head next,
+        the others are inside the block from here."""
+        if self.limits.label_end:
+            self._state = "label"
+            self._label = []
+            return
+        self._state = "reasoning"
+        if not self.limits.mask_opener and self._no_room():
+            # The opener came through unmasked into a block the budget
+            # has no room for: closed at once, counted nothing.
+            self._suppressed = self.last_suppressed = True
+        self._count(self._opener_cost)
+        self._gate_opener()
+        self._maybe_arm()
+
+    def _end_head(self) -> None:
+        """The label's end: a head that means reasoning opens the block
+        and is booked whole; the answer's or a tool's head opens nothing."""
+        label = tuple(self._label[: -len(self.limits.label_end)])
+        fired = self._close_on_end
+        self._close_on_end = False
+        if self._means_reasoning(label):
+            self._state = "reasoning"
+            cost = self._opener_cost + len(self._label)
+            if not self.limits.mask_opener and self._overflows(cost):
+                # Only the head says whether it is reasoning, and it does
+                # not fit what is left: closed at once, counted nothing.
+                self._suppressed = self.last_suppressed = True
+            self._count(cost)
+            if fired:
+                # This step's logits forced the close's first token:
+                # armed from here without a free token, the queue goes
+                # on from its second.
+                self._arm(free=0)
+                self._pos = 1
+                self._closed = mx.array(False)
+            self._gate_opener()
+            self._maybe_arm()
+        else:
+            self._state = "normal"
+        self._label = []
+        self._window = False
+
+    def _head_aborts(self) -> bool:
+        verdict = self.limits.head_may_open
+        return verdict is not None and not verdict(tuple(self._label))
+
+    def _leave_head(self) -> None:
+        self._state = "normal"
+        self._label = []
+        self._label_end = _Matcher(self.limits.label_end)
+        self._close_on_end = False
+        self._window = False
 
     def _count(self, n: int) -> None:
         """`n` tokens of a block seen: the progress always, the published
@@ -383,6 +452,16 @@ class ThinkingBudget:
             and limit - self.reasoning_tokens < self._entry + 1 + self._close_counted
         )
 
+    def _overflows(self, cost: int) -> bool:
+        """A head of `cost` counted tokens and the close's counted part
+        exceed what is left: a head that fits exactly is counted and
+        closed at once (_close_on_end), a longer one is suppressed."""
+        limit = self.limits.max_tokens
+        return (
+            limit is not None
+            and self.reasoning_tokens + cost + self._close_counted > limit
+        )
+
     def _header_overruns(self) -> bool:
         """The label so far, were it to end now, means reasoning and costs
         more than the gate planned for: no free token fits after it in
@@ -393,7 +472,7 @@ class ThinkingBudget:
         so_far = tuple(self._label[: len(self._label) - self._label_end.matched])
         if not so_far or not self._means_reasoning(so_far):
             return False
-        cost = 1 + len(so_far) + len(self.limits.label_end)
+        cost = self._opener_cost + len(so_far) + len(self.limits.label_end)
         return self.reasoning_tokens + cost > limit - 1 - self._close_counted
 
     def _means_reasoning(self, label: tuple[int, ...]) -> bool:
@@ -476,6 +555,7 @@ class ThinkingBudget:
         self._closed = None
         self._closing = 0
         self._suppressed = False
+        self._window = False
 
     def _gate_opener(self) -> None:
         """Mask the opener as soon as the allowance left cannot hold another
