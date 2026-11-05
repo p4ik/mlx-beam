@@ -36,7 +36,9 @@ dependencies = [
   # Renders the prompt of a checkpoint that ships tekken.json instead of a
   # chat template (every official Mistral release), as transformers'
   # MistralCommonBackend; the vision package adds its [image] part.
-  "mistral-common>=1.8.4",
+  # 1.11.7: what transformers' tekken backend requires; the validator takes
+  # a user turn after a tool turn from 1.11.1 (measured 2026-10-17).
+  "mistral-common>=1.11.7",
 ]
 
 [project.optional-dependencies]

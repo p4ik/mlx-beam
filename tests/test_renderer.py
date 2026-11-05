@@ -443,6 +443,44 @@ def test_mistral_tool_ids_render_on_the_next_turn(tekken):
     assert gen.tokens.index(end) + 1 in gen.boundaries
 
 
+def test_a_tool_turn_may_be_followed_by_a_user_turn(tekken):
+    """The turn a client sends after a tool result with text beside it:
+    `assistant(tool_calls)`, `tool`, `user`. The validator takes it - the
+    user's text renders as a user turn after `[/TOOL_RESULTS]` - and is
+    still on the path: a tool turn that answers no call is its 400.
+    Measured 2026-10-18 through this path: mistral-common 1.11.7 with
+    transformers 5.17.0 takes the sequence; 1.8.4 refuses it in its
+    validator (`tool` is followed by `assistant` or `tool` only), and
+    transformers 5.17.0 does not load the backend below 1.11.5 at all."""
+    body = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "2+2?"},
+            *tool_turn("abcdefghi"),
+            {"role": "user", "content": "and tomorrow?"},
+        ],
+        "tools": TOOLS,
+    }
+    ids = chat.build_prompt(tekken, chat.parse_chat_request(body, "m"))
+    end = tekken.convert_tokens_to_ids("[/TOOL_RESULTS]")
+    after = ids[ids.index(end) + 1 :]
+    turn = [
+        tekken.convert_tokens_to_ids("[INST]"),
+        *encode(tekken, "and tomorrow?"),
+        tekken.convert_tokens_to_ids("[/INST]"),
+    ]
+    assert any(after[i : i + len(turn)] == turn for i in range(len(after)))
+
+    body["messages"] = [
+        {"role": "user", "content": "2+2?"},
+        {"role": "tool", "tool_call_id": "abcdefghi", "content": "4"},
+    ]
+    with pytest.raises(ApiError) as exc:
+        chat.build_prompt(tekken, chat.parse_chat_request(body, "m"))
+    assert exc.value.status == 400
+    assert exc.value.message.startswith("the chat template rejected the messages")
+
+
 def test_mapped_tool_ids_stay_distinct_within_a_turn(tekken):
     """Within a turn no two ids fall together: parallel calls keep apart,
     a valid id keeps its place and a foreign id that would map onto it
