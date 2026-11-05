@@ -3,9 +3,10 @@
 The vision towers come from [mlx-vlm](https://github.com/Blaizzy/mlx-vlm)
 (MIT; `mlx_vlm/LICENSE`), wheel 0.7.1 on PyPI. Each tower is the model
 family's `vision.py` and `config.py` under `mlx_vlm/models/<family>/`,
-copied unchanged and served from `mlx_vlm/<family>/` here; `base.py` holds
-the two pieces they import (`BaseModelConfig`, `ensure_fused_sdpa`), copied
-from `mlx_vlm/models/base.py`. What mlx-vlm does around a tower - the
+copied and served from `mlx_vlm/<family>/` here, unchanged but for the
+local changes listed below; `base.py` holds the two pieces they import
+(`BaseModelConfig`, `ensure_fused_sdpa`), copied from
+`mlx_vlm/models/base.py`. What mlx-vlm does around a tower - the
 processor, the merge of image features into the text embeddings, the
 language model - is not vendored: the processor is the checkpoint's own
 through transformers, the merge is mlx-beam's prefill (image spans), the
@@ -21,3 +22,14 @@ language model is mlx-beam's.
 
 `tools/vendor_diff.py` in the repository root compares these files against
 the wheel (`tools/vendor.toml`, part `mlx-vlm-vision`).
+
+## Local changes
+
+`moe type` - `qwen3_vl/vision.py`: the tower's type check takes
+`qwen3_vl_moe` and `qwen3_vl_moe_vision` (Qwen3-VL-MoE's family name and
+transformers' name for its vision config) and `qwen3_vl_vision`
+(transformers' name for the dense vision config) beside the dense and
+Qwen3.5 names. `families.FAMILIES` routes the types to this tower; without
+the entry a checkpoint whose vision_config names its type was refused
+before its processor was built. Tests: `tests/test_qwen3_vl.py`
+(`test_the_tower_takes_every_vision_type_name_of_its_family`).
